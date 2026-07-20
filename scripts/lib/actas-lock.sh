@@ -308,6 +308,26 @@ agmsg_ready_path() {
   esac
 }
 
+# Boot-process presence path for a spawned (team, agent). This records the
+# launcher boot shell, not agent readiness or responsiveness. The boot shell
+# owns the foreground CLI; if model-driven startup never reaches watcher
+# registration, this still distinguishes a running CLI from no launch.
+# Match ready/spawn path resolution, including ID-keyed paths and ambiguous
+# legacy+ID state, so concurrent identities cannot silently split records.
+agmsg_boot_pid_path() {
+  local team="$1" agent="$2"
+  _agmsg_lock_paths_require_skill_dir agmsg_boot_pid_path || return 1
+  local t a legacy; t="$(_actas_lock_encode "$team")"; a="$(_actas_lock_encode "$agent")"
+  legacy="$(printf '%s/boot-pid.%s__%s' "$(_actas_lock_dir)" "$t" "$a")"
+  local key krc=0
+  key="$(_agmsg_id_key_or_legacy "$team" "$agent")" || krc=$?
+  case "$krc" in
+    0) _agmsg_id_or_legacy_path "$(printf '%s/boot-pid.%s' "$(_actas_lock_dir)" "$key")" "$legacy" ;;
+    1) printf '%s\n' "$legacy" ;;
+    *) return 1 ;;
+  esac
+}
+
 # Placement record path for a spawned (team, agent). `spawn` writes the
 # member's tmux target id + project + type here at launch time so that
 # `despawn --force` can tear the member down (kill its pane/window, drop its
