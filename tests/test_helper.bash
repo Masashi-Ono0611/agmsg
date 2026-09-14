@@ -1,7 +1,36 @@
 # Shared setup/teardown for agmsg BATS tests.
 # Each test gets an isolated skill directory with its own DB and teams.
 
+# #1095: a test that exercises join.sh/actas-claim.sh/spawn.sh/watch.sh/
+# session-start.sh/check-inbox.sh (or the two libraries under them) is, as far
+# as the self-naming primitive can tell, a seat acting -- so it names the pane
+# it is running in, with its own fixture team/agent. On a real machine that is
+# the developer's own terminal, inherited because bats runs inside it. This is
+# TOP-LEVEL, not inside setup_test_env(): `load test_helper` runs it before
+# ANY test's own setup(), so it reaches every file that loads this one,
+# including one (test_install.bats) whose own setup() never calls
+# setup_test_env. A file that deliberately exercises the switch itself
+# (test_self_name.bats, test_self_rename.bats) unsets this right after
+# loading -- that is a local, visible override, not a gap in this default.
+# Hard safety boundary: a test that opts back into self-naming must first install
+# a fake terminal. Clear every ambient terminal marker while this helper loads,
+# before any suite-level setup or test body can unset AGMSG_SELF_NAME. Tests that
+# deliberately model a real terminal restore these variables explicitly, using
+# a fake driver or a documented fixture socket.
+unset TMUX TMUX_PANE TMUX_TMPDIR
+unset HERDR_ENV HERDR_PANE_ID HERDR_SOCKET_PATH HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_SESSION HERDR_BIN_PATH HERDR_STARTUP_CWD
+export AGMSG_SELF_NAME=off
+
 setup_test_env() {
+  # A test never inherits the developer's terminal. The terminal drivers
+  # identify "this pane" from the environment (tmux: $TMUX/$TMUX_PANE; herdr:
+  # HERDR_PANE_ID, measured 2026-09-08), and join/send/inbox/history name the
+  # caller's pane through it -- so a suite run from inside a real tmux or herdr
+  # pane would otherwise write the fixture's team:agent onto the developer's
+  # own pane. Tests that want a terminal set these AFTER this call, against a
+  # fake on PATH. CI runners carry none of these, so nothing changes there.
+  unset TMUX TMUX_PANE TMUX_TMPDIR
+  unset HERDR_ENV HERDR_PANE_ID HERDR_SOCKET_PATH HERDR_WORKSPACE_ID HERDR_TAB_ID HERDR_SESSION HERDR_BIN_PATH HERDR_STARTUP_CWD
   export TEST_SKILL_DIR="$(mktemp -d)"
   mkdir -p "$TEST_SKILL_DIR"/{scripts,db,teams}
 
@@ -114,6 +143,24 @@ _reap_test_skill_dir_procs() {
   done
 }
 
+# Derive the run-file path a real caller would use for (team, agent), instead
+# of a test hardcoding the pre-#1023 legacy literal "<team>__<agent>". join.sh
+# mints team_id unconditionally when it creates a brand-new team config, and
+# mints the member's member_id in the same call once team_id exists -- so a
+# freshly join.sh'd team/agent pair (the normal case in this suite) resolves
+# to the NEW id-keyed path, not the legacy one. A literal string baked into a
+# test fixture silently stops matching the path production code actually
+# reads or writes the moment #1023 lands, with no error at the mismatch site.
+_ready_path() {   # <team> <agent>
+  ( SKILL_DIR="$TEST_SKILL_DIR"; source "$TEST_SKILL_DIR/scripts/lib/actas-lock.sh"; agmsg_ready_path "$1" "$2" )
+}
+_spawn_record_path() {   # <team> <agent>
+  ( SKILL_DIR="$TEST_SKILL_DIR"; source "$TEST_SKILL_DIR/scripts/lib/actas-lock.sh"; agmsg_spawn_path "$1" "$2" )
+}
+_actas_session_path() {   # <team> <agent>
+  ( SKILL_DIR="$TEST_SKILL_DIR"; source "$TEST_SKILL_DIR/scripts/lib/actas-lock.sh"; actas_lock_path "$1" "$2" )
+}
+
 teardown_test_env() {
   # Try the plain rm FIRST, and only reap when it actually fails. The reaper's scan is a
   # full `ps -eo pid=,args=`; running it in EVERY teardown would add that cost to all of
@@ -127,6 +174,75 @@ teardown_test_env() {
   _reap_test_skill_dir_procs || reap_status=$?
   rm -rf "$TEST_SKILL_DIR" || rm_status=$?
   [ "$reap_status" -eq 0 ] && [ "$rm_status" -eq 0 ]
+}
+
+# Print the renderable type set from the registry rather than duplicating the
+# list in each composition assertion. The optional root is useful for tests
+# that copy scripts into an isolated skill directory.
+agmsg_renderable_types() {
+  local root="${1:-$BATS_TEST_DIRNAME/..}"
+  (
+    # shellcheck disable=SC1091
+    source "$root/scripts/lib/type-registry.sh"
+    printf '%s\n' $AGMSG_RENDERABLE_SKILL_TYPES
+  )
+}
+
+# A fake `tmux` that logs its argv and produces the ids/text real tmux would.
+#
+# Shared because three suites drive the terminal layer now — the registry's own
+# tests, the watcher, and per-turn delivery (#1044 gave the last two a naming
+# call). Callers set FAKEBIN and ARGV_LOG first; nothing here reads them at
+# source time, so a suite that does not want a fake terminal is unaffected.
+agmsg_install_fake_tmux() {
+  # The label this fake REMEMBERS. A pane option that is set and then never
+  # readable is not a model of tmux: `terminal_label_of` asks a pane which agmsg
+  # label it carries, and code that acts on the answer (the self-naming fast
+  # half, #1130) cannot be tested against a fake that always answers nothing.
+  # So `set-option ... @agmsg_agent <label>` is stored per pane and
+  # `display-message` replays it. Only the one format that asks for the label is
+  # answered; every other format falls through to silence exactly as before, so
+  # suites that depend on this fake's other behaviour are untouched.
+  export FAKE_TMUX_STATE="${FAKE_TMUX_STATE:-$FAKEBIN/tmux.labels}"
+  : > "$FAKE_TMUX_STATE"
+  cat > "$FAKEBIN/tmux" <<EOF
+#!/usr/bin/env bash
+{ printf 'tmux'; for a in "\$@"; do printf ' [%s]' "\$a"; done; printf '\n'; } >> "$ARGV_LOG"
+state='$FAKE_TMUX_STATE'
+args=("\$@")
+if [ "\${args[0]}" = -S ]; then args=("\${args[@]:2}"); fi
+case "\${args[0]}" in
+  new-window)   echo '@7' ;;
+  split-window) echo '%9' ;;
+  capture-pane) printf 'line one\nline two\n' ;;
+  set-option)
+    # set-option -p -t <id> @agmsg_agent <label>
+    if [ "\${args[4]}" = '@agmsg_agent' ]; then
+      pane="\${args[3]}"; label="\${args[5]}"
+      [ -f "\$state" ] && grep -v "^\$pane	" "\$state" > "\$state.new" 2>/dev/null || : > "\$state.new"
+      printf '%s\t%s\n' "\$pane" "\$label" >> "\$state.new"
+      mv "\$state.new" "\$state"
+    fi ;;
+  display-message)
+    # display-message -p -t <id> <format>
+    if [ "\${args[4]}" = '#{pane_id}|#{@agmsg_agent}' ]; then
+      pane="\${args[3]}"
+      label="\$(awk -F'\t' -v p="\$pane" '\$1 == p { print \$2 }' "\$state" 2>/dev/null)"
+      printf '%s|%s\n' "\$pane" "\$label"
+    fi ;;
+esac
+exit 0
+EOF
+  chmod +x "$FAKEBIN/tmux"
+  export PATH="$FAKEBIN:$PATH"
+}
+
+# Clear the agmsg label the fake tmux remembers for <pane>, without touching the
+# pane or the server -- the state "someone renamed the pane by hand" leaves.
+agmsg_fake_tmux_clear_label() {   # <pane>
+  [ -f "${FAKE_TMUX_STATE:-}" ] || return 0
+  grep -v "^$1	" "$FAKE_TMUX_STATE" > "$FAKE_TMUX_STATE.new" 2>/dev/null || : > "$FAKE_TMUX_STATE.new"
+  mv "$FAKE_TMUX_STATE.new" "$FAKE_TMUX_STATE"
 }
 
 # Skip a test on native Windows / Git Bash (MSYS/MINGW/Cygwin). Use ONLY for
@@ -150,6 +266,15 @@ skip_unless_windows() {
     MINGW*|MSYS*|CYGWIN*) ;;
     *) skip "${1:-only meaningful under Git Bash}" ;;
   esac
+}
+
+# The Antigravity monitor is Linux-only: antigravity-tui-supervisor.py reads
+# /proc/<pid>/stat for every liveness check, and the control actions all go
+# through antigravity-mode.mjs, which does the same. Use for any test that
+# actually invokes the installed agy-tui shim; tests that only check install.sh's
+# own file handling (ownership, symlink replacement) do not need this.
+skip_unless_linux() {
+  [ "$(uname -s)" = Linux ] || skip "${1:-Antigravity TUI monitor is Linux-only}"
 }
 
 # In-memory sqlite for test ASSERTIONS, stripping CR. sqlite3.exe writes stdout
