@@ -126,13 +126,27 @@ Registering where a session is also settles *who* it is — which makes the sepa
 
 Right now a session does two things. `join` puts a name in the team; `actas <name>` then declares "I am that name in this session", which takes an exclusivity lock and narrows what this session receives. The second step is explicit, repeated after every restart, and easy to get wrong — and getting it wrong is silent. A session that never claims a role receives *everything* addressed to any role registered for that project; a watcher started without the name argument does the same. Both look identical to a working setup until someone notices messages being marked read by a session that was never meant to see them. That failure has been reported and fixed under several numbers (#62, #300, #982) and re-appeared each time in a new shape, because the underlying arrangement — "you also have to say who you are, separately, every time" — stayed.
 
-Under agmsgd the registration already carries the identity: a session tells the daemon "I am team X's *bob*, this process, this pane". So:
+**Under agmsgd, a session always ends up with an identity.** Session start resolves one rather than waiting to be told: from the name `spawn` passed, from the role this session held last time, or — when the project has exactly one identity free — from that. Only a genuine ambiguity reaches the user, and because holding an identity is exclusive, the daemon can offer just the ones nobody is holding. Creating the first identity in a project is the same resolution with an empty set, not a separate first-run ceremony.
 
-- **A session subscribes to a name at startup**, from what it already knows (the project it runs in, the role recorded for it, or the name it was spawned with). `join` establishes the name; `spawn` passes it; a restart re-derives it. Nothing has to be typed again.
-- **The subscribed name is locked by default.** Holding the subscription *is* holding the role — the two cannot drift apart, because there is no longer a second place to state it.
-- **`actas` becomes the exception, not the routine**: switching a session to a different role deliberately. It stops being a step every session must remember, which is what made forgetting it possible.
+**A subscription is what an identity receives**, and it is durable: its own name, plus any tags it has subscribed to. It outlives the session, so a session that starts tomorrow picks up what that identity was already listening to. Binding a session to an identity is the exclusive part — one session at a time, which is exactly today's lock, now taken automatically instead of typed.
 
-Worth being precise about what the lock is: it is **local**. It keeps two sessions on the same machine from both answering as `bob`; it is not an authority claim about who may act as `bob` anywhere. Nothing in this section changes that scope — it changes when the lock is acquired (with the subscription, automatically) rather than what it protects.
+`actas` does not disappear so much as become the exception it should always have been: switching a session to a *different* identity on purpose. What it used to be — the thing you had to remember every time — is gone.
+
+**Forgetting now costs nothing.** A session with no identity receives nothing at all, rather than everything addressed to everyone in the project. The dangerous default inverts: the failure that produced #300 and #982 was "unspecified means receive it all", and the failure here is a quiet inbox you notice immediately and nobody else is harmed by.
+
+### What the separation makes possible
+
+**One message to a group.** `to:#devs` reaches every identity subscribed to that tag, and each carries its own noticed/read state: three read it, two have not, and that is visible. Today the same announcement is N separate sends with no way to see who picked it up.
+
+**Tags are subscribed to, not administered.** A tag comes into existence when the first identity subscribes to it and ceases to exist when the last one leaves — no registry to curate, no cleanup of tags nobody uses, and no way to end up with a tag that exists but reaches no one. The count is over identities rather than live sessions, so `#devs` is still there in the morning. `#all` is the exception in both directions: it exists from the moment a team does, every identity is subscribed implicitly, and none can unsubscribe.
+
+**Addressing a tag nobody subscribes to is an error**, not a delivery to zero recipients. A message to `#dev` when the tag is `#devs` fails loudly instead of succeeding into nothing.
+
+**Several teams from one session.** An identity is one per team and a session can hold several across teams, so one seat can work in more than one team without a separate window for each.
+
+**Nothing to re-declare after a restart.** Subscriptions belong to the identity, so they survive; binding is resolved at session start. There is no ceremony left to forget.
+
+**`from` becomes something that is actually protected.** Measured: `send` does not consult the exclusivity lock at all today, so any registered name can be sent as. Holding the identity is the first mechanism that makes a sender's name mean anything.
 
 ### One name, many tools; one message, many recipients
 
