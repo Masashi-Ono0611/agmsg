@@ -791,6 +791,42 @@ test('TUI monitor は対話端末でない起動を拒否する', () => {
   assert.match(status.stdout, /tui-pty 未起動/);
 });
 
+test('TUI status refuses an unreadable process identity', () => {
+  runPython(`
+import contextlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import sys
+import tempfile
+spec = importlib.util.spec_from_file_location('supervisor', ${JSON.stringify(supervisor)})
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+root = Path(tempfile.mkdtemp())
+(root / 'run').mkdir()
+state = root / 'run' / 'state.json'
+state.write_text(json.dumps({'project': '/tmp/project', 'team': 'fixture', 'role': 'worker'}))
+reservation = root / 'run' / 'antigravity-reservation.fixture.json'
+reservation.write_text(json.dumps({'pid': os.getpid(), 'start': 'start', 'state': str(state), 'kind': 'tui-pty'}))
+module.ROOT = root
+def unreadable(_pid, _start):
+    raise module.StartTimeUnreadable('synthetic read failure')
+module.process_still = unreadable
+sys.argv = ['supervisor.py', '--action', 'status', '--project', '/tmp/project', '--team', 'fixture', '--name', 'worker']
+stderr = io.StringIO()
+with contextlib.redirect_stderr(stderr):
+    try:
+        module.main()
+    except SystemExit as exc:
+        assert exc.code == 1
+    else:
+        raise AssertionError('status accepted an unreadable process identity')
+assert 'TUI process identity is unreadable' in stderr.getvalue()
+`);
+});
+
 test('偽TUIを実PTYで起動し、受信後のreceipt確認からackまで進める', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agmsg-tui-pty-test-'));
   const install = path.join(dir, 'install');
@@ -853,7 +889,39 @@ process.stdin.on('data', chunk => {
     'bash', quote(path.join(install, 'scripts/drivers/types/antigravity/antigravity-tui-monitor.sh')),
     '--project', quote(project), '--team', 'fixture', '--name', 'worker', '--agy', quote(fake), '--poll', '0.05',
   ].join(' ');
-  const child = spawn('script', ['-qefc', command, '/dev/null'], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const ptyRelay = path.join(dir, 'pty-relay.py');
+  if (process.platform === 'darwin') fs.writeFileSync(ptyRelay, `
+import os
+import pty
+import select
+import sys
+
+pid, master = pty.fork()
+if pid == 0:
+    os.execlp('bash', 'bash', '-c', sys.argv[1])
+while True:
+    ready, _, _ = select.select([master, sys.stdin.buffer], [], [])
+    if master in ready:
+        try:
+            data = os.read(master, 8192)
+        except OSError:
+            break
+        if not data:
+            break
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    if sys.stdin.buffer in ready:
+        data = os.read(sys.stdin.fileno(), 8192)
+        if not data:
+            break
+        os.write(master, data)
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+`);
+  const spawnPty = (cmd, childEnv) => process.platform === 'darwin'
+    ? spawn('python3', [ptyRelay, cmd], { env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] })
+    : spawn('script', ['-qefc', cmd, '/dev/null'], { env: childEnv, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawnPty(command, env);
   let output = '';
   child.stdout.on('data', chunk => { output += chunk.toString(); });
   child.stderr.on('data', chunk => { output += chunk.toString(); });
@@ -939,7 +1007,7 @@ process.stdin.on('data', chunk => {
     replayState.humanInputSawNonIdle = true;
     fs.writeFileSync(path.join(install, 'run', stateFile), JSON.stringify(replayState));
     const replayCommand = 'stty rows 40 cols 120; exec ' + ['python3', supervisorPath, '--action', 'replay', '--project', project, '--team', 'fixture', '--name', 'worker', '--agy', fake, '--batch', uncertain.batch.id, '--confirm-id', uncertain.batch.messages[0].id].map(quote).join(' ');
-    const replay = spawn('script', ['-qefc', replayCommand, '/dev/null'], { env: { ...env, TEST_REPLAY_RECEIPT: '1' }, stdio: ['pipe', 'pipe', 'pipe'] });
+    const replay = spawnPty(replayCommand, { ...env, TEST_REPLAY_RECEIPT: '1' });
     let replayOutput = '';
     replay.stdout.on('data', chunk => { replayOutput += chunk.toString(); });
     replay.stderr.on('data', chunk => { replayOutput += chunk.toString(); });

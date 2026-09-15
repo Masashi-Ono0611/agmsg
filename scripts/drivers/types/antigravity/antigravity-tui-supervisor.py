@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
-"""Linux-only PTY owner for one Antigravity TUI and one agmsg role.
+"""POSIX PTY owner for one Antigravity TUI and one agmsg role.
 
-Linux-only is a measured statement, not an untried one. Every control action --
-status, stop, resume, reset-guard -- goes through antigravity-mode.mjs, which
-reads /proc/<pid>/stat directly, and the headless sibling additionally spawns
-flock. Porting this file alone would give macOS a TUI that starts and cannot be
-stopped, which is worse than not offering it. (#1090 review; the mjs port is its
-own issue.)
+The supervisor and its headless sibling use the same process identity contract
+on Linux and macOS. Windows remains refused by the shell wrapper because it
+does not provide the POSIX PTY and advisory-lock primitives used here.
 """
-import argparse, codecs, fcntl, hashlib, json, os, pty, re, select, shlex, signal, struct, subprocess, sys, termios, time, tty, unicodedata, uuid
+import argparse, codecs, errno, fcntl, hashlib, json, os, pty, re, select, shlex, signal, struct, subprocess, sys, termios, time, tty, unicodedata, uuid
 from pathlib import Path
 
 HERE=Path(__file__).resolve().parent
@@ -33,26 +30,16 @@ class StartTimeUnreadable(OSError):
     """
 
 def proc_start(pid):
-    """The process's start time, from /proc/<pid>/stat field 22 (clock ticks).
+    """Return the process start token from the native POSIX process table.
 
     A pid alone is not an identity: pids are recycled, and every comparison of
     this value in this file exists to separate "the same process" from "a
     different process that inherited its number".
 
-    ONE source, deliberately. An earlier version of this function fell back to
-    `ps -o lstart=` whenever reading /proc raised, and tagged the result with its
-    source so the two could not be compared by accident. The tag was right; the
-    fallback made it fire. On Linux a single transient read error would return a
-    `ps` token for a process whose stored token came from /proc, the comparison
-    would correctly refuse to match, and a LIVE process would be reported as a
-    different one -- the same outcome as a pid-reuse false positive, from nothing
-    but one failed read. The function that documented "these two must not be
-    compared" was itself producing the mixture. (Found in review of #1090.)
-
-    So a read that fails is a read that failed: raise, and say what could not be
-    read. "Could not determine" is not "a different process" -- the same split
-    this driver's inbox-transport makes between "someone else holds it" and "I
-    could not read the lock".
+    Linux uses /proc clock ticks; macOS uses the shared libproc helper, which
+    supplies parent, state, and a microsecond start token from one kernel
+    snapshot. A read failure remains a separate exception from a confirmed
+    missing pid.
 
     TWO exception types, and the split is the whole point. Callers catch
     FileNotFoundError to mean "that pid is gone" and then unlink a reservation,
@@ -61,14 +48,24 @@ def proc_start(pid):
     StartTimeUnreadable, which those handlers do NOT catch, so it propagates and
     the act does not happen.
 
-    The first version of this raise mapped every OSError to FileNotFoundError,
-    and that fed "could not read" straight into three call sites' "is not there".
-    A live supervisor whose /proc was unreadable would have had its reservation
-    taken. Found in review; it is the third time in one day that this repo has
-    read "could not read it" as "it is not there" (actas_lock_owner, gc_stale,
-    here), and the answer is the same each time: they are different facts and
-    need different values.
+    A live supervisor whose process table cannot be read must therefore keep its
+    reservation rather than being mistaken for a stale process.
     """
+    if sys.platform == 'darwin':
+        try:
+            result=subprocess.run([sys.executable,str(ROOT/'scripts/drivers/types/antigravity/mac-process-info.py'),str(pid)],capture_output=True,text=True)
+        except OSError as exc:
+            raise StartTimeUnreadable(f'pid {pid} の起動時刻を判定できません (libproc: {exc.strerror})') from exc
+        if result.returncode == 1:
+            raise FileNotFoundError(errno.ENOENT, f'pid {pid} is not running')
+        if result.returncode != 0:
+            raise StartTimeUnreadable(f'pid {pid} の起動時刻を判定できません (libproc)')
+        fields=result.stdout.strip().split('\t')
+        if len(fields)!=3 or not fields[2].startswith('darwin:'):
+            raise StartTimeUnreadable(f'pid {pid} の起動時刻を判定できません (libproc output)')
+        return fields[2]
+    if sys.platform != 'linux':
+        raise StartTimeUnreadable(f'pid {pid} の起動時刻を判定できません (unsupported platform: {sys.platform})')
     try:
         raw=Path(f'/proc/{pid}/stat').read_text()
     except FileNotFoundError as exc:
@@ -289,14 +286,14 @@ class TerminalScreen:
 class Supervisor:
     HUMAN_IDLE_STABLE_SECONDS=0.6
     def __init__(self, args):
-        self.a=args; self.project=str(Path(args.project).resolve()); self.owner=f'{uuid.uuid4()}.{os.getpid()}'
+        self.a=args; self.project=str(Path(args.project).absolute()); self.owner=f'{uuid.uuid4()}.{os.getpid()}'
         self.start=proc_start(os.getpid()); self.cap=uuid.uuid4().hex+uuid.uuid4().hex
         paths=self.call('paths').splitlines(); self.actas=Path(paths[0])
         key=self.actas.name.removeprefix('actas.').removesuffix('.session')
         self.state_file=ROOT/'run'/f'antigravity-tui-pty.{key}.state.json'
         self.reservation=ROOT/'run'/f'antigravity-reservation.{key}.json'; self.violations=Path(str(self.reservation)+'.violations')
         self.state={'schemaVersion':2,'project':self.project,'team':args.team,'role':args.name,'owner':self.owner,'supervisorPhase':'STARTING','manualResumeRequired':False,'humanInputActive':False,'humanInputSawNonIdle':False,'durableAttention':False,'batch':None}
-        self.master=None; self.child=None; self.old=None; self.screen=None; self.stopping=False; self.stop_reason=None; self.buffer=''; self.result_buffer=''; self.permission_raw_window=''; self.last_poll=0; self.human_idle_since=None; self.human_input_restart_recovery=False; self.resume_requested=False; self.resize_requested=False; self.acquired=False
+        self.master=None; self.child=None; self.old=None; self.screen=None; self.stopping=False; self.stop_reason=None; self.buffer=''; self.result_buffer=''; self.permission_raw_window=''; self.last_poll=0; self.last_output=time.monotonic(); self.human_idle_since=None; self.human_input_restart_recovery=False; self.resume_requested=False; self.resize_requested=False; self.acquired=False
         signal.signal(signal.SIGTERM, self.request_stop)
         signal.signal(signal.SIGINT, self.request_stop)
         signal.signal(signal.SIGUSR1, self.request_resume)
@@ -586,7 +583,8 @@ class Supervisor:
         # footerだけでは許可画面や入力途中を区別できない。空の入力欄も要求する。
         screen=getattr(self,'screen',None)
         if not screen or screen.uncertain or screen.state!='normal' or screen.decoder.getstate()[0]: return False
-        if time.monotonic()-getattr(self,'last_output',0)<0.3: return False
+        last_output=getattr(self,'last_output',0)
+        if last_output>0 and time.monotonic()-last_output<0.3: return False
         footer=screen.tail_with_prefix('? for shortcuts')
         if footer is None:return False
         footer_text=''.join(line.strip() for line in screen.lines()[footer[0]:footer[1]+1])
@@ -731,16 +729,24 @@ def main():
         return
     if a.action in ('status','stop','resume'):
         matches=[]
-        for file in (ROOT/'run').glob('antigravity-reservation.*.json'):
-            try:
-                reservation=json.loads(file.read_text()); state=json.loads(Path(reservation['state']).read_text())
-                if state.get('project')!=str(Path(a.project).resolve()) or state.get('team')!=a.team or state.get('role')!=a.name or reservation.get('kind')!='tui-pty': continue
-                live=False
-                try: live=process_still(int(reservation['pid']),reservation['start'])
-                except (ValueError,StartTimeUnreadable): pass
-                matches.append((file,reservation,state,live))
-            except (OSError,KeyError,TypeError,ValueError,json.JSONDecodeError):
-                continue
+        try:
+            for file in (ROOT/'run').glob('antigravity-reservation.*.json'):
+                try:
+                    reservation=json.loads(file.read_text()); state=json.loads(Path(reservation['state']).read_text())
+                    if state.get('project')!=str(Path(a.project).absolute()) or state.get('team')!=a.team or state.get('role')!=a.name or reservation.get('kind')!='tui-pty': continue
+                    live=False
+                    try: live=process_still(int(reservation['pid']),reservation['start'])
+                    except FileNotFoundError: live=False
+                    except ValueError as exc: raise RuntimeError(f'TUI reservation is malformed: {file}: {exc}') from exc
+                    except StartTimeUnreadable as exc: raise RuntimeError(f'TUI process identity is unreadable: {file}: {exc}') from exc
+                    matches.append((file,reservation,state,live))
+                except FileNotFoundError as exc:
+                    raise RuntimeError(f'TUI reservation disappeared while reading: {file}: {exc}') from exc
+                except (OSError,KeyError,TypeError,ValueError,json.JSONDecodeError) as exc:
+                    raise RuntimeError(f'TUI reservation is unreadable or malformed: {file}: {exc}') from exc
+        except RuntimeError as exc:
+            print(str(exc), file=sys.stderr)
+            sys.exit(1)
         if a.action=='status':
             if not matches: print('runtime: tui-pty 未起動'); return
             for _,reservation,state,live in matches:
