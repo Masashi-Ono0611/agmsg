@@ -2595,26 +2595,34 @@ EOF
   grep -q -- "--inline-inbox" "$log"
 }
 
-@test "session-start.sh for codex writes the bridge request from a ws:// port file alone (#1056)" {
+@test "session-start.sh for codex writes the bridge request from a seat record alone (#1056)" {
   # No AGMSG_CODEX_BRIDGE_APP_SERVER, no unix:// token on the agent's cmdline
   # (AGMSG_AGENT_PID is "" per setup()), and no .sock file -- the first three
-  # app-server probes all come up empty. Only the port file _app-server.sh's
-  # _agmsg_codex_app_server_url reads is present, carrying a ws:// port.
+  # app-server probes all come up empty. Only the seat record
+  # _app-server.sh's _agmsg_codex_app_server_url reads (via AGMSG_CODEX_SEAT_
+  # KEY, #1254) is present, carrying a ws:// port.
   bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
   _seed_role_record team alice thread-ws-1056 "$TEST_PROJECT" codex
 
   # shellcheck disable=SC1091
   source "$SCRIPTS/lib/hash.sh"
-  local hash; hash="$(printf '%s' "$TEST_PROJECT" | agmsg_sha1)"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/drivers/types/codex/_seat-key.sh"
+  local seat_key project_hash
+  seat_key="$(_agmsg_codex_seat_key_new)"
+  project_hash="$(printf '%s' "$TEST_PROJECT" | agmsg_sha1)"
   mkdir -p "$TEST_SKILL_DIR/run"
-  printf '50505' > "$TEST_SKILL_DIR/run/codex-app-server.$hash.port"
+  _agmsg_codex_seat_record_write \
+    "$(_agmsg_codex_seat_record_path "$TEST_SKILL_DIR/run" "$seat_key")" \
+    "$project_hash" "12345" "50505" "" "" "codex-cli-test"
 
   ( unset AGMSG_CODEX_BRIDGE_APP_SERVER
     AGMSG_CODEX_BRIDGE_LAUNCHER=1 \
+    AGMSG_CODEX_SEAT_KEY="$seat_key" \
     CODEX_THREAD_ID="thread-ws-1056" \
       bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT" >/dev/null )
 
-  local request_file="$TEST_SKILL_DIR/run/codex-bridge-request.$hash"
+  local request_file="$TEST_SKILL_DIR/run/codex-bridge-request.$seat_key"
   [ -f "$request_file" ]
   grep -q -- "ws://127.0.0.1:50505" "$request_file"
 }
@@ -3054,6 +3062,67 @@ EOF
   [ ! -f "$TEST_SKILL_DIR/run/codex-app-server.$h.port" ]
   [ ! -f "$TEST_SKILL_DIR/run/codex-app-server.$h.version" ]
   kill "$bpid" 2>/dev/null || true
+
+  # #1254 review: a legacy pidfile that cannot be read or is malformed must
+  # NOT be treated as proof its server is dead -- that would strip a LIVE
+  # legacy server's records out from under an install mid-upgrade, exactly
+  # what this cleanup is supposed to leave alone. A different project so this
+  # does not collide with the record already removed above.
+  local proj2; proj2="$(mktemp -d)"
+  bash "$SCRIPTS/join.sh" team alice codex "$proj2" >/dev/null
+  bash "$SCRIPTS/delivery.sh" set monitor codex "$proj2" >/dev/null
+  local h2; h2="$(printf '%s' "$proj2" | agmsg_sha1)"
+  printf 'not-a-pid' > "$TEST_SKILL_DIR/run/codex-app-server.$h2.pid"
+  : > "$TEST_SKILL_DIR/run/codex-app-server.$h2.port"
+  : > "$TEST_SKILL_DIR/run/codex-app-server.$h2.version"
+  : > "$TEST_SKILL_DIR/run/codex-app-server.$h2.log"
+
+  run bash "$SCRIPTS/delivery.sh" set off codex "$proj2"
+  [ "$status" -eq 0 ]
+  [ -f "$TEST_SKILL_DIR/run/codex-app-server.$h2.pid" ]
+  [ -f "$TEST_SKILL_DIR/run/codex-app-server.$h2.port" ]
+  [ -f "$TEST_SKILL_DIR/run/codex-app-server.$h2.version" ]
+  [ -f "$TEST_SKILL_DIR/run/codex-app-server.$h2.log" ]
+
+  # #1254 review: a refused stop signal must not be followed by removing the
+  # record anyway -- a live server whose only record was just deleted is the
+  # worst of the outcomes here, and returning success on top of that hides
+  # it entirely. Exercises _agmsg_codex_seat_record_stop directly (sourced
+  # into this test's own shell, not through a separate `bash delivery.sh`
+  # process) because shadowing the `kill` builtin only works within the
+  # same shell -- exported functions that override a builtin are not
+  # reliably honored across a fresh bash invocation on every platform this
+  # suite runs on.
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/compat.sh"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/lib/instance-id.sh"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/drivers/types/codex/_seat-key.sh"
+  bash -c 'exec -a codex-app-server-fake sleep 30' &
+  local fake_server=$!
+  local waited=0
+  while ! kill -0 "$fake_server" 2>/dev/null && [ "$waited" -lt 30 ]; do
+    sleep 0.1; waited=$((waited + 1))
+  done
+  local witness_line wsrc wval seat_key3 rec3
+  witness_line="$(_agmsg_codex_seat_witness "$fake_server")"
+  wsrc="${witness_line%%$'\t'*}"
+  wval="${witness_line#*$'\t'}"
+  seat_key3="$(_agmsg_codex_seat_key_new)"
+  rec3="$(_agmsg_codex_seat_record_path "$TEST_SKILL_DIR/run" "$seat_key3")"
+  _agmsg_codex_seat_record_write "$rec3" "someproj" "$fake_server" "9999" "$wsrc" "$wval" "codex-cli-test"
+
+  kill() { return 1; }
+  run _agmsg_codex_seat_record_stop "$TEST_SKILL_DIR/run" "$seat_key3"
+  unset -f kill
+  [ "$status" -ne 0 ]
+  grep -qF "refused" <<<"$output"
+  [ -f "$rec3" ]
+  kill -0 "$fake_server" 2>/dev/null
+
+  kill -TERM "$fake_server" 2>/dev/null || true
+  wait "$fake_server" 2>/dev/null || true
 }
 
 # --- hermes (manual-only: delivery_modes=off, no automatic hook) ---
@@ -3239,8 +3308,16 @@ JSON
 
   # shellcheck disable=SC1090
   source "$SCRIPTS/lib/hash.sh"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/drivers/types/codex/_seat-key.sh"
   mkdir -p "$TEST_SKILL_DIR/run"
-  cp "$portfile" "$TEST_SKILL_DIR/run/codex-app-server.$(printf '%s' "$TEST_PROJECT" | agmsg_sha1).port"
+  local seat_key project_hash silent_port
+  seat_key="$(_agmsg_codex_seat_key_new)"
+  project_hash="$(printf '%s' "$TEST_PROJECT" | agmsg_sha1)"
+  silent_port="$(cat "$portfile")"
+  _agmsg_codex_seat_record_write \
+    "$(_agmsg_codex_seat_record_path "$TEST_SKILL_DIR/run" "$seat_key")" \
+    "$project_hash" "$listener" "$silent_port" "" "" "codex-cli-test"
 
   local start finish elapsed
   start=$(date +%s)
@@ -3281,8 +3358,15 @@ JSON
 
   # shellcheck disable=SC1090
   source "$SCRIPTS/lib/hash.sh"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/drivers/types/codex/_seat-key.sh"
   mkdir -p "$TEST_SKILL_DIR/run"
-  printf '1' > "$TEST_SKILL_DIR/run/codex-app-server.$(printf '%s' "$TEST_PROJECT" | agmsg_sha1).port"
+  local seat_key project_hash
+  seat_key="$(_agmsg_codex_seat_key_new)"
+  project_hash="$(printf '%s' "$TEST_PROJECT" | agmsg_sha1)"
+  _agmsg_codex_seat_record_write \
+    "$(_agmsg_codex_seat_record_path "$TEST_SKILL_DIR/run" "$seat_key")" \
+    "$project_hash" "$$" "1" "" "" "codex-cli-test"
 
   AGMSG_NODE="$fake" run bash "$SCRIPTS/delivery.sh" status codex "$TEST_PROJECT"
   [ "$status" -eq 0 ]
@@ -3309,7 +3393,14 @@ JSON
   source "$SCRIPTS/lib/role-session.sh"
   agmsg_role_session_record team alice thr-alice "$TEST_PROJECT" codex
   [ -n "$(agmsg_role_session_uuid team alice)" ]
-  printf '1' > "$TEST_SKILL_DIR/run/codex-app-server.$(printf '%s' "$TEST_PROJECT" | agmsg_sha1).port"
+  # shellcheck disable=SC1091
+  source "$SCRIPTS/drivers/types/codex/_seat-key.sh"
+  local seat_key project_hash
+  seat_key="$(_agmsg_codex_seat_key_new)"
+  project_hash="$(printf '%s' "$TEST_PROJECT" | agmsg_sha1)"
+  _agmsg_codex_seat_record_write \
+    "$(_agmsg_codex_seat_record_path "$TEST_SKILL_DIR/run" "$seat_key")" \
+    "$project_hash" "$$" "1" "" "" "codex-cli-test"
 
   local fake="$TEST_SKILL_DIR/fake-node-loaded"
   { printf '#!/usr/bin/env bash\n'; printf 'printf %%s\\\\n thr-alice\n'; } > "$fake"
