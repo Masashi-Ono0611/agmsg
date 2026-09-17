@@ -196,7 +196,12 @@ settings_file() {
   run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [[ "$output" == *"mode: monitor"* ]]
-  [[ "$output" == *"watch processes:"* ]]
+  grep -qF -- "watch processes:" <<<"$output"
+  # `mode: monitor` reports configuration, not the runtime Monitor task; the
+  # claude-code-only note points at TaskList, not the background-task footer
+  # (#270).
+  grep -qF -- "configured hooks only" <<<"$output"
+  [[ "$output" == *"Verify with TaskList"* ]]
 }
 
 # A pid that exists but this user cannot signal, so `kill -0` fails with EPERM
@@ -705,6 +710,10 @@ _seed_role_record() {
   local cmdline; cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
   eval "set -- $cmdline"
   [ "$5" = "alice" ]
+  # The role-filtered directive gets its own verification guidance too, named
+  # for THIS role's suffixed description -- not just the generic branch's
+  # (#270: this branch used to exit before that block existed).
+  [[ "$output" == *'Monitor(agmsg inbox stream (acting as alice)) starts'* ]]
 }
 
 @test "session-start: an unrecorded sid emits the generic directive (#339)" {

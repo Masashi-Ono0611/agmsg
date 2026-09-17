@@ -22,6 +22,10 @@ set -euo pipefail
 #   both     — monitor primary; turn as per-session safety net
 #   off      — no automatic delivery
 #
+# `status` reports configured delivery hooks. For Claude Code, `mode: monitor`
+# means the project is configured for monitor delivery; runtime success still
+# requires Claude Code to start its generic Monitor tool for `agmsg inbox stream`.
+#
 # settings.json injection is idempotent: each `set` call first strips any
 # existing agmsg-owned SessionStart/Stop entries, then re-adds whichever
 # the new mode requires. Re-running with the same mode is a no-op.
@@ -486,6 +490,14 @@ AGMSG-DIRECTIVE: For this running session, invoke the Monitor tool now with:
   persistent: true
 
 Pass the command above verbatim — the session_id is already filled in.
+Use Claude Code's generic Monitor tool only. Do not start this command with
+Bash/background/nohup or a shell task. Success is a TaskList entry whose
+description begins with "agmsg inbox stream" (after actas it reads
+"agmsg inbox stream (acting as <name>)") and, once messages arrive, a
+transcript event named to match. The background-task footer is not a
+reliable check either way; use TaskList. If ToolSearch cannot find the
+generic Monitor tool, use turn/manual inbox as a fallback; that is not
+real-time monitor delivery.
 EOF
 }
 
@@ -815,6 +827,19 @@ do_status() {
   if [ -n "$TYPE" ] && [ -n "$PROJECT" ]; then
     agmsg_delivery_load_plug "$TYPE"
     agmsg_delivery_status "$TYPE" "$PROJECT"
+    case "$TYPE" in
+      claude-code)
+        cat <<'EOF'
+note: status reports configured hooks only. For real-time delivery, Claude Code
+must also have a generic Monitor task running in the current session whose
+description begins with "agmsg inbox stream" (after actas: "agmsg inbox
+stream (acting as <name>)"). Verify with TaskList, not the background-task
+footer — the footer is not a reliable signal either way. A watch.sh started
+as a shell/background/nohup task instead of through the Monitor tool is not
+real-time delivery even while its process stays alive.
+EOF
+        ;;
+    esac
   fi
 
   agmsg_delivery_runtime_status "$TYPE" "$PROJECT"
