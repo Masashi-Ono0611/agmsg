@@ -45,8 +45,19 @@ stale memory of their last known pane. Act on one with '$SKILL_DIR/scripts/peek.
 says whether it worked and, if not, why.
 EOF
 )"
+    # Pre-#1248 agmsg (1.3.0 and earlier) wrote this same text but named the
+    # per-driver notes file SKILL.md instead of README.md (renamed in #1248,
+    # commit a54c9e23) -- that is the only byte that ever differed. Accept
+    # either form as agmsg's own generated content so an upgraded user's
+    # untouched rule file still migrates instead of being refused. The old
+    # path lives in its own file (see legacy-pre1248-notes-path.sh), not
+    # written out literally here, so a #1249 regression elsewhere still fails.
+    local LEGACY_PRE1248_NOTES_PATH
+    # shellcheck disable=SC1091
+    source "$(dirname "${BASH_SOURCE[0]}")/legacy-pre1248-notes-path.sh"
+    local expected_pre1248="${expected/drivers\/terminals\/<terminal>\/README.md/$LEGACY_PRE1248_NOTES_PATH}"
     actual="$(cat "$file")"
-    if [ "$actual" != "$expected" ]; then
+    if [ "$actual" != "$expected" ] && [ "$actual" != "$expected_pre1248" ]; then
       echo 'existing rule file is not in agmsg format' >&2; return 1
     fi
   fi
