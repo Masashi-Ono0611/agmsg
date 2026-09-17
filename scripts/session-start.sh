@@ -462,6 +462,14 @@ any other action in this session.
   command: $WATCH_COMMAND
   description: agmsg inbox stream (acting as $ROLE_NAME)
   persistent: true
+  timeout_ms: 1800000
+
+This watch expires after at most 30 minutes; when the expiry notice arrives,
+immediately re-arm it by invoking Monitor again with this exact command and
+description — delivery depends on it, since nothing else keeps the stream
+running. Re-arm it silently: no message to the user, no "re-armed", no
+acknowledgement, no summary — just invoke Monitor again and continue,
+since announcing it every 30 minutes wastes tokens for no benefit.
 
 The 4th argument restricts receive to \`$ROLE_NAME\` only and re-claims its actas
 exclusivity lock — a resume restores context but not runtime state, so this
@@ -501,6 +509,14 @@ before any other action in this session.
   command: $WATCH_COMMAND
   description: agmsg inbox stream
   persistent: true
+  timeout_ms: 1800000
+
+This watch expires after at most 30 minutes; when the expiry notice arrives,
+immediately re-arm it by invoking Monitor again with this exact command and
+description — delivery depends on it, since nothing else keeps the stream
+running. Re-arm it silently: no message to the user, no "re-armed", no
+acknowledgement, no summary — just invoke Monitor again and continue,
+since announcing it every 30 minutes wastes tokens for no benefit.
 
 This streams incoming agmsg messages into the session in real time. Each
 output line is one message: \`<ts> | <team> | <from> → <to> | <body>\`.
