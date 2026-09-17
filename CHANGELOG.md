@@ -8,7 +8,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 Teams that use remote sync should update every machine to 1.3.1 or later. From this release the client reports its version to the server, so older clients can be told apart.
 
-The Antigravity monitor remains experimental: it is usable only on a dedicated seat that no person types into, started with `agy-tui ... -- --dangerously-skip-permissions`. For interactive Antigravity use, keep the default turn delivery.
+The Antigravity monitor remains experimental: it is usable only on a dedicated seat that no person types into, started with `agy-tui ... -- --dangerously-skip-permissions`. For interactive Antigravity use, keep the default turn delivery. It runs on macOS and Linux only; on other systems the monitor refuses to start. This release's live check covered macOS only.
 
 ### Added
 - The client sends its version to the server in an `Agmsg-Client-Version` header on every request; a request without it comes from a client older than 1.3.1 (#1290)
