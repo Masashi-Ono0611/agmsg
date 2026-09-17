@@ -1032,3 +1032,123 @@ sys.exit(os.waitstatus_to_exitcode(status))
     if (child.exitCode === null) child.kill('SIGKILL');
   }
 });
+
+test('agy-tui が -- の後ろで受け取った引数だけを起動されるagyへそのまま渡り、その前の未知optionは拒否する (#1291)', async () => {
+  // The pass-through has to be scoped to an explicit --, not "whatever
+  // agy-tui.sh does not recognize": review of the first version of this fix
+  // found that agy-tui.sh's old catch-all treated ANY unrecognized option as
+  // the start of pass-through, -- or not, so a typo like --tema would launch
+  // agy carrying it instead of failing loudly. Both directions are pinned
+  // here, through the real entry point (agy-tui.sh itself, not the Python
+  // supervisor invoked directly -- bypassing agy-tui.sh would let this pass
+  // even if the shell layer stopped forwarding args after -- correctly).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agmsg-tui-argv-test-'));
+  const install = path.join(dir, 'install');
+  const project = path.join(dir, 'project');
+  fs.mkdirSync(install);
+  fs.mkdirSync(project);
+  fs.cpSync(path.join(repo, 'scripts'), path.join(install, 'scripts'), { recursive: true });
+  const env = {
+    ...process.env,
+    AGMSG_STORAGE_DRIVER: 'sqlite',
+    AGMSG_STORAGE_PATH: path.join(install, 'db'),
+    AGMSG_CONFIG: path.join(dir, 'config.json'),
+  };
+  const run = (script, args) => {
+    const result = spawnSync('bash', [path.join(install, 'scripts', script), ...args], { env, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    return result.stdout;
+  };
+  run('join.sh', ['fixture', 'worker', 'antigravity', project]);
+  run('delivery.sh', ['set', 'monitor', 'antigravity', project]);
+  const dump = path.join(dir, 'argv-dump.txt');
+  const fake = path.join(dir, 'agy');
+  fs.writeFileSync(
+    fake,
+    `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(dump)}\necho READY\nwhile :; do sleep 1; done\n`,
+    { mode: 0o700 },
+  );
+  const agyTuiPath = path.join(install, 'scripts/drivers/types/antigravity/agy-tui.sh');
+
+  // A typo before -- must be refused, not silently forwarded to agy.
+  const typo = spawnSync(
+    'bash',
+    [agyTuiPath, 'status', '--project', project, '--team', 'fixture', '--name', 'worker', '--tema', 'oops'],
+    { env, encoding: 'utf8' },
+  );
+  assert.notEqual(typo.status, 0);
+  assert.match(typo.stderr, /unknown option --tema/);
+
+  // A trailing -- with nothing after it must not crash: bash 3.2 (what CI's
+  // macOS runners actually use) treats expanding an assigned-but-empty array
+  // under `set -u` as an unbound-variable error, not silently-empty.
+  const emptyDashDash = spawnSync(
+    'bash',
+    [agyTuiPath, 'status', '--project', project, '--team', 'fixture', '--name', 'worker', '--'],
+    { env, encoding: 'utf8' },
+  );
+  assert.equal(emptyDashDash.status, 0, emptyDashDash.stderr + emptyDashDash.stdout);
+
+  // --batch/--confirm-id are supervisor flags for ack/replay recovery, not
+  // agy-tui's own -- they relied on the old catch-all to reach the
+  // supervisor and were the actual CI failure once that catch-all became a
+  // hard refusal: without an explicit exemption they read as a typo too.
+  const ack = spawnSync(
+    'bash',
+    [agyTuiPath, 'ack', '--project', project, '--team', 'fixture', '--name', 'worker', '--batch', 'batch-1', '--confirm-id', 'message-1'],
+    { env, encoding: 'utf8' },
+  );
+  assert.equal(ack.status, 1, ack.stderr + ack.stdout);
+  assert.match(ack.stderr, /no reservation or state exists for recovery/);
+
+  const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
+  const command = 'stty rows 40 cols 120; exec ' + [
+    'bash', agyTuiPath, '--project', project, '--team', 'fixture', '--name', 'worker',
+    '--agy', fake, '--', '--dangerously-skip-permissions', '--extra-marker=agmsg-e2e-42',
+  ].map(quote).join(' ');
+  const ptyRelay = path.join(dir, 'pty-relay.py');
+  if (process.platform === 'darwin') fs.writeFileSync(ptyRelay, `
+import os
+import pty
+import select
+import sys
+
+pid, master = pty.fork()
+if pid == 0:
+    os.execlp('bash', 'bash', '-c', sys.argv[1])
+while True:
+    ready, _, _ = select.select([master, sys.stdin.buffer], [], [])
+    if master in ready:
+        try:
+            data = os.read(master, 8192)
+        except OSError:
+            break
+        if not data:
+            break
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    if sys.stdin.buffer in ready:
+        data = os.read(sys.stdin.fileno(), 8192)
+        if not data:
+            break
+        os.write(master, data)
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+`);
+  const spawnPty = cmd => process.platform === 'darwin'
+    ? spawn('python3', [ptyRelay, cmd], { env, stdio: ['pipe', 'pipe', 'pipe'] })
+    : spawn('script', ['-qefc', cmd, '/dev/null'], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawnPty(command);
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk.toString(); });
+  child.stderr.on('data', chunk => { output += chunk.toString(); });
+  try {
+    for (let i = 0; i < 200 && !fs.existsSync(dump); i += 1) await new Promise(resolve => setTimeout(resolve, 50));
+    assert.ok(fs.existsSync(dump), `fake agyの起動を検知できませんでした: ${output}`);
+    const argv = fs.readFileSync(dump, 'utf8').split('\n').filter(Boolean);
+    assert.deepEqual(argv, ['--dangerously-skip-permissions', '--extra-marker=agmsg-e2e-42']);
+  } finally {
+    child.kill('SIGKILL');
+    await Promise.race([once(child, 'close'), new Promise(resolve => setTimeout(resolve, 3000))]);
+  }
+});
