@@ -126,7 +126,16 @@ agmsg_session_start() {
     safe_pairs="${safe_pairs:+$safe_pairs$'\n'}${candidate_team}"$'\t'"${candidate_name}"
   done <<< "$PAIRS"
   PAIRS="$safe_pairs"
-  [ -n "$PAIRS" ] || exit 0
+  # A request is an authority hand-off, not a best-effort hint. Never derive a
+  # path from an absent RUN_DIR or publish a record whose type is empty: callers
+  # that cannot provide either input must leave the previous request untouched.
+  if [ -z "${TYPE:-}" ] || [ -z "${RUN_DIR:-}" ]; then
+    echo "codex SessionStart: missing TYPE or RUN_DIR; refusing bridge request publication" >&2
+    return 0
+  fi
+  request_type_value="${TYPE:-}"
+  request_run_dir="${RUN_DIR:-}"
+  pair_count=$(printf '%s\n' "${PAIRS:-}" | grep -c . || true)
   app_server="${AGMSG_CODEX_BRIDGE_APP_SERVER:-}"
   if [ -z "$app_server" ]; then
     agent_pid=$(agmsg_agent_pid "$TYPE" 2>/dev/null || true)
@@ -161,8 +170,6 @@ agmsg_session_start() {
     fi
     app_server="$(_agmsg_codex_app_server_url "$PROJECT")"
   fi
-  [ -n "$app_server" ] || exit 0
-
   if [ "${AGMSG_CODEX_BRIDGE_LAUNCHER:-}" = "1" ]; then
     # #1254: the request file is this SEAT's own, never a project-wide one --
     # AGMSG_CODEX_SEAT_KEY reaches this hook the same way AGMSG_CODEX_BRIDGE_
@@ -175,16 +182,30 @@ agmsg_session_start() {
     fi
     seat_key="${AGMSG_CODEX_SEAT_KEY:-}"
     _agmsg_codex_seat_key_ok "$seat_key" || exit 0
-    request_file="$RUN_DIR/codex-bridge-request.$seat_key"
+    request_file="$request_run_dir/codex-bridge-request.$seat_key"
     tmp_request="$request_file.$$"
-    mkdir -p "$RUN_DIR" 2>/dev/null || true
-    printf '%s\t%s\t%s\n' "$TYPE" "$thread_id" "$app_server" > "$tmp_request"
+    mkdir -p "$request_run_dir" 2>/dev/null || true
+    request_pair_count="$pair_count"
+    if [ "$request_pair_count" -eq 1 ] && [ -n "$app_server" ]; then
+      IFS=$'\t' read -r request_team request_name <<EOF
+$PAIRS
+EOF
+      printf '%s\t%s\t%s\t%s\t%s\n' "$request_type_value" "$thread_id" "$app_server" \
+        "$request_team" "$request_name" > "$tmp_request"
+    else
+      # A seat with zero or multiple matching roles has no unambiguous pair;
+      # when the endpoint is unavailable, a single matching role is also held
+      # back. Publish the thread and an empty pair so a stale role is retired;
+      # the dispatcher waits instead of fanning out project roles.
+      printf '%s\t%s\t%s\t\n' "$request_type_value" "$thread_id" "$app_server" > "$tmp_request"
+    fi
     mv "$tmp_request" "$request_file"
     exit 0
   fi
 
+  [ -n "$app_server" ] || exit 0
+
   mkdir -p "$RUN_DIR" 2>/dev/null || true
-  pair_count=$(printf '%s\n' "$PAIRS" | grep -c . || true)
   if [ "$pair_count" = "1" ]; then
     IFS=$'\t' read -r key_team key_name <<EOF
 $PAIRS
