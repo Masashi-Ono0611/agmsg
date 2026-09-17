@@ -4,6 +4,33 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-09-17
+
+Teams that use remote sync should update every machine to 1.3.1 or later. From this release the client reports its version to the server, so older clients can be told apart.
+
+### Added
+- The client sends its version to the server in an `Agmsg-Client-Version` header on every request; a request without it comes from a client older than 1.3.1 (#1290)
+- `peek` and `poke` have an agent-native substitute on terminals with no addressable pane (#1256)
+- `agy-tui` passes everything after `--` to `agy`, and rejects any other unknown option (#1291)
+
+### Fixed
+- Codex: each seat runs its own app-server, and its bridge dispatcher starts only the role recorded for that seat instead of every role in the project (#1273, #1285)
+- Codex: a stale app-server URL left in a request file no longer overrides the live endpoint (#1305)
+- `install --update` restarts a sync engine that was running, on the new code, instead of leaving it stale (#1288)
+- Receiving tolerates unknown fields in a message, so a newer sender does not get its messages rejected (#1282)
+- Claude Code Monitor directives set a 30-minute timeout and tell the agent to re-arm silently when a watch expires (#1287)
+- Antigravity monitor works on macOS (#1253); switching an existing 1.3.0 project to monitor delivery is accepted (#1289, #1303); user-facing messages are in English (#1281); a paused start says how to resume (#1291)
+- Sync engines supervised by systemd are detected (#1006)
+- A backtick in a SQL comment no longer runs as a command substitution (#1276)
+- herdr instance names containing a backslash survive percent-decoding (#1275)
+
+### Changed
+- Antigravity's read-reservation guard lives in the Antigravity driver (#1271)
+
+### Documentation
+- Antigravity permission guidance covers the exact invocation shapes `agy` prompts for, including `bash -lc` (#1289)
+- The design RFC describes tag subscriptions, session-start identity, and delivery through the driver (#1251, #1267)
+
 ## [1.3.0] - 2026-09-14
 
 ### Added
