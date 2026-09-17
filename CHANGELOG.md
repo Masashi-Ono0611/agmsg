@@ -22,8 +22,9 @@ The Antigravity monitor remains experimental: it is usable only on a dedicated s
 - `install --update` restarts a sync engine that was running, on the new code, instead of leaving it stale (#1288)
 - Receiving tolerates unknown fields in a message, so a newer sender does not get its messages rejected (#1282)
 - Claude Code Monitor directives set a 30-minute timeout and tell the agent to re-arm silently when a watch expires (#1287)
-- Antigravity monitor delivery, which is experimental, now also runs on macOS (#1253); switching an existing 1.3.0 project to monitor delivery is accepted (#1289, #1303); user-facing messages are in English (#1281); a refused claim names the process that holds the role and how to release it (#1301). See docs/antigravity-monitor-beta.md for its limitations before enabling it.
+- Antigravity monitor delivery, which is experimental, now also runs on macOS (#1253); switching an existing 1.3.0 project to monitor delivery is accepted (#1289, #1303); user-facing messages are in English (#1281); a refused claim names the process that holds the role and how to release it (#1301); the driver's messages and comments are all in English (#1313). See docs/antigravity-monitor-beta.md for its limitations before enabling it.
 - Sync engines supervised by systemd are detected (#1006)
+- Windows: every jq call in the sqlite driver forces binary output, so values read back from the server no longer carry a stray carriage return and fail the sequence check (#1277, #1278)
 - A backtick in a SQL comment no longer runs as a command substitution (#1276)
 - herdr instance names containing a backslash survive percent-decoding (#1275)
 
