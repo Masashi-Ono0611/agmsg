@@ -19,7 +19,7 @@ Teams that use remote sync should update every machine to 1.3.1 or later. From t
 - `install --update` restarts a sync engine that was running, on the new code, instead of leaving it stale (#1288)
 - Receiving tolerates unknown fields in a message, so a newer sender does not get its messages rejected (#1282)
 - Claude Code Monitor directives set a 30-minute timeout and tell the agent to re-arm silently when a watch expires (#1287)
-- Antigravity monitor works on macOS (#1253); switching an existing 1.3.0 project to monitor delivery is accepted (#1289, #1303); user-facing messages are in English (#1281); a paused start says how to resume (#1291)
+- Antigravity monitor works on macOS (#1253); switching an existing 1.3.0 project to monitor delivery is accepted (#1289, #1303); user-facing messages are in English (#1281)
 - Sync engines supervised by systemd are detected (#1006)
 - A backtick in a SQL comment no longer runs as a command substitution (#1276)
 - herdr instance names containing a backslash survive percent-decoding (#1275)
