@@ -196,7 +196,12 @@ settings_file() {
   run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
   [[ "$output" == *"mode: monitor"* ]]
-  [[ "$output" == *"watch processes:"* ]]
+  grep -qF -- "watch processes:" <<<"$output"
+  # `mode: monitor` reports configuration, not the runtime Monitor task; the
+  # claude-code-only note points at TaskList, not the background-task footer
+  # (#270).
+  grep -qF -- "configured hooks only" <<<"$output"
+  [[ "$output" == *"Verify with TaskList"* ]]
 }
 
 # A pid that exists but this user cannot signal, so `kill -0` fails with EPERM
@@ -716,6 +721,10 @@ _seed_role_record() {
   local cmdline; cmdline=$(printf '%s\n' "$output" | sed -n 's/^[[:space:]]*command: //p')
   eval "set -- $cmdline"
   [ "$5" = "alice" ]
+  # The role-filtered directive gets its own verification guidance too, named
+  # for THIS role's suffixed description -- not just the generic branch's
+  # (#270: this branch used to exit before that block existed).
+  [[ "$output" == *'Monitor(agmsg inbox stream (acting as alice)) starts'* ]]
 }
 
 @test "session-start: an unrecorded sid emits the generic directive (#339)" {
@@ -3247,6 +3256,37 @@ JSON
 
   kill "$watch_pid" 2>/dev/null || true
   wait 2>/dev/null || true
+}
+
+# --- devin (manual-only: delivery_modes=off, no automatic hook) ---
+
+@test "delivery devin: status is manual/off" {
+  run bash "$SCRIPTS/delivery.sh" status devin "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "mode: off" ]]
+}
+
+@test "delivery devin: rejects automatic modes" {
+  local mode
+  for mode in turn monitor both; do
+    run bash "$SCRIPTS/delivery.sh" set "$mode" devin "$TEST_PROJECT"
+    [ "$status" -ne 0 ]
+    [[ "$output" =~ "not supported for devin" ]]
+  done
+}
+
+@test "delivery devin: rejects unknown mode" {
+  run bash "$SCRIPTS/delivery.sh" set bogus devin "$TEST_PROJECT"
+  [ "$status" -ne 0 ]
+  [[ "$output" =~ "Unknown mode" ]]
+}
+
+@test "delivery devin: accepts off without error" {
+  run bash "$SCRIPTS/delivery.sh" set off devin "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  grep -qF "Delivery mode set to 'off'" <<<"$output"
+  grep -qF "manual inbox checks only" <<<"$output"
+  refute grep -qF "AGMSG-DIRECTIVE" <<<"$output"
 }
 
 # --- grok-build (turn|off via a markdown rule file .grok/rules/agmsg.md) ---

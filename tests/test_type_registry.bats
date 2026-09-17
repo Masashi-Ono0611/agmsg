@@ -43,11 +43,11 @@ write_node_launcher_fixtures() {
   printf '// stub node launcher fixture\n' > "$nd/nodetype-launcher.mjs"
 }
 
-@test "type-registry: known_types lists the ten built-ins" {
+@test "type-registry: known_types lists the eleven built-ins" {
   run env -i PATH="$PATH" bash -c \
     "source '$SCRIPTS/lib/type-registry.sh'; agmsg_known_types | sort -u | paste -sd, -"
   [ "$status" -eq 0 ]
-  [ "$output" = "agmsg-app,antigravity,claude-code,codex,copilot,cursor,gemini,grok-build,hermes,opencode" ]
+  [ "$output" = "agmsg-app,antigravity,claude-code,codex,copilot,cursor,devin,gemini,grok-build,hermes,opencode" ]
 }
 
 @test "type-registry: is_known_type accepts a built-in and rejects a bogus type" {
@@ -256,8 +256,8 @@ EOF
   done <<<"$renderable_types"
 }
 
-@test "type-registry: spawnable set is exactly eight of the ten built-ins (#277, #279)" {
-  # hermes deliberately stays out (#279): no known CLI mode starts it
+@test "type-registry: spawnable set is exactly eight of the eleven built-ins (#277, #279)" {
+  # hermes and devin deliberately stay out (#279): no known CLI mode starts them
   # interactive with a seeded initial prompt. agmsg-app also stays out: it's
   # the desktop app itself (spawnable=no), not a spawnable agent type.
   run env -i PATH="$PATH" bash -c \
