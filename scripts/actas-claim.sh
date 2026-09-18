@@ -130,6 +130,51 @@ while IFS= read -r team; do
   agmsg_role_session_record "$team" "$NAME" "$BARE_SID" "$PROJECT_PHYS" "$TYPE" "$SESSION_ID" || true
 done <<< "$TEAMS"
 
+# A monitored Codex seat's dispatcher reads its role pair from the seat request
+# rather than inferring it from the project roster. Actas can change the role
+# after SessionStart, so publish the new pair (or an empty pair when the claim
+# is ambiguous) atomically at the same event. Other agent types have no request
+# file and do not enter this branch.
+if [ -z "${SKILL_DIR:-}" ] || [ -z "${TYPE:-}" ]; then
+  echo "actas claim: missing TYPE or SKILL_DIR; refusing bridge request publication" >&2
+elif [ "$TYPE" = "codex" ] && [ -n "${AGMSG_CODEX_SEAT_KEY:-}" ] \
+  && [ -r "$SCRIPT_DIR/drivers/types/codex/_seat-key.sh" ]; then
+  # shellcheck disable=SC1091
+  . "$SCRIPT_DIR/drivers/types/codex/_seat-key.sh"
+  if _agmsg_codex_seat_key_ok "$AGMSG_CODEX_SEAT_KEY"; then
+    request_file="$SKILL_DIR/run/codex-bridge-request.$AGMSG_CODEX_SEAT_KEY"
+    request_server="${AGMSG_CODEX_BRIDGE_APP_SERVER:-}"
+    if [ -z "$request_server" ] && [ -f "$request_file" ]; then
+      _request_line=""
+      IFS= read -r _request_line < "$request_file" 2>/dev/null || true
+      _agmsg_codex_request_parse "$_request_line" || true
+      request_server="${AGMSG_CODEX_REQUEST_APP_SERVER:-}"
+    fi
+    if [ -z "$request_server" ] && [ -r "$SCRIPT_DIR/drivers/types/codex/_app-server.sh" ]; then
+      # Resume can enter actas from the app-server process without inheriting
+      # its URL. Recover the same per-seat URL from the atomic seat record.
+      . "$SCRIPT_DIR/drivers/types/codex/_app-server.sh"
+      request_server="$(_agmsg_codex_app_server_url "$PROJECT")"
+    fi
+    request_tmp="$request_file.$$"
+    mkdir -p "$SKILL_DIR/run" 2>/dev/null || true
+    team_count=$(printf '%s\n' "$TEAMS" | grep -c . || true)
+    if [ "$team_count" -eq 1 ] && [ -n "$request_server" ]; then
+      IFS= read -r request_team <<EOF
+$TEAMS
+EOF
+      printf '%s\t%s\t%s\t%s\t%s\n' "$TYPE" "$BARE_SID" "$request_server" "$request_team" "$NAME" > "$request_tmp"
+    else
+      # Publish an empty-pair tombstone even when this seat's endpoint is
+      # unavailable. This retires the old role instead of leaving it as the
+      # dispatcher's stale authority; a later SessionStart can publish the
+      # non-empty pair once the per-seat URL is recoverable.
+      printf '%s\t%s\t%s\t\n' "$TYPE" "$BARE_SID" "$request_server" > "$request_tmp"
+    fi
+    mv "$request_tmp" "$request_file"
+  fi
+fi
+
 # Name this pane for the role just claimed, so peek/poke can reach a session a
 # human started by hand — not only one `spawn` placed. `|| true` twice over: the
 # claim is what the caller is waiting on, and naming must not be able to fail it

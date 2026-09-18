@@ -13,7 +13,7 @@ set -euo pipefail
 exec 3>&- 4>&-
 
 # Runs outside Codex's tool sandbox and owns the app-server connections. The
-# dispatcher starts one bridge per recorded Codex role in this project.
+# dispatcher starts bridges only for roles recorded as belonging to this seat.
 #
 # On codex 0.141+ the SessionStart hook cannot resolve the thread id
 # (CODEX_THREAD_ID is not exported and no rollout is written for --remote
@@ -165,6 +165,41 @@ resolve_identity() {  # prints "team<TAB>name" lines for the project's codex rol
     | sort -u
 }
 
+# Read the seat's own request record. SessionStart writes the already-narrowed
+# role pair after the TUI claims it; a missing or ambiguous pair is not a
+# reason to consult the project-wide identity list.
+read_seat_request() {
+  REQUEST_THREAD=""
+  REQUEST_APP_SERVER="$APP_SERVER"
+  REQUEST_PAIR=""
+  local request_line="" request_type="" request_team="" request_name=""
+  [ -f "$REQUEST_FILE" ] || return 1
+  IFS= read -r request_line < "$REQUEST_FILE" 2>/dev/null || return 1
+  _agmsg_codex_request_parse "$request_line" || return 1
+  request_type="${AGMSG_CODEX_REQUEST_TYPE:-}"
+  REQUEST_THREAD="${AGMSG_CODEX_REQUEST_THREAD:-}"
+  REQUEST_APP_SERVER="${AGMSG_CODEX_REQUEST_APP_SERVER:-}"
+  request_team="${AGMSG_CODEX_REQUEST_TEAM:-}"
+  request_name="${AGMSG_CODEX_REQUEST_NAME:-}"
+  [ "$request_type" = "$TYPE" ] || return 1
+  [ -n "$REQUEST_THREAD" ] || return 1
+  [ -n "$request_team" ] && [ -n "$request_name" ] || return 1
+  REQUEST_PAIR="$request_team$TAB$request_name"
+  return 0
+}
+
+request_pair_matches_record() {
+  local pair="$1" team name record_project record_project_phys
+  IFS="$TAB" read -r team name <<EOF
+$pair
+EOF
+  agmsg_role_session_load "$team" "$name" 2>/dev/null || true
+  [ "${AGMSG_ROLE_SESSION_UUID:-}" = "$REQUEST_THREAD" ] || return 1
+  record_project="${AGMSG_ROLE_SESSION_PROJECT:-}"
+  record_project_phys="$(agmsg_canonical_path "$record_project" 2>/dev/null || printf '%s' "$record_project")"
+  [ "$record_project_phys" = "$PROJECT_PHYS" ]
+}
+
 # identities.sh opens and parses EVERY teams/*/config.json on every call: two
 # sqlite3 processes per team file, ~57 processes and ~145 ms total on an
 # eight-team install, and a poll loop was paying that several times a second.
@@ -267,8 +302,9 @@ build_safety_state() {
   done <<< "$identity"
 }
 
-# actas may register the role a moment after launch, so retry while the parent
-# (codex-monitor.sh) is alive. Multiple identities are intentional (#150).
+# The role is claimed a moment after launch, so retry while the parent
+# (codex-monitor.sh) is alive. Never substitute the project's other identities
+# when this seat's own record is not available.
 # The parent only dispatches. Every role receives an independent child launcher
 # and therefore an independent bridge bound to its own recorded thread.
 if [ -z "$ROLE_PAIR" ]; then
@@ -278,14 +314,27 @@ if [ -z "$ROLE_PAIR" ]; then
     && _agmsg_pid_alive_local "$LIFETIME_PID"; do
     refresh_identity_cache
     current_pairs="$IDENTITY_CACHE"
+    seat_pairs=""
+    if read_seat_request && request_pair_matches_record "$REQUEST_PAIR" \
+      && pair_registered "$REQUEST_PAIR" "$current_pairs"; then
+      seat_pairs="$REQUEST_PAIR"
+    fi
     [ "$IDENTITY_CACHE_FRESH" = "1" ] || poll_reset
+    if [ -z "$seat_pairs" ]; then
+      echo "codex-bridge-launcher: this seat has no unambiguous request pair; waiting without dispatch" >&2
+      # No owned pair is authoritative: forget any children this seat used to
+      # own so a later re-registration can be dispatched again.
+      known_pairs=""
+      poll_sleep
+      continue
+    fi
     # Forget pairs that are no longer registered. A child now exits by itself
     # once its own registration is gone, so a stale known_pairs entry would
     # suppress the respawn if that same pair were registered again later.
     retained=""
     while IFS= read -r seen_pair; do
       [ -n "$seen_pair" ] || continue
-      pair_registered "$seen_pair" "$current_pairs" || continue
+      pair_registered "$seen_pair" "$seat_pairs" || continue
       retained="${retained:+$retained$'\n'}$seen_pair"
     done <<< "$known_pairs"
     known_pairs="$retained"
@@ -298,7 +347,7 @@ if [ -z "$ROLE_PAIR" ]; then
       nohup "$0" "$TYPE" "$PROJECT" "$APP_SERVER" "$LIFETIME_PID" "$child_pair" >/dev/null 2>&1 3>&- 4>&- &
       known_pairs="${known_pairs:+$known_pairs$'\n'}$child_pair"
       poll_reset
-    done <<< "$current_pairs"
+    done <<< "$seat_pairs"
     poll_sleep
   done
   # #1254: this seat's TUI (LIFETIME_PID) is gone. Stop the seat's own
@@ -311,7 +360,7 @@ if [ -z "$ROLE_PAIR" ]; then
   exit 0
 fi
 
-# One live child per (project, role) — #485. Children are `nohup`'d and bound to
+# One live child per (seat, role) — #485. Children are `nohup`'d and bound to
 # the shared app-server, while the dispatcher runs in the TUI's process group and
 # is killed by the SIGHUP a pane teardown delivers. A replacement dispatcher
 # starts with an empty known_pairs and re-spawns the ENTIRE child set, so without
@@ -347,7 +396,12 @@ safety_state="$SAFETY_STATE"
 thread_hint="loaded"
 if [ -f "$REQUEST_FILE" ]; then
   _hint_type=""; _hint_thread=""; _hint_app=""
-  IFS="$TAB" read -r _hint_type _hint_thread _hint_app < "$REQUEST_FILE" 2>/dev/null || true
+  _hint_line=""
+  IFS= read -r _hint_line < "$REQUEST_FILE" 2>/dev/null || true
+  _agmsg_codex_request_parse "$_hint_line" || true
+  _hint_type="${AGMSG_CODEX_REQUEST_TYPE:-}"
+  _hint_thread="${AGMSG_CODEX_REQUEST_THREAD:-}"
+  _hint_app="${AGMSG_CODEX_REQUEST_APP_SERVER:-}"
   [ -n "${_hint_thread:-}" ] && thread_hint="$_hint_thread"
 fi
 safe_ids=""
@@ -666,6 +720,26 @@ else
   bridge_run=("$NODE_BIN" "$SCRIPT_DIR/codex-bridge.js")
 fi
 
+# Retire this role's bridge only when its lease proves the pid is the bridge
+# previously launched for this exact project and pair. A numeric pid alone is
+# not enough: after a quick exit it may already name an unrelated process.
+retire_recorded_bridge() {
+  local old_pid="" lease="" token=""
+  local lproj lpairs lhost lpid lstart lstartsrc
+  [ -f "$pidfile" ] || return 0
+  IFS= read -r old_pid < "$pidfile" 2>/dev/null || true
+  _agmsg_pid_valid "$old_pid" || return 0
+  lease="$RUN_DIR/codex-bridge-lease.$old_pid"
+  [ -f "$lease" ] || return 0
+  _read_lease "$lease" || return 0
+  [ "$lpid" = "$old_pid" ] || return 0
+  [ "$lproj" = "$PROJECT_HASH" ] || return 0
+  [ "$lpairs" = "$BRIDGE_PAIRS_HASH" ] || return 0
+  token="$(_start_token "$old_pid" 2>/dev/null || true)"
+  [ -n "$token" ] && [ "$token" = "$lstartsrc	$lstart" ] || return 0
+  kill "$old_pid" 2>/dev/null || true
+}
+
 deregistered_ticks=0
 while _agmsg_pid_alive_local "$PARENT_PID"; do
   # Resolved once per iteration and threaded through the fingerprint, so a tick
@@ -684,14 +758,7 @@ while _agmsg_pid_alive_local "$PARENT_PID"; do
   if [ -z "$current_ids" ]; then
     deregistered_ticks=$((deregistered_ticks + 1))
     if [ "$deregistered_ticks" -ge 2 ]; then
-      if [ -f "$pidfile" ]; then
-        old_pid=""
-        IFS= read -r old_pid < "$pidfile" 2>/dev/null || true
-        # _agmsg_pid_valid, not just non-empty: `kill 0` signals this
-        # launcher's own process group, so a corrupt pidfile would tear down
-        # the dispatcher and its siblings instead of one stale bridge.
-        _agmsg_pid_valid "$old_pid" && kill "$old_pid" 2>/dev/null || true
-      fi
+      retire_recorded_bridge
       exit 0
     fi
     sleep 0.3
@@ -699,16 +766,33 @@ while _agmsg_pid_alive_local "$PARENT_PID"; do
   fi
   deregistered_ticks=0
 
+  # Check the seat request before refreshing role-record safety state. Actas
+  # publishes role changes here; retire this child immediately when its pair is
+  # no longer the selected one.
+  request_pair=""
+  _rtype=""; _rthread=""; _rapp=""; _rteam=""; _rname=""
+  if [ -f "$REQUEST_FILE" ]; then
+    _request_line=""
+    IFS= read -r _request_line < "$REQUEST_FILE" 2>/dev/null || true
+    _agmsg_codex_request_parse "$_request_line" || true
+    _rtype="${AGMSG_CODEX_REQUEST_TYPE:-}"; _rthread="${AGMSG_CODEX_REQUEST_THREAD:-}"
+    _rapp="${AGMSG_CODEX_REQUEST_APP_SERVER:-}"; _rteam="${AGMSG_CODEX_REQUEST_TEAM:-}"
+    _rname="${AGMSG_CODEX_REQUEST_NAME:-}"
+    if [ -n "${_rteam:-}" ] && [ -n "${_rname:-}" ]; then
+      request_pair="$_rteam$TAB$_rname"
+    fi
+  fi
+  if [ "$request_pair" != "$ROLE_PAIR" ]; then
+    retire_recorded_bridge
+    exit 0
+  fi
+
   # actas can join a second role after SessionStart. Re-exec through the same
   # safety filter when the registration set changes, replacing the old bridge
   # so the new role is actually subscribed instead of being stranded.
   build_safety_state "$current_ids"
   if [ "$SAFETY_STATE" != "$safety_state" ]; then
-    if [ -f "$pidfile" ]; then
-      old_pid=""
-      IFS= read -r old_pid < "$pidfile" 2>/dev/null || true
-      _agmsg_pid_valid "$old_pid" && kill "$old_pid" 2>/dev/null || true
-    fi
+    retire_recorded_bridge
     exec "$0" "$TYPE" "$PROJECT" "$APP_SERVER" "$PARENT_PID" "$ROLE_PAIR"
   fi
   # Resolve the thread this iteration would launch against. A request file may
@@ -722,14 +806,12 @@ while _agmsg_pid_alive_local "$PARENT_PID"; do
   thread_id="loaded"
   req_app_server="$APP_SERVER"
   if [ -f "$REQUEST_FILE" ]; then
-    _rtype=""; _rthread=""; _rapp=""
-    IFS="$TAB" read -r _rtype _rthread _rapp < "$REQUEST_FILE" 2>/dev/null || true
     [ -n "${_rthread:-}" ] && thread_id="$_rthread"
   fi
 
-  # A child launcher is role-scoped. The project request file only supplies a
-  # current app-server endpoint; its thread belongs to whichever role most
-  # recently fired SessionStart and must never override this role's seat.
+  # A child launcher is role-scoped. The seat request supplies the pair and
+  # thread selected by SessionStart; the role-session record is re-read and
+  # must agree before this child can bind a bridge.
   IFS="$TAB" read -r team name <<EOF
 $ids
 EOF
@@ -738,7 +820,8 @@ EOF
   rec_project="$AGMSG_ROLE_SESSION_PROJECT"
   rec_owner="$AGMSG_ROLE_SESSION_OWNER"
   rec_project_phys="$(agmsg_canonical_path "$rec_project" 2>/dev/null || printf '%s' "$rec_project")"
-  if [ -z "$rec_thread" ] || [ "$rec_project_phys" != "$PROJECT_PHYS" ]; then
+  if [ -z "$rec_thread" ] || [ "$rec_project_phys" != "$PROJECT_PHYS" ] \
+    || [ "$rec_thread" != "${_rthread:-}" ]; then
     # A role with no record (or one seated in another project) stays
     # deliberately unsubscribed (#150) and waits for a record to appear. That
     # wait is open-ended, so it has to be the cheapest path in the file.
@@ -843,6 +926,31 @@ EOF
   launched_pid=$!
   printf '%s\n' "$launched_pid" > "$pidfile"
   if [ -n "${AGMSG_CODEX_BRIDGE_CMD:-}" ]; then
+    # A custom bridge is foregrounded by the test harness, so a plain wait
+    # would hide a role change until the bridge exits on its own. Poll the
+    # request while it runs and retire this exact leased bridge when the seat
+    # selects another pair; the normal outer loop handles the same transition
+    # for the default bridge, which is not waited on here.
+    while _agmsg_pid_alive_local "$launched_pid"; do
+      _bridge_request_pair=""
+      if [ -f "$REQUEST_FILE" ]; then
+        _bridge_request_line=""
+        IFS= read -r _bridge_request_line < "$REQUEST_FILE" 2>/dev/null || true
+        _agmsg_codex_request_parse "$_bridge_request_line" || true
+        _bridge_req_type="${AGMSG_CODEX_REQUEST_TYPE:-}"
+        _bridge_req_thread="${AGMSG_CODEX_REQUEST_THREAD:-}"
+        _bridge_req_app="${AGMSG_CODEX_REQUEST_APP_SERVER:-}"
+        _bridge_req_team="${AGMSG_CODEX_REQUEST_TEAM:-}"
+        _bridge_req_name="${AGMSG_CODEX_REQUEST_NAME:-}"
+        if [ -n "${_bridge_req_team:-}" ] && [ -n "${_bridge_req_name:-}" ]; then
+          _bridge_request_pair="$_bridge_req_team$TAB$_bridge_req_name"
+        fi
+      fi
+      if [ "$_bridge_request_pair" != "$ROLE_PAIR" ]; then
+        retire_recorded_bridge
+      fi
+      sleep 0.2
+    done
     wait "$launched_pid" 2>/dev/null || true
     recorded_pid=""
     IFS= read -r recorded_pid < "$pidfile" 2>/dev/null || true

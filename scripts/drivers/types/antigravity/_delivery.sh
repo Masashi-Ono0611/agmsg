@@ -45,15 +45,31 @@ stale memory of their last known pane. Act on one with '$SKILL_DIR/scripts/peek.
 says whether it worked and, if not, why.
 EOF
 )"
+    # Pre-#1248 agmsg (1.3.0 and earlier) wrote this same text but named the
+    # per-driver notes file SKILL.md instead of README.md (renamed in #1248,
+    # commit a54c9e23) -- that is the only byte that ever differed. Accept
+    # either form as agmsg's own generated content so an upgraded user's
+    # untouched rule file still migrates instead of being refused. The old
+    # path lives in its own file (see legacy-pre1248-notes-path.sh), not
+    # written out literally here, so a #1249 regression elsewhere still fails.
+    local LEGACY_PRE1248_NOTES_PATH
+    # shellcheck disable=SC1091
+    source "$(dirname "${BASH_SOURCE[0]}")/legacy-pre1248-notes-path.sh"
+    # Refuse rather than read a value that failed to load: an empty path here
+    # would turn the substitution below into a no-op, and expected_pre1248
+    # would silently become a copy of expected -- matching nothing it should
+    # not, but also proving nothing about the actual pre-#1248 text.
+    [ -n "${LEGACY_PRE1248_NOTES_PATH:-}" ] || return 1
+    local expected_pre1248="${expected/drivers\/terminals\/<terminal>\/README.md/$LEGACY_PRE1248_NOTES_PATH}"
     actual="$(cat "$file")"
-    if [ "$actual" != "$expected" ]; then
-      echo '既存rulefileはagmsg形式ではありません' >&2; return 1
+    if [ "$actual" != "$expected" ] && [ "$actual" != "$expected_pre1248" ]; then
+      echo 'existing rule file is not in agmsg format' >&2; return 1
     fi
   fi
   {
     printf '%s\n' '<!-- agmsg:antigravity:monitor -->'
     printf '%s\n' '# agmsg Integration Rule'
-    printf '%s\n' '受領はAntigravity bridgeが管理します。inbox.sh/check-inbox.shを呼ばないでください。'
+    printf '%s\n' 'Message delivery is managed by the Antigravity bridge. Do not call inbox.sh/check-inbox.sh.'
   } > "$file"
 }
 agmsg_delivery_status() {
@@ -61,8 +77,8 @@ agmsg_delivery_status() {
   if [ -f "$file" ] && grep -q '^<!-- agmsg:antigravity:monitor -->$' "$file"; then echo 'mode: monitor'; else rulefile_status "$@"; fi
 }
 agmsg_delivery_on_enable() {
-  printf 'headless明示起動: bash %q --project %q --team <team> --name <role>\n' "$SKILL_DIR/scripts/drivers/types/antigravity/antigravity-monitor.sh" "$3"
-  printf 'TUI明示起動: bash %q --project %q --team <team> --name <role>\n' "$SKILL_DIR/scripts/drivers/types/antigravity/antigravity-tui-monitor.sh" "$3"
+  printf 'Start headless explicitly: bash %q --project %q --team <team> --name <role>\n' "$SKILL_DIR/scripts/drivers/types/antigravity/antigravity-monitor.sh" "$3"
+  printf 'Start the TUI explicitly: bash %q --project %q --team <team> --name <role>\n' "$SKILL_DIR/scripts/drivers/types/antigravity/antigravity-tui-monitor.sh" "$3"
 }
 agmsg_delivery_runtime_status() {
   node "$SKILL_DIR/scripts/drivers/types/antigravity/antigravity-mode.mjs" status "$2"

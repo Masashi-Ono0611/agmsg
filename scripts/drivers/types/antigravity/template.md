@@ -28,7 +28,7 @@ If argument is "mode" (no further args):
 2. Show the output to the user.
 
 If argument starts with "mode" followed by a mode name:
-1. Antigravity supports `monitor`, `turn`, and `off`; `both` is not supported. `monitor` requires explicitly starting `antigravity-monitor.sh` or `antigravity-tui-monitor.sh`.
+1. Antigravity supports `monitor`, `turn`, and `off`; `both` is not supported. `monitor` requires explicitly starting `antigravity-monitor.sh` or `antigravity-tui-monitor.sh`, and is experimental — see `docs/antigravity-monitor-beta.md` before choosing it for a seat a person types into.
 2. Run: `~/.agents/skills/__SKILL_NAME__/scripts/delivery.sh set <mode> __AGENT_TYPE__ "$(pwd)"`
 
 If argument is "hook on", run `delivery.sh set turn __AGENT_TYPE__ "$(pwd)"`.
@@ -37,6 +37,8 @@ If argument is "hook off", run `delivery.sh set off __AGENT_TYPE__ "$(pwd)"`.
 
 <!-- agmsg:slot execute-extra -->
 First run `bash ~/.agents/skills/__SKILL_NAME__/scripts/drivers/types/antigravity/antigravity-tui-monitor.sh status --project <project> --team <team> --name <role>`. If the output reports that the `tui-pty` runtime has not started, apply the default no-argument behavior above as written. Any other line containing `tui-pty` means the Antigravity TUI monitor is active: **do not apply that default behavior**, and do not call bare `__CMD_PREFIX____SKILL_NAME__`, `inbox.sh`, or `check-inbox.sh`. Use this status command (`tui-monitor status`) for any required state checks; it neither redisplays message bodies nor marks them read. Acknowledge receipt to the TUI monitor with exactly one line, `AGMSG_RECEIVED:<batch-id>`, using the batch ID from the envelope header.
+
+If that status reports anything other than a clean `running` or `busy` runtime — `stopped`, a batch `phase` of `uncertain` or `prepared`, or any line asking for confirmation — **do not go looking for the reason**: do not read this driver's own source files, and do not read anything under its `run/` state directory. Report the status output to the human verbatim and stop; recovering from it is `agy-tui`'s (`status` / `ack` / `replay` / `reset-guard`) job or the human's, not something to reconstruct by inspecting internals.
 
 If argument is "resume":
 1. Run: `~/.agents/skills/__SKILL_NAME__/scripts/drivers/types/antigravity/antigravity-resume.sh "$(pwd)"`

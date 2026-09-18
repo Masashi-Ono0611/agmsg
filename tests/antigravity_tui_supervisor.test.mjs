@@ -18,7 +18,7 @@ function runPython(source) {
   assert.equal(result.status, 0, result.stderr || result.stdout);
 }
 
-test('許可画面・draftでは投入せず、preparedだけを空の入力欄へ再投入する', () => {
+test('does not inject on a permission screen or draft; only reinjects a prepared batch into an empty input field', () => {
   runPython(`
 import importlib.util
 from types import SimpleNamespace
@@ -56,31 +56,31 @@ for text in [
     assert sent == []
 draw('>\\r\\n? for shortcuts    Gemini 3.8 Flash · high')
 assert s.input_ready()
-draw('過去の受信本文: Requesting permission\\r\\n過去の受信本文: Do you want to proceed?\\r\\n>\\r\\n? for shortcuts  Gemini 3.8 Flash · high')
-assert s.input_ready(), '過去の本文の語句で配送を止めない'
+draw('past receive body: Requesting permission\\r\\npast receive body: Do you want to proceed?\\r\\n>\\r\\n? for shortcuts  Gemini 3.8 Flash · high')
+assert s.input_ready(), 'wording from a past body must not stop delivery'
 for tail in [b'\\x1b[', b'\\x1b]title', b'\\xe3']:
     draw('>\\r\\n? for shortcuts')
     s.screen.feed(tail)
-    assert not s.input_ready(), '描画途中は投入しない'
+    assert not s.input_ready(), 'must not inject mid-render'
 draw('>\\r\\n? for shortcuts  Gemini 3.8 Flash · high')
 s.last_output = module.time.monotonic()
-assert not s.input_ready(), '出力直後は投入しない'
+assert not s.input_ready(), 'must not inject immediately after output'
 s.last_output = 0
 s.state['manualResumeRequired'] = True
 s.maybe_poll()
-assert sent == [], '保存されたpauseも保持する'
+assert sent == [], 'a saved pause is also honored'
 s.state['manualResumeRequired'] = False
 s.maybe_poll()
 assert sent == ['injected']
 s.maybe_poll()
-assert sent == ['injected'], 'sent batchは自動再送しない'
+assert sent == ['injected'], 'a sent batch is not automatically resent'
 s.state['batch']['phase'] = 'uncertain'
 s.maybe_poll()
-assert sent == ['injected'], 'uncertain batchは自動再送しない'
+assert sent == ['injected'], 'an uncertain batch is not automatically resent'
 `);
 });
 
-test('注入直前に未処理のchild出力または人間入力があればpreparedで保留する', () => {
+test('holds a batch in prepared when unprocessed child output or human input exists right before injection', () => {
   runPython(`
 import importlib.util
 from types import SimpleNamespace
@@ -98,7 +98,7 @@ s.call = lambda command: '{"id":"m1","body":"test"}' if command == 'peek' else '
 s.save = lambda: None
 s.input_ready = lambda: True
 s.master = 99
-s.inject = lambda: (_ for _ in ()).throw(AssertionError('pending I/O中にinjectした'))
+s.inject = lambda: (_ for _ in ()).throw(AssertionError('injected while I/O was pending'))
 saw = {'calls': 0}
 def pending_after_peek(*_args):
     saw['calls'] += 1
@@ -109,7 +109,7 @@ assert s.state['batch']['phase'] == 'prepared'
 `);
 });
 
-test('実agy 1.1.27の画面断片はidleだけを注入可能と判定する', () => {
+test('real agy 1.1.27 screen fragments are judged injectable only when idle', () => {
   runPython(`
 import importlib.util
 import json
@@ -137,7 +137,7 @@ for name, fixture in fixtures.items():
 `);
 });
 
-test('狭幅のfooter/NAV折返しは最下部だけを再構成し、本文の語句ではidleと誤認しない', () => {
+test('a narrow-width footer/NAV wrap is reconstructed from only the bottom rows, and body text is never mistaken for idle', () => {
   runPython(`
 import importlib.util
 spec = importlib.util.spec_from_file_location('supervisor', ${JSON.stringify(supervisor)})
@@ -150,9 +150,9 @@ def ready(text):
     s.screen.feed(text.encode())
     return s.input_ready()
 assert ready('>\\r\\n────────────────────────────────────────\\r\\n? for shortcuts  Gemini 3.8 Flash ·\\r\\n high')
-assert not ready('本文末尾: ? for shortcuts  Gemini 3.8 Flash ·\\r\\n high\\r\\n▸ Generating...\\r\\n>\\r\\n────────────────────────────────\\r\\nesc to cancel'), '本文のfooter語句を生成中と誤認しない'
-assert not ready('? for shortcuts quoted in body\\r\\n▸ Generating...\\r\\n>\\r\\n────────────────────────────────\\r\\nesc to cancel'), '行頭footer語句を生成中と誤認しない'
-assert not ready('>\\r\\n? for shortcuts\\r\\nRequesting permission for:\\r\\nDo you want to proceed?\\r\\n> 1. Yes\\r\\n↑/↓ Navigate\\r\\nesc to cancel'), '本文idle署名を許可modalと誤認しない'
+assert not ready('body tail: ? for shortcuts  Gemini 3.8 Flash ·\\r\\n high\\r\\n▸ Generating...\\r\\n>\\r\\n────────────────────────────────\\r\\nesc to cancel'), 'a footer phrase in the body must not be mistaken for generating'
+assert not ready('? for shortcuts quoted in body\\r\\n▸ Generating...\\r\\n>\\r\\n────────────────────────────────\\r\\nesc to cancel'), 'a footer phrase at line start must not be mistaken for generating'
+assert not ready('>\\r\\n? for shortcuts\\r\\nRequesting permission for:\\r\\nDo you want to proceed?\\r\\n> 1. Yes\\r\\n↑/↓ Navigate\\r\\nesc to cancel'), 'a body idle signature must not be mistaken for the permission modal'
 for cols in (18,23,24,27,28,40,80,120):
     s=module.Supervisor.__new__(module.Supervisor)
     s.screen=module.TerminalScreen(24,cols); s.last_output=0
@@ -161,15 +161,15 @@ for cols in (18,23,24,27,28,40,80,120):
 s=module.Supervisor.__new__(module.Supervisor)
 s.screen=module.TerminalScreen(24,120); s.last_output=0
 s.screen.feed('>\\r\\n? for shortcuts  Gemini 3.8 Flash · high\\r\\nRequesting permission for:\\r\\nDo you want to proceed?\\r\\n> 1. Yes\\r\\n↑/↓ Navigate\\r\\nesc to cancel'.encode())
-assert not s.input_ready(), '本文全体がfooterを模しても許可modalへ注入しない'
+assert not s.input_ready(), 'must not inject into the permission modal even if the whole body imitates a footer'
 s=module.Supervisor.__new__(module.Supervisor)
 s.screen=module.TerminalScreen(24, 40); s.last_output=0
 s.screen.feed('Requesting permission for:\\r\\nDo you want to proceed?\\r\\n> 1. Yes\\r\\n↑/↓ Navigate · tab Amend · ctrl+g\\r\\n edit/expand command\\r\\nesc to cancel  Gemini 3.8 Flash ·\\r\\n high'.encode())
-assert s.permission_input_ready(), 'permissionのNAV/footer折返しを許可する'
+assert s.permission_input_ready(), 'allows the NAV/footer wrap of the permission modal'
 `);
 });
 
-test('本文にidle署名を含むbatchはack後の後続自動配送を停止する', () => {
+test('a batch whose body contains an idle signature stops further automatic delivery after ack', () => {
   runPython(`
 import importlib.util
 spec = importlib.util.spec_from_file_location('supervisor', ${JSON.stringify(supervisor)})
@@ -181,7 +181,7 @@ assert not module.Supervisor.batch_contains_idle_signature({'messages':[{'body':
 `);
 });
 
-test('idle署名を含むbatchのackはmanual resumeを要求する', () => {
+test('acking a batch with an idle signature requires manual resume', () => {
   runPython(`
 import importlib.util
 spec = importlib.util.spec_from_file_location('supervisor', ${JSON.stringify(supervisor)})
@@ -197,7 +197,7 @@ assert s.human_input_seen is True
 `);
 });
 
-test('alternate screen切替は以前に検知した未知CSIを正常状態へ戻さない', () => {
+test('switching to the alternate screen does not clear a previously detected unknown CSI', () => {
   runPython(`
 import importlib.util
 spec = importlib.util.spec_from_file_location('supervisor', ${JSON.stringify(supervisor)})
@@ -209,11 +209,11 @@ assert screen.uncertain is True
 assert screen.uncertain_reason == 'unsupported-csi:999z'
 screen.feed(b'\\x1b[?1049h')
 assert screen.alternate_screen is True
-assert screen.uncertain is True, '切替は旧画面を消しても未知CSIの検知を消さない'
+assert screen.uncertain is True, 'a switch clears the old screen but not the detection of an unknown CSI'
 `);
 });
 
-test('agy Read表示のDECST8CとCBTは画面モデルで扱い、それ以外のWはfail-closedにする', () => {
+test('DECST8C and CBT from agy Read output are handled by the screen model; every other W sequence fails closed', () => {
   runPython(`
 import importlib.util
 spec = importlib.util.spec_from_file_location('supervisor', ${JSON.stringify(supervisor)})
@@ -221,16 +221,16 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 screen = module.TerminalScreen(4, 40)
 screen.feed(b'\\x1b[?5W')
-assert not screen.uncertain, 'agyのDECST8Cは既定tab stopと同じ'
+assert not screen.uncertain, 'agy\\'s DECST8C matches the default tab stops'
 screen.feed(b'123456789012\\x1b[ZX')
 assert screen.lines()[0].startswith('12345678X012')
-assert not screen.uncertain, 'Read後に出るCBTでreceipt判定を停止しない'
+assert not screen.uncertain, 'a CBT that follows a Read must not stop receipt judgment'
 screen.feed(b'\\x1b[?4W')
-assert screen.uncertain, '観測していないtab制御は許容しない'
+assert screen.uncertain, 'an unobserved tab control is not tolerated'
 `);
 });
 
-test('TUI envelope は複数メッセージをID順に一対一で表現する', () => {
+test('the TUI envelope represents multiple messages one-to-one in ID order', () => {
   runPython(`
 import importlib.util
 from pathlib import Path
@@ -239,8 +239,8 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 s = module.Supervisor.__new__(module.Supervisor)
 batch = {'id': 'batch-1', 'messages': [
-  {'id': 'm-1', 'from': 'agy', 'at': '2026-09-06T06:00:00Z', 'body': '一件目'},
-  {'id': 'm-2', 'from': 'claude', 'at': '2026-09-06T06:01:00Z', 'body': '二件目\\x1b'},
+  {'id': 'm-1', 'from': 'agy', 'at': '2026-09-06T06:00:00Z', 'body': 'first item'},
+  {'id': 'm-2', 'from': 'claude', 'at': '2026-09-06T06:01:00Z', 'body': 'second item\\x1b'},
 ]}
 text = s.envelope(batch)
 assert '[agmsg batch id=batch-1 ' in text
@@ -249,11 +249,11 @@ assert text.index('id=m-1') < text.index('id=m-2')
 assert text.count('[/agmsg message]') == 2
 assert '\\\\x1b' in text
 assert 'AGMSG_RECEIVED:batch-1' not in text
-assert 'ASCIIコロン（U+003A）、batch idを空白なしで連結' in text
+assert 'an ASCII colon (U+003A), and the batch id with no spaces' in text
 `);
 });
 
-test('TUI注入はbracketed pasteとCRを付け、送信状態を保存する', () => {
+test('TUI injection wraps bracketed paste and CR, and saves the sent state', () => {
   runPython(`
 import importlib.util
 import os
@@ -264,7 +264,7 @@ r, w = os.pipe()
 s = module.Supervisor.__new__(module.Supervisor)
 s.master = w
 s.state = {'batch': {'id': 'batch-2', 'messages': [
-  {'id': 'm-1', 'from': 'agy', 'at': '2026-09-06T06:00:00Z', 'body': '本文'},
+  {'id': 'm-1', 'from': 'agy', 'at': '2026-09-06T06:00:00Z', 'body': 'body text'},
 ]}, 'supervisorPhase': 'PREPARED'}
 s.save = lambda: None
 s.inject()
@@ -278,7 +278,7 @@ os.close(r); os.close(w)
 `);
 });
 
-test('通常の人間入力は耐久pauseを立てず一時保留にする', () => {
+test('normal human input holds temporarily without raising a durable pause', () => {
   runPython(`
 import contextlib
 import importlib.util
@@ -298,11 +298,11 @@ assert s.state['manualResumeRequired'] is False
 assert s.state['humanInputActive'] is True
 assert s.state['humanInputSawNonIdle'] is False
 assert s.state['supervisorPhase'] == 'WAITING_FOR_IDLE'
-assert notice.getvalue().count('空の入力待ちに戻れば自動再開') == 1
+assert notice.getvalue().count('resume when the empty input prompt returns') == 1
 `);
 });
 
-test('通常入力はnon-idle後の安定idleでだけ自動復帰する', () => {
+test('normal input auto-resumes only after a stable idle following non-idle', () => {
   runPython(`
 import importlib.util
 spec = importlib.util.spec_from_file_location('supervisor', ${JSON.stringify(supervisor)})
@@ -321,7 +321,7 @@ s.injection_ready = lambda: ready['value']
 now = {'value': 10.0}
 module.time.monotonic = lambda: now['value']
 s.update_human_input_state()
-assert s.state['humanInputActive'] is True, '古いidleだけでは解除しない'
+assert s.state['humanInputActive'] is True, 'an old idle alone does not clear it'
 ready['value'] = False
 s.update_human_input_state()
 assert s.state['humanInputSawNonIdle'] is True
@@ -329,10 +329,10 @@ ready['value'] = True
 s.update_human_input_state()
 now['value'] += 0.59
 s.update_human_input_state()
-assert s.state['humanInputActive'] is True, '安定期間未満では解除しない'
+assert s.state['humanInputActive'] is True, 'does not clear before the stable period elapses'
 ready['value'] = False
 s.update_human_input_state()
-assert s.human_idle_since is None, '途中の非idleで安定観測をリセットする'
+assert s.human_idle_since is None, 'a non-idle in the middle resets the stability observation'
 ready['value'] = True
 s.update_human_input_state()
 now['value'] += 0.61
@@ -352,11 +352,11 @@ for field, value in [('manualResumeRequired', True), ('durableAttention', True)]
 s.state.update({'batch': {'phase': 'prepared'}, 'humanInputActive': True,
                 'manualResumeRequired': False, 'durableAttention': False})
 s.update_human_input_state()
-assert s.state['humanInputActive'] is True, '未解決batchでは解除しない'
+assert s.state['humanInputActive'] is True, 'does not clear while a batch is unresolved'
 `);
 });
 
-test('再起動復帰は新screenの安定idleだけを要求し、耐久状態は解除しない', () => {
+test('restart recovery requires only a stable idle on the new screen, and does not clear the durable state', () => {
   runPython(`
 import importlib.util
 spec = importlib.util.spec_from_file_location('supervisor', ${JSON.stringify(supervisor)})
@@ -381,7 +381,7 @@ assert s.human_input_restart_recovery is False
 `);
 });
 
-test('実測済みの許可UIだけは受信turn中の人間確認入力を許可する', () => {
+test('only a measured, verified permission UI allows human confirmation input during a receive turn', () => {
   runPython(`
 import contextlib
 import importlib.util
@@ -408,13 +408,13 @@ for name in ('idle', 'generating'):
     assert not s.permission_input_ready(), name
 s.screen = module.TerminalScreen(28, 120)
 s.screen.feed(b'Requesting permission for:\\r\\nDo you want to proceed?\\r\\n> 1. Yes\\r\\n? for shortcuts')
-assert not s.permission_input_ready(), '受信本文の語句だけで許可しない'
+assert not s.permission_input_ready(), 'must not allow on wording from the received body alone'
 s.screen = module.TerminalScreen(24, 120)
 s.screen.feed('Requesting permission for:\\r\\nDo you want to proceed?\\r\\n> 1. Yes\\r\\n↑/↓ Navigate · tab Amend\\r\\n▸ Generating...\\r\\n>\\r\\n────────────────────────────────\\r\\nesc to cancel'.encode())
-assert not s.permission_input_ready(), '生成中chromeと受信本文の語句・Nav行を許可UIと誤認しない'
+assert not s.permission_input_ready(), 'must not mistake generating-state chrome plus received-body wording and a Nav line for the permission UI'
 s.screen = module.TerminalScreen(24, 120)
 s.screen.feed('Requesting permission for:\\r\\nDo you want to proceed?\\r\\n> 1. Yes\\r\\n↑/↓ Navigate · tab Amend\\r\\nesc to cancel'.encode())
-assert s.permission_input_ready(), 'Nav行を本文で供給できる合成画面は判定上modalと区別できない'
+assert s.permission_input_ready(), 'a synthetic screen that can supply the Nav line via the body is indistinguishable from the modal by this judgment'
 s.screen = module.TerminalScreen(40, 154)
 s.screen.feed(('Command\\r\\n' +
     'Requesting permission for:\\r\\n' +
@@ -426,14 +426,14 @@ s.screen.feed(('Command\\r\\n' +
     '  4. No\\r\\n' +
     '  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\\r\\n' +
     'esc to cancel  Gemini 3.8 Flash · high').encode())
-assert s.permission_input_ready(), 'Orca実画面の長いpermission選択肢も許可UIとして認識する'
+assert s.permission_input_ready(), 'a real Orca screen with long permission choices is also recognized as the permission UI'
 diagnostic = s.permission_screen_diagnostic()
 assert 'rows=40,cols=154' in diagnostic
 assert "'request': [1]" in diagnostic
 assert "'footer': [9]" in diagnostic
 assert "'navigate': True" in diagnostic
-assert 'whoami.sh' not in diagnostic, 'command本文を診断へ含めない'
-assert 'RAW_WINDOW_SECRET_MARKER' not in diagnostic, '生出力windowの本文を診断へ含めない'
+assert 'whoami.sh' not in diagnostic, 'must not include command text in the diagnostic'
+assert 'RAW_WINDOW_SECRET_MARKER' not in diagnostic, 'must not include the raw-output-window body in the diagnostic'
 s.screen = module.TerminalScreen(40, 120)
 s.screen.feed(('Command\\r\\n' +
     'Requesting permission for:\\r\\n' +
@@ -445,13 +445,13 @@ s.screen.feed(('Command\\r\\n' +
     '  4. No\\r\\n' +
     '  ↑/↓ Navigate · tab Amend · ctrl+g edit/expand command\\r\\n' +
     'esc to cancel  Gemini 3.8 Flash · high').encode())
-assert s.permission_input_ready(), '長い引用付き選択肢の折返しが12行を超えても許可UIとして認識する'
+assert s.permission_input_ready(), 'recognized as the permission UI even when a long quoted choice wraps past 12 lines'
 s.screen = module.TerminalScreen(24, 120)
 s.screen.feed('Requesting permission for:\\r\\nDo you want to proceed?\\r\\n> 1. Yes\\r\\n  4. No\\r\\n↑/↓ Navigate · tab Amend\\r\\n▸ Generating...\\r\\n>\\r\\n────────────────────────────────\\r\\nesc to cancel'.encode())
-assert not s.permission_input_ready(), 'navとfooterの間に通常画面がある合成表示は許可しない'
+assert not s.permission_input_ready(), 'must not allow a synthetic display with a normal screen between nav and footer'
 s.screen = module.TerminalScreen(24, 120)
 s.screen.feed('> 1. Yes\\r\\nRequesting permission for:\\r\\nDo you want to proceed?\\r\\n↑/↓ Navigate · tab Amend\\r\\nesc to cancel'.encode())
-assert not s.permission_input_ready(), '必須要素の並びが許可modalと異なる合成表示は許可しない'
+assert not s.permission_input_ready(), 'must not allow a synthetic display whose required-element order differs from the permission modal'
 s.state = {'batch': {'id': 'batch', 'phase': 'sent'}, 'manualResumeRequired': True,
            'humanInputActive': False, 'humanInputSawNonIdle': False,
            'supervisorPhase': 'WAITING_FOR_RESULT'}
@@ -460,15 +460,15 @@ s.save = lambda: None
 notice = io.StringIO()
 with contextlib.redirect_stderr(notice): s.allow_permission_input()
 assert s.state['batch']['phase'] == 'sent'
-assert s.state['manualResumeRequired'] is True, '既存の耐久pauseには触らない'
+assert s.state['manualResumeRequired'] is True, 'must not touch an existing durable pause'
 assert s.state['humanInputActive'] is True
 assert s.state['humanInputSawNonIdle'] is True
 assert s.state['supervisorPhase'] == 'WAITING_FOR_RESULT'
-assert '受領確認後、空の入力待ちに戻れば自動再開' in notice.getvalue()
+assert 'resume after confirmation when the empty input prompt returns' in notice.getvalue()
 `);
 });
 
-test('child描画と親入力が同時readyならpermission画面を先に反映する', () => {
+test('when child rendering and parent input are ready together, the permission screen is reflected first', () => {
   runPython(`
 import importlib.util
 import sys
@@ -517,7 +517,7 @@ assert events == ['child','allowed'], events
 `);
 });
 
-test('permission入力と同時の部分再描画でmodalが消えても直前画面で分類する', () => {
+test('a partial redraw simultaneous with permission input is classified by the screen just before it, even if the modal disappears', () => {
   runPython(`
 import importlib.util
 import sys
@@ -558,7 +558,7 @@ assert events == ['child-partial-redraw','allowed'], events
 `);
 });
 
-test('read-denied停止には安全な復旧案内を表示する', () => {
+test('a read-denied stop shows safe recovery guidance', () => {
   runPython(`
 import contextlib
 import importlib.util
@@ -572,14 +572,14 @@ s.save = lambda: None
 s.stopping = False
 out = io.StringIO()
 with contextlib.redirect_stderr(out):
-    s.fail('通常inboxによる既読試行を検知')
+    s.fail('detected a mark-read attempt through the regular inbox')
 assert 'agy-tui reset-guard' in out.getvalue()
-assert 'ackせず停止します' in out.getvalue()
+assert 'stopping without ack' in out.getvalue()
 assert s.state['durableAttention'] is True
 `);
 });
 
-test('reset-guardは停止中かつbatchなしの場合だけviolationを解除する', () => {
+test('reset-guard clears the violation only while stopped and with no batch', () => {
   runPython(`
 import importlib.util
 import json
@@ -615,9 +615,9 @@ s.state_file.write_text(json.dumps({**s.state, 'batch': {'id': 'batch-1', 'phase
 try:
     s.reset_guard()
 except RuntimeError as error:
-    assert '未解決batch' in str(error)
+    assert 'unresolved batch' in str(error)
 else:
-    raise AssertionError('未解決batchを拒否しなかった')
+    raise AssertionError('did not refuse an unresolved batch')
 assert s.violations.read_text() == 'keep'
 assert calls == ['claim', 'release']
 s.state_file.write_text(json.dumps({**s.state, 'batch': None}))
@@ -630,15 +630,15 @@ s.reservation.write_text(json.dumps({
 try:
     s.reset_guard()
 except RuntimeError as error:
-    assert '稼働中' in str(error)
+    assert 'running' in str(error)
 else:
-    raise AssertionError('稼働中supervisorを拒否しなかった')
+    raise AssertionError('did not refuse a running supervisor')
 assert s.violations.read_text() == 'keep'
 assert calls == ['claim', 'release', 'claim', 'release']
 `);
 });
 
-test('receiptはread chunk境界をまたいでも画面上の完全行として判定できる', () => {
+test('a receipt is recognized as a complete line on screen even when it spans a read-chunk boundary', () => {
   runPython(`
 import importlib.util
 spec = importlib.util.spec_from_file_location('supervisor', ${JSON.stringify(supervisor)})
@@ -654,7 +654,7 @@ assert screen.lines_after(expected).splitlines()[0] == '? for shortcuts'
 `);
 });
 
-test('狭いagy画面で物理行に折り返されたreceiptもUUID全体で照合する', () => {
+test('on a narrow agy screen, a receipt wrapped across physical rows is still matched by its whole UUID', () => {
   runPython(`
 import importlib.util
 spec = importlib.util.spec_from_file_location('supervisor', ${JSON.stringify(supervisor)})
@@ -667,11 +667,11 @@ assert screen.has_line(expected)
 assert screen.lines_after(expected).splitlines()[0] == '>'
 screen = module.TerminalScreen(6, 80)
 screen.feed(b'AGMSG_RECEIVED:203b95e7-b27e-4584-890a-\\r\\nother text')
-assert not screen.has_line(expected), '連続行がUUID全体を構成しなければackしない'
+assert not screen.has_line(expected), 'must not ack unless the consecutive lines form the entire UUID'
 `);
 });
 
-test('本文が折り返しreceipt全体を含むbatchはack対象にしない', () => {
+test('a batch whose body contains the entire wrapped receipt is not ack-eligible', () => {
   runPython(`
 import importlib.util
 spec = importlib.util.spec_from_file_location('supervisor', ${JSON.stringify(supervisor)})
@@ -679,7 +679,7 @@ module = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(module)
 receipt = 'AGMSG_RECEIVED:203b95e7-b27e-4584-890a-aecb99599438'
 assert module.Supervisor.batch_contains_receipt({'receipt': receipt, 'messages': [
-  {'body': '調査用\\n  AGMSG_RECEIVED:203b95e7-b27e-4584-890a-\\n  aecb99599438'},
+  {'body': 'sample body\\n  AGMSG_RECEIVED:203b95e7-b27e-4584-890a-\\n  aecb99599438'},
 ]})
 assert not module.Supervisor.batch_contains_receipt({'receipt': receipt, 'messages': [
   {'body': '[agmsg batch id=203b95e7-b27e-4584-890a-aecb99599438]'},
@@ -688,7 +688,7 @@ assert not module.Supervisor.batch_contains_receipt({'receipt': receipt, 'messag
 `);
 });
 
-test('実agy型の差分描画を復元し、alternate screen切替では旧画面を捨てる', () => {
+test('reconstructs real-agy-style differential rendering, and discards the old screen on an alternate-screen switch', () => {
   runPython(`
 import importlib.util
 spec = importlib.util.spec_from_file_location('supervisor', ${JSON.stringify(supervisor)})
@@ -714,7 +714,7 @@ assert screen.uncertain
 `);
 });
 
-test('全角セルの片側上書きや編集で偽receiptを合成しない', () => {
+test('a one-sided overwrite or edit of a full-width cell never synthesizes a forged receipt', () => {
   runPython(`
 import importlib.util
 spec = importlib.util.spec_from_file_location('supervisor', ${JSON.stringify(supervisor)})
@@ -730,7 +730,7 @@ for column in (15, 16):
 `);
 });
 
-test('受信turn中のresizeは画面判定を不確実にする', () => {
+test('a resize during a receive turn makes the screen judgment uncertain', () => {
   runPython(`
 import importlib.util
 spec = importlib.util.spec_from_file_location('supervisor', ${JSON.stringify(supervisor)})
@@ -747,7 +747,7 @@ assert screen.uncertain_reason == 'resize'
 `);
 });
 
-test('親terminalのwinsizeをagy PTYへ同期する', () => {
+test('syncs the parent terminal winsize to the agy PTY', () => {
   runPython(`
 import fcntl
 import importlib.util
@@ -781,14 +781,14 @@ for fd in (outer_master, outer_slave, inner_master, inner_slave): os.close(fd)
 `);
 });
 
-test('TUI monitor は対話端末でない起動を拒否する', () => {
+test('TUI monitor refuses to start from a non-interactive terminal', () => {
   const wrapper = new URL('../scripts/drivers/types/antigravity/antigravity-tui-monitor.sh', import.meta.url).pathname;
   const result = spawnSync('bash', [wrapper, '--help'], { encoding: 'utf8' });
   assert.notEqual(result.status, 0);
-  assert.match(result.stderr, /対話端末/);
+  assert.match(result.stderr, /interactive terminal/);
   const status = spawnSync('bash', [wrapper, 'status', '--project', '/tmp', '--team', 'no-such-team', '--name', 'no-such-role'], { encoding: 'utf8' });
   assert.equal(status.status, 0, status.stderr);
-  assert.match(status.stdout, /tui-pty 未起動/);
+  assert.match(status.stdout, /tui-pty not started/);
 });
 
 test('TUI status refuses an unreadable process identity', () => {
@@ -831,7 +831,7 @@ assert 'TUI process identity is unreadable' in stderr.getvalue()
 `);
 });
 
-test('偽TUIを実PTYで起動し、受信後のreceipt確認からackまで進める', async () => {
+test('launches a fake TUI on a real PTY and proceeds from post-receive receipt confirmation through ack', async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agmsg-tui-pty-test-'));
   const install = path.join(dir, 'install');
   const project = path.join(dir, 'project');
@@ -934,7 +934,7 @@ sys.exit(os.waitstatus_to_exitcode(status))
       if (predicate()) return;
       await new Promise(resolve => setTimeout(resolve, 50));
     }
-    throw new Error(`待機timeout: ${output}`);
+    throw new Error(`wait timeout: ${output}`);
   };
   try {
     await waitFor(() => output.includes('? for shortcuts'));
@@ -959,7 +959,7 @@ sys.exit(os.waitstatus_to_exitcode(status))
     child.stdin.write('1');
     await waitFor(() => JSON.parse(fs.readFileSync(path.join(install, 'run', stateFile), 'utf8')).batch === null);
     const afterPermission = JSON.parse(fs.readFileSync(path.join(install, 'run', stateFile), 'utf8'));
-    assert.equal(afterPermission.manualResumeRequired, false, '許可確認で耐久pauseを立てない');
+    assert.equal(afterPermission.manualResumeRequired, false, 'a permission confirmation does not raise a durable pause');
     await waitFor(() => JSON.parse(fs.readFileSync(path.join(install, 'run', stateFile), 'utf8')).humanInputActive === false);
     run('send.sh', ['fixture', 'sender', 'worker', 'HELD_AFTER_PERMISSION']);
     await waitFor(() => JSON.parse(fs.readFileSync(path.join(install, 'run', stateFile), 'utf8')).batch?.messages?.some(message => message.body === 'HELD_AFTER_PERMISSION'));
@@ -976,35 +976,35 @@ sys.exit(os.waitstatus_to_exitcode(status))
     const stop = spawnSync('python3', [supervisorPath, '--action', 'stop', '--project', project, '--team', 'fixture', '--name', 'worker'], { env, encoding: 'utf8' });
     assert.equal(stop.status, 0, stop.stderr);
     await waitFor(() => child.exitCode !== null);
-    assert.match(run('delivery.sh', ['status', 'antigravity', project]), /runtime: worker tui-pty 停止\/要確認/);
+    assert.match(run('delivery.sh', ['status', 'antigravity', project]), /runtime: worker tui-pty stopped\/needs-attention/);
     const deadStatus = spawnSync('python3', [supervisorPath, '--action', 'status', '--project', project, '--team', 'fixture', '--name', 'worker'], { env, encoding: 'utf8' });
     assert.equal(deadStatus.status, 0, deadStatus.stderr);
-    assert.match(deadStatus.stdout, /runtime: worker tui-pty 停止\/要確認/);
-    assert.match(stop.stdout, /停止要求を送信しました/);
+    assert.match(deadStatus.stdout, /runtime: worker tui-pty stopped\/needs-attention/);
+    assert.match(stop.stdout, /Stop request sent/);
     assert.match(fs.readFileSync(path.join(install, 'run', stateFile), 'utf8'), /"phase": "uncertain"|"phase":"uncertain"/);
     const unresolvedBeforeRecovery = JSON.parse(fs.readFileSync(path.join(install, 'run', stateFile), 'utf8'));
     const restartRejected = spawnSync('python3', [supervisorPath, '--project', project, '--team', 'fixture', '--name', 'worker', '--agy', fake], { env, encoding: 'utf8' });
     assert.notEqual(restartRejected.status, 0);
-    assert.match(restartRejected.stderr, /前回の受信を安全に既読確定できなかった/);
+    assert.match(restartRejected.stderr, /previous delivery could not be safely marked read/);
     assert.match(restartRejected.stderr, new RegExp('batch: ' + uncertain.batch.id + ' phase=uncertain messages=1'));
     assert.match(restartRejected.stderr, new RegExp('message IDs: ' + uncertain.batch.messages[0].id));
-    assert.match(restartRejected.stderr, /これは未処理とは限りません/);
+    assert.match(restartRejected.stderr, /does not necessarily mean the messages are unprocessed/);
     assert.match(restartRejected.stderr, /agy-tui status --project/);
     assert.match(restartRejected.stderr, /agy-tui ack --project/);
     assert.match(restartRejected.stderr, /agy-tui replay --project/);
-    assert.match(restartRejected.stderr, /AGMSG_RECEIVED行と返信を確認済みの場合だけ/);
-    assert.match(restartRejected.stderr, /判断できない場合はackせず/);
+    assert.match(restartRejected.stderr, /Mark read only after confirming the AGMSG_RECEIVED line and reply/);
+    assert.match(restartRejected.stderr, /If you cannot decide, do not ack/);
     assert.deepEqual(
       JSON.parse(fs.readFileSync(path.join(install, 'run', stateFile), 'utf8')),
       unresolvedBeforeRecovery,
-      '未解決batchによる通常起動拒否でstateを変更しない',
+      'a normal-startup refusal from an unresolved batch does not change state',
     );
     const rejected = spawnSync('python3', [supervisorPath, '--action', 'ack', '--project', project, '--team', 'fixture', '--name', 'worker', '--batch', uncertain.batch.id, '--confirm-id', 'wrong-id'], { env, encoding: 'utf8' });
     assert.notEqual(rejected.status, 0);
     assert.deepEqual(
       JSON.parse(fs.readFileSync(path.join(install, 'run', stateFile), 'utf8')),
       unresolvedBeforeRecovery,
-      'ID不一致による復旧拒否でstateを変更しない',
+      'a recovery refusal from an ID mismatch does not change state',
     );
     const replayState = JSON.parse(fs.readFileSync(path.join(install, 'run', stateFile), 'utf8'));
     replayState.humanInputActive = true;
@@ -1024,7 +1024,7 @@ sys.exit(os.waitstatus_to_exitcode(status))
     }
     assert.match(run('inbox.sh', ['fixture', 'worker']), /No new messages\./);
     const afterReplay = JSON.parse(fs.readFileSync(path.join(install, 'run', stateFile), 'utf8'));
-    assert.equal(afterReplay.humanInputActive, false, '明示replayは旧セッションの通常入力pauseを解除する');
+    assert.equal(afterReplay.humanInputActive, false, "an explicit replay clears the previous session's normal-input pause");
     assert.equal(afterReplay.humanInputSawNonIdle, false);
   } finally {
     if (child.exitCode === null) child.stdin.write('\x04');
@@ -1033,7 +1033,127 @@ sys.exit(os.waitstatus_to_exitcode(status))
   }
 });
 
-test('claim拒否は保持しているsupervisorのpidと停止コマンドを示す', () => {
+test('agy-tui passes only the arguments received after -- through unchanged to the spawned agy, and refuses an unknown option before it (#1291)', async () => {
+  // The pass-through has to be scoped to an explicit --, not "whatever
+  // agy-tui.sh does not recognize": review of the first version of this fix
+  // found that agy-tui.sh's old catch-all treated ANY unrecognized option as
+  // the start of pass-through, -- or not, so a typo like --tema would launch
+  // agy carrying it instead of failing loudly. Both directions are pinned
+  // here, through the real entry point (agy-tui.sh itself, not the Python
+  // supervisor invoked directly -- bypassing agy-tui.sh would let this pass
+  // even if the shell layer stopped forwarding args after -- correctly).
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agmsg-tui-argv-test-'));
+  const install = path.join(dir, 'install');
+  const project = path.join(dir, 'project');
+  fs.mkdirSync(install);
+  fs.mkdirSync(project);
+  fs.cpSync(path.join(repo, 'scripts'), path.join(install, 'scripts'), { recursive: true });
+  const env = {
+    ...process.env,
+    AGMSG_STORAGE_DRIVER: 'sqlite',
+    AGMSG_STORAGE_PATH: path.join(install, 'db'),
+    AGMSG_CONFIG: path.join(dir, 'config.json'),
+  };
+  const run = (script, args) => {
+    const result = spawnSync('bash', [path.join(install, 'scripts', script), ...args], { env, encoding: 'utf8' });
+    assert.equal(result.status, 0, result.stderr + result.stdout);
+    return result.stdout;
+  };
+  run('join.sh', ['fixture', 'worker', 'antigravity', project]);
+  run('delivery.sh', ['set', 'monitor', 'antigravity', project]);
+  const dump = path.join(dir, 'argv-dump.txt');
+  const fake = path.join(dir, 'agy');
+  fs.writeFileSync(
+    fake,
+    `#!/bin/sh\nprintf '%s\\n' "$@" > ${JSON.stringify(dump)}\necho READY\nwhile :; do sleep 1; done\n`,
+    { mode: 0o700 },
+  );
+  const agyTuiPath = path.join(install, 'scripts/drivers/types/antigravity/agy-tui.sh');
+
+  // A typo before -- must be refused, not silently forwarded to agy.
+  const typo = spawnSync(
+    'bash',
+    [agyTuiPath, 'status', '--project', project, '--team', 'fixture', '--name', 'worker', '--tema', 'oops'],
+    { env, encoding: 'utf8' },
+  );
+  assert.notEqual(typo.status, 0);
+  assert.match(typo.stderr, /unknown option --tema/);
+
+  // A trailing -- with nothing after it must not crash: bash 3.2 (what CI's
+  // macOS runners actually use) treats expanding an assigned-but-empty array
+  // under `set -u` as an unbound-variable error, not silently-empty.
+  const emptyDashDash = spawnSync(
+    'bash',
+    [agyTuiPath, 'status', '--project', project, '--team', 'fixture', '--name', 'worker', '--'],
+    { env, encoding: 'utf8' },
+  );
+  assert.equal(emptyDashDash.status, 0, emptyDashDash.stderr + emptyDashDash.stdout);
+
+  // --batch/--confirm-id are supervisor flags for ack/replay recovery, not
+  // agy-tui's own -- they relied on the old catch-all to reach the
+  // supervisor and were the actual CI failure once that catch-all became a
+  // hard refusal: without an explicit exemption they read as a typo too.
+  const ack = spawnSync(
+    'bash',
+    [agyTuiPath, 'ack', '--project', project, '--team', 'fixture', '--name', 'worker', '--batch', 'batch-1', '--confirm-id', 'message-1'],
+    { env, encoding: 'utf8' },
+  );
+  assert.equal(ack.status, 1, ack.stderr + ack.stdout);
+  assert.match(ack.stderr, /no reservation or state exists for recovery/);
+
+  const quote = value => `'${value.replaceAll("'", "'\\''")}'`;
+  const command = 'stty rows 40 cols 120; exec ' + [
+    'bash', agyTuiPath, '--project', project, '--team', 'fixture', '--name', 'worker',
+    '--agy', fake, '--', '--dangerously-skip-permissions', '--extra-marker=agmsg-e2e-42',
+  ].map(quote).join(' ');
+  const ptyRelay = path.join(dir, 'pty-relay.py');
+  if (process.platform === 'darwin') fs.writeFileSync(ptyRelay, `
+import os
+import pty
+import select
+import sys
+
+pid, master = pty.fork()
+if pid == 0:
+    os.execlp('bash', 'bash', '-c', sys.argv[1])
+while True:
+    ready, _, _ = select.select([master, sys.stdin.buffer], [], [])
+    if master in ready:
+        try:
+            data = os.read(master, 8192)
+        except OSError:
+            break
+        if not data:
+            break
+        sys.stdout.buffer.write(data)
+        sys.stdout.buffer.flush()
+    if sys.stdin.buffer in ready:
+        data = os.read(sys.stdin.fileno(), 8192)
+        if not data:
+            break
+        os.write(master, data)
+_, status = os.waitpid(pid, 0)
+sys.exit(os.waitstatus_to_exitcode(status))
+`);
+  const spawnPty = cmd => process.platform === 'darwin'
+    ? spawn('python3', [ptyRelay, cmd], { env, stdio: ['pipe', 'pipe', 'pipe'] })
+    : spawn('script', ['-qefc', cmd, '/dev/null'], { env, stdio: ['pipe', 'pipe', 'pipe'] });
+  const child = spawnPty(command);
+  let output = '';
+  child.stdout.on('data', chunk => { output += chunk.toString(); });
+  child.stderr.on('data', chunk => { output += chunk.toString(); });
+  try {
+    for (let i = 0; i < 200 && !fs.existsSync(dump); i += 1) await new Promise(resolve => setTimeout(resolve, 50));
+    assert.ok(fs.existsSync(dump), `could not detect the fake agy launch: ${output}`);
+    const argv = fs.readFileSync(dump, 'utf8').split('\n').filter(Boolean);
+    assert.deepEqual(argv, ['--dangerously-skip-permissions', '--extra-marker=agmsg-e2e-42']);
+  } finally {
+    child.kill('SIGKILL');
+    await Promise.race([once(child, 'close'), new Promise(resolve => setTimeout(resolve, 3000))]);
+  }
+});
+
+test('a claim refusal shows the pid of the holding supervisor and the stop command', () => {
   runPython(`
 import importlib.util, json, os, tempfile
 from pathlib import Path
@@ -1057,12 +1177,12 @@ verdict = 'held:00000000-0000-0000-0000-000000000000.%d' % pid
 message = module.explain_claim_refusal(verdict, str(project), 'demo', 'agy')
 
 # The verdict alone is what this replaces, so it must not survive as the answer.
-assert message != verdict, 'held: の生の判定がそのまま出ている'
-assert 'demo/agy' in message, 'どのseatの話かが無い'
-assert str(pid) in message, '保持しているprocessのpidが無い'
-assert 'supervisor' in message, '何が保持しているのかが無い'
-assert 'agy-tui stop' in message, '次にやることが無い'
-assert '--name agy' in message, '停止コマンドがこのroleを指していない'
+assert message != verdict, 'the raw held: verdict is coming through unchanged'
+assert 'demo/agy' in message, 'no mention of which seat this is about'
+assert str(pid) in message, 'no pid of the holding process'
+assert 'supervisor' in message, 'no mention of what is holding it'
+assert 'agy-tui stop' in message, 'no next action given'
+assert '--name agy' in message, 'the stop command does not point at this role'
 
 # An owner token this cannot decode keeps its original wording rather than being
 # dressed up as a diagnosis.

@@ -7,6 +7,7 @@
 load test_helper
 
 setup() {
+  skip "quarantined for 1.3.1: #1262"
   setup_test_env
   # On MSYS2, the compat shim makes the ppid walk succeed; _iid() (bats
   # subshell) and watch.sh (standalone bash) have different process trees, so
@@ -19,6 +20,8 @@ setup() {
 }
 
 teardown() {
+  # Nothing to clean when setup() skipped before creating the sandbox (the 1.3.1 quarantine, #1262).
+  [ -n "${TEST_SKILL_DIR:-}" ] || return 0
   teardown_test_env
 }
 

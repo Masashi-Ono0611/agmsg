@@ -479,9 +479,30 @@ eperm_pid() {
 @test "delivery set monitor: emits AGMSG-DIRECTIVE for Monitor invocation" {
   run bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
-  [[ "$output" =~ "AGMSG-DIRECTIVE" ]]
-  [[ "$output" =~ "invoke the Monitor tool" ]]
-  [[ "$output" =~ "watch.sh" ]]
+  grep -q 'AGMSG-DIRECTIVE' <<<"$output"
+  grep -q 'invoke the Monitor tool' <<<"$output"
+  grep -q 'watch.sh' <<<"$output"
+  # Claude Code 2.1.271 caps every Monitor watch at 30 minutes and drops the
+  # unbounded 'persistent' option, notifying the agent to re-arm on expiry
+  # (#1270). Without an explicit timeout_ms the watch silently degrades to
+  # the 5-minute default -- timeout_ms is unconditional, present regardless
+  # of AGMSG_CC_MONITOR_KEEP_ALIVE below.
+  grep -q 'timeout_ms: 1800000' <<<"$output"
+  # AGMSG_CC_MONITOR_KEEP_ALIVE, default OFF: with it unset (the run above),
+  # the directive must NOT carry the re-arm wording -- most seats have
+  # nothing asking them to keep a watch alive across its own expiry, and
+  # rearm.sh covers the ones that do.
+  refute grep -q 'immediately re-arm it by invoking Monitor again' <<<"$output"
+  refute grep -q 'Re-arm it silently' <<<"$output"
+
+  run env AGMSG_CC_MONITOR_KEEP_ALIVE=1 bash "$SCRIPTS/delivery.sh" set monitor claude-code "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  grep -q 'timeout_ms: 1800000' <<<"$output"
+  grep -q 'immediately re-arm it by invoking Monitor again' <<<"$output"
+  # The maintainer's follow-up to #1270: an agent that announces every silent
+  # re-arm ("re-armed", an acknowledgement, a summary) burns tokens every 30
+  # minutes for no reader benefit, so the directive must say to do it quietly.
+  [[ "$output" =~ "Re-arm it silently" ]]
 }
 
 @test "delivery set both: emits AGMSG-DIRECTIVE for Monitor invocation" {
@@ -2560,8 +2581,47 @@ JSON
   [ -f "$TEST_PROJECT/.agent/rules/agmsg.md" ]
   run bash "$SCRIPTS/delivery.sh" set monitor antigravity "$TEST_PROJECT"
   [ "$status" -eq 0 ]
-  refute grep -qF '既存rulefileはagmsg形式ではありません' <<<"$output"
+  refute grep -qF 'existing rule file is not in agmsg format' <<<"$output"
   grep -qF '<!-- agmsg:antigravity:monitor -->' "$TEST_PROJECT/.agent/rules/agmsg.md"
+
+  # Pre-#1248 agmsg (1.3.0 and earlier) wrote this exact text but named the
+  # per-driver notes file SKILL.md, renamed to README.md in #1248. Every
+  # upgraded user's untouched rule file has that one older byte, and must
+  # migrate the same way rather than being refused as a foreign file.
+  local rule_file="$TEST_PROJECT/.agent/rules/agmsg.md"
+  rm -f "$rule_file"
+  mkdir -p "$(dirname "$rule_file")"
+  # Sourced, not written out literally here, for the same #1249 reason
+  # _delivery.sh's own migration check sources it: this stays the only
+  # tracked place holding the pre-#1248 path, so a new stray SKILL.md
+  # reference anywhere else -- including elsewhere in this file -- still
+  # fails the #1249 check.
+  local LEGACY_PRE1248_NOTES_PATH
+  source "$SCRIPTS/drivers/types/antigravity/legacy-pre1248-notes-path.sh"
+  cat > "$rule_file" <<EOF
+# agmsg Integration Rule
+
+## PostToolUse
+After each tool call, automatically check the agmsg inbox for unread messages.
+- Command: '$SCRIPTS/check-inbox.sh' 'antigravity' '$TEST_PROJECT'
+
+## Terminal/pane self-awareness
+Asked about your own terminal, pane, or driver — or before using arrange/peek/poke
+— run '$SCRIPTS/where.sh' first and answer from its terminal=/capabilities=
+fields. Never guess from environment variables or a grep/ps command; a driver
+that IS present can be wrongly reported absent that way. Per-driver detail:
+'$SCRIPTS/$LEGACY_PRE1248_NOTES_PATH' (terminal= names which).
+
+## Teammates: placement, status, and reaching them
+Placement and status for a teammate: '$SCRIPTS/team.sh' <team> — never a
+stale memory of their last known pane. Act on one with '$SCRIPTS/peek.sh'
+/ 'poke.sh' / 'arrange.sh' <team> <name> directly, not a guess: its exit code
+says whether it worked and, if not, why.
+EOF
+  run bash "$SCRIPTS/delivery.sh" set monitor antigravity "$TEST_PROJECT"
+  [ "$status" -eq 0 ]
+  refute grep -qF 'existing rule file is not in agmsg format' <<<"$output"
+  grep -qF '<!-- agmsg:antigravity:monitor -->' "$rule_file"
 }
 
 @test "antigravity rejects both mode" {
@@ -2634,6 +2694,27 @@ EOF
   local request_file="$TEST_SKILL_DIR/run/codex-bridge-request.$seat_key"
   [ -f "$request_file" ]
   grep -q -- "ws://127.0.0.1:50505" "$request_file"
+}
+
+@test "session-start.sh for codex retires a stale pair when its server is unavailable" {
+  bash "$SCRIPTS/join.sh" team alice codex "$TEST_PROJECT" >/dev/null
+  _seed_role_record team alice thread-tombstone "$TEST_PROJECT" codex
+
+  source "$SCRIPTS/drivers/types/codex/_seat-key.sh"
+  local seat_key request_file
+  seat_key="$(_agmsg_codex_seat_key_new)"
+  request_file="$TEST_SKILL_DIR/run/codex-bridge-request.$seat_key"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  printf 'codex\told-thread\tws://127.0.0.1:1\tteam\talice\n' > "$request_file"
+
+  ( unset AGMSG_CODEX_BRIDGE_APP_SERVER
+    AGMSG_CODEX_BRIDGE_LAUNCHER=1 \
+    AGMSG_CODEX_SEAT_KEY="$seat_key" \
+    CODEX_THREAD_ID="thread-tombstone" \
+      bash "$SCRIPTS/session-start.sh" codex "$TEST_PROJECT" >/dev/null )
+
+  [ -f "$request_file" ]
+  [ "$(sed -n '1p' "$request_file")" = $'codex\tthread-tombstone\t\t' ]
 }
 
 @test "session-start.sh for codex stays quiet without monitor launcher env" {
