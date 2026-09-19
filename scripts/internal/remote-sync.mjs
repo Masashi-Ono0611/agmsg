@@ -1,12 +1,13 @@
 #!/usr/bin/env node
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { spawn } from "node:child_process";
-import { appendFile, lstat, mkdir, open, readFile, readdir, rename, rm, rmdir, stat, writeFile } from "node:fs/promises";
+import { appendFile, lstat, mkdir, open, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import { basename, dirname, join, resolve, sep } from "node:path";
 import process from "node:process";
-import { closeSync, mkdtempSync, openSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { closeSync, mkdirSync, mkdtempSync, openSync, readFileSync, realpathSync, rmdirSync,
+  rmSync, unlinkSync, writeFileSync } from "node:fs";
+import { hostname, tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { ageExecutableVersion, CipherStateError, openEnvelope,
   readNativeAgeIdentity } from "./sync-cipher.mjs";
@@ -4149,10 +4150,65 @@ async function publicSnapshot(serverUrl, teamId) {
 // primitive, so the two sides of the connection pair -- the shell writing the
 // binding, this file writing the stored sync config -- serialize against each
 // other, not just against themselves. Spin bounded the same way (~10s).
-async function withTeamConfigLock(team, fn) {
+// Tracks the ONE team-config lock this process currently holds, so a
+// terminating signal can release it before Node's default disposition tears
+// the process down. There is at most one, because withTeamConfigLock is never
+// called reentrantly within a single process (measured: SIGTERM with no
+// handler installed skips a pending `finally` entirely -- the same failure
+// mode as SIGKILL, not just power loss, so the ordinary stop path can leak
+// this lock too).
+let heldTeamConfigLock = null; // { lockDir, holderPath, token } | null
+
+// Same ownership check as the shell side's _agmsg_lock_drop: remove the
+// holder and the directory only when the recorded token is still ours. An
+// operator may have removed a stuck lock and a successor taken the same path
+// between our write and this call; deleting blind would take the lock away
+// from whoever holds it now.
+//
+// Synchronous throughout, on purpose, and callable from a signal handler:
+// the token compare and both removals happen on one call stack with no
+// `await` anywhere in it, so process.exit() right after this returns can
+// never land mid-release the way it could when this read the holder back
+// asynchronously (nothing forces the event loop to run between here and the
+// exit call that follows it).
+function releaseTeamConfigLockSync(held) {
+  let seen;
+  try {
+    seen = /^token (.+)$/m.exec(readFileSync(held.holderPath, "utf8"))?.[1];
+  } catch { seen = undefined; }
+  if (seen !== held.token) return;
+  try { unlinkSync(held.holderPath); } catch { /* already gone */ }
+  try { rmdirSync(held.lockDir); } catch { /* already gone */ }
+}
+
+let teamConfigLockSignalHandlersInstalled = false;
+function installTeamConfigLockSignalHandlers() {
+  if (teamConfigLockSignalHandlersInstalled) return;
+  teamConfigLockSignalHandlersInstalled = true;
+  // $(128 + signum), the same convention registry-lock.sh's own traps use.
+  // Not `async`: the handler must run start-to-finish on one call stack, the
+  // same reason releaseTeamConfigLockSync is synchronous rather than a
+  // sequence of awaited I/O the exit below could outrun.
+  for (const [signal, exitCode] of [["SIGTERM", 143], ["SIGINT", 130]]) {
+    process.on(signal, () => {
+      const held = heldTeamConfigLock;
+      heldTeamConfigLock = null;
+      if (held) { try { releaseTeamConfigLockSync(held); } catch { /* best effort */ } }
+      process.exit(exitCode);
+    });
+  }
+}
+
+export async function withTeamConfigLock(team, fn) {
+  // Installed once, on first use: this changes shutdown behavior for the
+  // whole process (Node otherwise terminates on SIGTERM/SIGINT with no
+  // handler at all), so it is scoped to callers that actually take this lock
+  // rather than applied unconditionally to every subcommand in this file.
+  installTeamConfigLockSignalHandlers();
   const lockDir = join(dirname(teamConfigPath(team)), ".config.lock");
+  const holderPath = `${lockDir}.holder`;
   for (let attempt = 0; ; attempt += 1) {
-    try { await mkdir(lockDir); break; }
+    try { mkdirSync(lockDir); break; }
     catch (error) {
       if (error?.code !== "EEXIST") throw error;
       // Same exit as the shell side (registry-lock.sh): a holder that died
@@ -4168,10 +4224,31 @@ async function withTeamConfigLock(team, fn) {
       await new Promise((resolveSleep) => setTimeout(resolveSleep, 10));
     }
   }
+  // WHO HOLDS IT (#778's own reasoning, mirrored from registry-lock.sh): a
+  // bare lock directory says something is holding it and nothing about what.
+  //
+  // mkdirSync above, the writeFileSync below, and recording the hold in
+  // heldTeamConfigLock all run on one call stack with no `await` between
+  // them. A signal is only ever delivered between event-loop turns, never
+  // inside a run of synchronous code, so there is no window where the
+  // directory exists on disk but nothing in this process yet knows it owns
+  // it -- which is exactly the gap the first version of this fix left open:
+  // mkdir and the holder write were two separate awaited calls, so a SIGTERM
+  // landing between them found heldTeamConfigLock still null and exited over
+  // an empty, un-annotated directory, the original bug moved into a
+  // narrower window instead of closed.
+  const token = randomBytes(16).toString("hex");
+  const held = { lockDir, holderPath, token };
+  try {
+    writeFileSync(holderPath,
+      `token ${token}\npid ${process.pid}\ncommand remote-sync.mjs\nhost ${hostname()}\n`);
+  } catch { /* best-effort: the lock is held as of the mkdir above regardless */ }
+  heldTeamConfigLock = held;
   try {
     return await fn();
   } finally {
-    await rmdir(lockDir).catch(() => {});
+    heldTeamConfigLock = null;
+    releaseTeamConfigLockSync(held);
   }
 }
 
