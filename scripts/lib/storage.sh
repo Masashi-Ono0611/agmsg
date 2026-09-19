@@ -100,6 +100,17 @@ agmsg_db_path() {
 # Source the partition driver this team uses, memoized so repeated resolution in
 # one process costs nothing. Re-sources when a caller moves between teams on
 # different partitions — watch.sh loops over a subscription that can contain both.
+#
+# Deliberately NOT caching agmsg_driver_for_team's own answer (which driver a
+# team uses) per team, on top of this: a team's partition CAN change under a
+# running watcher, via an ordinary operation (internal/migrate-team-store.sh,
+# reached mid remote-connect) that flips a team from shared to per-team and
+# then removes its row from the shared store. A watcher that had cached
+# "shared" would keep reading the now-stale shared store forever, silently
+# never delivering anything the migrated store receives. The un-cached read
+# below is what notices the switch, exactly as it always has (review, #1329
+# round 2: a first attempt at this cache shipped the exact regression this
+# comment describes).
 _AGMSG_PARTITION_LOADED=""
 _agmsg_partition_load() {
   # The registry may not be sourced yet — agmsg_db_path is reachable without
