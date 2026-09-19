@@ -77,6 +77,45 @@ EOF
   export PATH="$FAKEBIN:$PATH"
 }
 
+# #1321: poke's own input-box check now peeks before typing. These delivery
+# tests are about the SUBMISSION mechanism (argv shape, body escaping), not
+# about the box-emptiness check itself (that has its own dedicated test
+# below) -- so their fake terminals must present a genuinely empty Claude
+# Code box (the same measured shape: a rule line, "❯", a rule line), or the
+# check correctly refuses generic placeholder text it was never designed to
+# read. Loosening the check to accept arbitrary fake output would be the
+# wrong fix (review, #1321) -- these fixtures are shaped to the real box
+# instead.
+_install_fake_tmux_empty_box() {
+  local rule
+  rule="$(printf '─%.0s' $(seq 1 60))"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '{ printf '\''tmux'\''; for a in "$@"; do printf '\'' [%%s]'\'' "$a"; done; printf '\''\\n'\''; } >> "%s"\n' "$ARGV_LOG"
+    printf 'case "$1" in\n'
+    printf "  capture-pane) printf '%%s\\\\n' '%s testteam-alice ─' '❯' '%s' ;;\n" "$rule" "$rule"
+    printf 'esac\n'
+    printf 'exit 0\n'
+  } > "$FAKEBIN/tmux"
+  chmod +x "$FAKEBIN/tmux"
+  export PATH="$FAKEBIN:$PATH"
+}
+
+_install_fake_herdr_empty_box() {
+  local rule
+  rule="$(printf '─%.0s' $(seq 1 60))"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '{ printf '\''herdr'\''; for a in "$@"; do printf '\'' [%%s]'\'' "$a"; done; printf '\''\\n'\''; } >> "%s"\n' "$ARGV_LOG"
+    printf 'if [ "$1" = pane ] && [ "$2" = read ]; then\n'
+    printf "  printf '%%s\\\\n' '%s testteam-alice ─' '❯' '%s'\n" "$rule" "$rule"
+    printf 'fi\n'
+    printf 'exit 0\n'
+  } > "$FAKEBIN/herdr"
+  chmod +x "$FAKEBIN/herdr"
+  export PATH="$FAKEBIN:$PATH"
+}
+
 _install_fake_osascript() {
   cat > "$FAKEBIN/uname" <<'EOF'
 #!/usr/bin/env bash
@@ -270,17 +309,21 @@ EOF
 # --- poke ----------------------------------------------------------------
 
 @test "poke: tmux text and Enter arrive in SEPARATE bursts, arrow in the second (#619)" {
-  _install_fake_tmux
+  _install_fake_tmux_empty_box
   _write_record "tmux:%5"
   run bash "$SCRIPTS/poke.sh" testteam alice "hello there"
   [ "$status" -eq 0 ]
   _out_has "poked 'testteam/alice' via tmux"
-  # Exactly TWO tmux invocations: a merged single burst (the #619 regression)
-  # or a third stray call both change this count.
-  [ "$(grep -c '^tmux ' "$ARGV_LOG")" -eq 2 ]
-  local first second
-  first="$(sed -n '1p' "$ARGV_LOG")"
-  second="$(sed -n '2p' "$ARGV_LOG")"
+  # Exactly THREE tmux invocations: the #1321 input-box peek (capture-pane),
+  # then the #619 two-burst submission. A merged single send-keys burst (the
+  # #619 regression), a missing peek, or a fourth stray call all change this
+  # count.
+  [ "$(grep -c '^tmux ' "$ARGV_LOG")" -eq 3 ]
+  local peek first second
+  peek="$(sed -n '1p' "$ARGV_LOG")"
+  first="$(sed -n '2p' "$ARGV_LOG")"
+  second="$(sed -n '3p' "$ARGV_LOG")"
+  [ "$peek" = 'tmux [capture-pane] [-p] [-t] [%5]' ]
   # Burst 1 is the literal text and carries NO Enter — the equality is what
   # goes red if the Enter ever rejoins the text burst (an Enter appended to
   # this line makes the string differ).
@@ -290,12 +333,15 @@ EOF
 }
 
 @test "poke: herdr submits in ONE call (agent prompt) with no Enter dance" {
-  _install_fake_herdr
+  _install_fake_herdr_empty_box
   _write_record "herdr:wC:p4"
   run bash "$SCRIPTS/poke.sh" testteam alice "hello"
   [ "$status" -eq 0 ]
   _out_has "poked 'testteam/alice' via herdr"
-  [ "$(grep -c '^herdr ' "$ARGV_LOG")" -eq 1 ]
+  # Two herdr invocations: the #1321 input-box peek (pane read), then the
+  # single agent-prompt submission call.
+  [ "$(grep -c '^herdr ' "$ARGV_LOG")" -eq 2 ]
+  grep -q '^herdr \[pane\] \[read\] \[wC:p4\] \[--source\] \[visible\]$' "$ARGV_LOG"
   # The inner ':' of the herdr pane id must survive the record round-trip.
   grep -q '^herdr \[agent\] \[prompt\] \[wC:p4\] \[hello\]$' "$ARGV_LOG"
   # No synthesized keystrokes: submission is agent prompt's own.
@@ -330,7 +376,7 @@ EOF
 }
 
 @test "poke: --body-file delivers a shell-hostile body verbatim (#507's class)" {
-  _install_fake_herdr
+  _install_fake_herdr_empty_box
   _write_record "herdr:wC:p4"
   # Backtick, $( ), quotes, $VAR — none of it may execute or change: the body
   # never crosses the caller's shell. Equality against the argv line is the
@@ -339,12 +385,13 @@ EOF
   run bash "$SCRIPTS/poke.sh" testteam alice --body-file "$TEST_SKILL_DIR/body.txt"
   [ "$status" -eq 0 ]
   _out_has "poked 'testteam/alice' via herdr"
-  [ "$(sed -n '1p' "$ARGV_LOG")" = 'herdr [agent] [prompt] [wC:p4] [check `whoami` and $(hostname) plus "quotes" and $HOME here]' ]
-  [ "$(grep -c '^herdr ' "$ARGV_LOG")" -eq 1 ]
+  # Line 1 is the #1321 input-box peek; the submission is line 2.
+  [ "$(sed -n '2p' "$ARGV_LOG")" = 'herdr [agent] [prompt] [wC:p4] [check `whoami` and $(hostname) plus "quotes" and $HOME here]' ]
+  [ "$(grep -c '^herdr ' "$ARGV_LOG")" -eq 2 ]
 }
 
 @test "poke: --body - reads stdin; a missing file and an empty body refuse before any terminal runs" {
-  _install_fake_tmux
+  _install_fake_tmux_empty_box
   _write_record "tmux:%5"
   printf 'from stdin' | { run bash "$SCRIPTS/poke.sh" testteam alice --body -; \
     [ "$status" -eq 0 ]; }
@@ -645,24 +692,40 @@ EOF
 # does not.
 
 # herdr whose `agent prompt` FAILS (pane exists, no live agent to receive).
+# `pane read` returns the real empty-input-box shape so the #1321 pre-check
+# passes and the submission failure is what actually surfaces (an empty
+# read is NOT itself proof of "no draft" -- see poke.sh's own comment on
+# this -- so the fixture must show a genuinely empty box, not blank output).
 _install_fake_herdr_poke_fails() {
-  cat > "$FAKEBIN/herdr" <<EOF
-#!/usr/bin/env bash
-{ printf 'herdr'; for a in "\$@"; do printf ' [%s]' "\$a"; done; printf '\n'; } >> "$ARGV_LOG"
-if [ "\$1" = agent ] && [ "\$2" = prompt ]; then echo "no live agent in pane" >&2; exit 1; fi
-exit 0
-EOF
+  local rule
+  rule="$(printf '─%.0s' $(seq 1 60))"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '{ printf '\''herdr'\''; for a in "$@"; do printf '\'' [%%s]'\'' "$a"; done; printf '\''\\n'\''; } >> "%s"\n' "$ARGV_LOG"
+    printf 'if [ "$1" = pane ] && [ "$2" = read ]; then\n'
+    printf "  printf '%%s\\\\n' '%s testteam-alice ─' '❯' '%s'\n" "$rule" "$rule"
+    printf '  exit 0\n'
+    printf 'fi\n'
+    printf 'if [ "$1" = agent ] && [ "$2" = prompt ]; then echo "no live agent in pane" >&2; exit 1; fi\n'
+    printf 'exit 0\n'
+  } > "$FAKEBIN/herdr"
   chmod +x "$FAKEBIN/herdr"; export PATH="$FAKEBIN:$PATH"
 }
 
-# tmux whose send-keys FAILS (the pane is gone).
+# tmux whose send-keys FAILS (the pane is gone). `capture-pane` returns the
+# real empty-input-box shape for the same reason as the herdr fixture above.
 _install_fake_tmux_poke_fails() {
-  cat > "$FAKEBIN/tmux" <<EOF
-#!/usr/bin/env bash
-{ printf 'tmux'; for a in "\$@"; do printf ' [%s]' "\$a"; done; printf '\n'; } >> "$ARGV_LOG"
-case "\$1" in send-keys) echo "can't find pane: %5" >&2; exit 1 ;; esac
-exit 0
-EOF
+  local rule
+  rule="$(printf '─%.0s' $(seq 1 60))"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '{ printf '\''tmux'\''; for a in "$@"; do printf '\'' [%%s]'\'' "$a"; done; printf '\''\\n'\''; } >> "%s"\n' "$ARGV_LOG"
+    printf 'case "$1" in\n'
+    printf "  capture-pane) printf '%%s\\\\n' '%s testteam-alice ─' '❯' '%s' ;;\n" "$rule" "$rule"
+    printf '  send-keys) echo "can'\''t find pane: %%5" >&2; exit 1 ;;\n'
+    printf 'esac\n'
+    printf 'exit 0\n'
+  } > "$FAKEBIN/tmux"
   chmod +x "$FAKEBIN/tmux"; export PATH="$FAKEBIN:$PATH"
 }
 
@@ -879,4 +942,128 @@ EOF
   [ "$status" -eq 0 ]
   [ "$output" = moved ]
   grep -q '^tmux \[swap-pane\] \[-s\] \[%1\] \[-t\] \[%2\]$' "$ARGV_LOG"
+}
+
+# #1321: poke.sh must not type over a person's own half-typed draft. The two
+# canned screens below mirror a real Claude Code pane's own shape (measured
+# live 2026-09-18): a top rule carrying the pane's label, the ❯ prompt line,
+# a bottom rule -- the exact structure scripts/lib/input-box.sh's "boxed"
+# check scopes its search to. RULE60 is built, not hand-typed, so its length
+# (60 >= the 20-character run the checker requires) is provable, not eyeballed.
+_install_fake_herdr_input_box() {
+  local shape="$1" rule
+  rule="$(printf '─%.0s' $(seq 1 60))"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '{ printf '\''herdr'\''; for a in "$@"; do printf '\'' [%%s]'\'' "$a"; done; printf '\''\\n'\''; } >> "%s"\n' "$ARGV_LOG"
+    printf 'if [ "$1" = pane ] && [ "$2" = read ]; then\n'
+    printf "  printf '%%s\\\\n' '%s testteam-alice ─'\n" "$rule"
+    if [ "$shape" = draft ]; then
+      printf "  printf '%%s\\\\n' '❯ half-typed draft'\n"
+    else
+      printf "  printf '%%s\\\\n' '❯'\n"
+    fi
+    printf "  printf '%%s\\\\n' '%s'\n" "$rule"
+    printf 'fi\n'
+    printf 'exit 0\n'
+  } > "$FAKEBIN/herdr"
+  chmod +x "$FAKEBIN/herdr"
+  export PATH="$FAKEBIN:$PATH"
+}
+
+_write_codex_record() {
+  local name="$1" ref="$2" path
+  path="$(bash -c '. "'"$SKILL_DIR"'/scripts/lib/actas-lock.sh"; agmsg_spawn_path testteam "$1"' _ "$name")"
+  [ -n "$path" ]
+  printf '%s\t/tmp/project-a\tcodex' "$ref" > "$path"
+}
+
+# Fake herdr for the flat (Codex) shape: one canned "pane read" screen per
+# call, taken in order, so ONE fake covers a multi-call scenario without a
+# stateful counter.
+_install_fake_herdr_flat_screens() {
+  local out="$FAKEBIN/herdr" i=0
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '{ printf '\''herdr'\''; for a in "$@"; do printf '\'' [%%s]'\'' "$a"; done; printf '\''\\n'\''; } >> "%s"\n' "$ARGV_LOG"
+    printf 'if [ "$1" = pane ] && [ "$2" = read ]; then\n'
+    printf '  case "$AGMSG_TEST_FLAT_SCREEN_FILE" in *) :;; esac\n'
+    printf '  cat "$AGMSG_TEST_FLAT_SCREEN_FILE"\n'
+    printf 'fi\n'
+    printf 'exit 0\n'
+  } > "$out"
+  chmod +x "$out"
+  export PATH="$FAKEBIN:$PATH"
+}
+
+@test "poke.sh refuses a Claude Code seat with a draft in its input box, and types once the box is empty" {
+  _install_fake_herdr_input_box draft
+  _write_record "herdr:w1:p5"
+  run bash "$SCRIPTS/poke.sh" testteam alice "hello"
+  [ "$status" -eq 14 ]
+  _out_has "input in progress"
+  [ "$(grep -c '^herdr \[agent\] \[prompt\]' "$ARGV_LOG")" -eq 0 ]
+
+  : > "$ARGV_LOG"
+  _install_fake_herdr_input_box empty
+  run bash "$SCRIPTS/poke.sh" testteam alice "hello"
+  [ "$status" -eq 0 ]
+  _out_has "poked 'testteam/alice' via herdr"
+  grep -q '^herdr \[agent\] \[prompt\]' "$ARGV_LOG"
+
+  # Codex, genuinely empty (#1321 review): the exact shape measured live on
+  # 5 real Codex panes (2026-09-18) -- marker line carrying Codex's own
+  # placeholder text, one blank line, a status footer containing "·".
+  # Still delivers.
+  : > "$ARGV_LOG"
+  _install_fake_herdr_flat_screens
+  export AGMSG_TEST_FLAT_SCREEN_FILE="$TEST_SKILL_DIR/flat-screen.txt"
+  printf 'some transcript line\n› Ask Codex to do anything\n\n  gpt-5.6-sol low · ~/projects/esota/agmsg-dev · task\n' \
+    > "$AGMSG_TEST_FLAT_SCREEN_FILE"
+  _write_codex_record codex1 "herdr:w1:p6"
+  run bash "$SCRIPTS/poke.sh" testteam codex1 "hello"
+  [ "$status" -eq 0 ]
+  grep -q '^herdr \[agent\] \[prompt\]' "$ARGV_LOG"
+
+  # Codex, real single-line draft in the same measured shape -- the
+  # marker's own tail is neither blank nor the placeholder, so it refuses
+  # even with a valid footer witness right below it.
+  : > "$ARGV_LOG"
+  printf 'some transcript line\n› half typed draft\n\n  gpt-5.6-sol low · ~/projects/esota/agmsg-dev · task\n' \
+    > "$AGMSG_TEST_FLAT_SCREEN_FILE"
+  run bash "$SCRIPTS/poke.sh" testteam codex1 "hello"
+  [ "$status" -eq 14 ]
+  [ "$(grep -c '^herdr \[agent\] \[prompt\]' "$ARGV_LOG")" -eq 0 ]
+
+  # Codex, multi-line draft: the marker line's OWN tail looks blank, but a
+  # continuation line sits where the footer witness must be -- refuses,
+  # because the blank-line-then-footer structure is broken, not because the
+  # continuation text itself was read.
+  : > "$ARGV_LOG"
+  printf 'some transcript line\n› \nhalf-typed continuation\n\n  gpt-5.6-sol low · ~/projects/esota/agmsg-dev · task\n' \
+    > "$AGMSG_TEST_FLAT_SCREEN_FILE"
+  run bash "$SCRIPTS/poke.sh" testteam codex1 "hello"
+  [ "$status" -eq 14 ]
+  [ "$(grep -c '^herdr \[agent\] \[prompt\]' "$ARGV_LOG")" -eq 0 ]
+
+  # Codex, stale/off-screen marker: a blank "›" with blank lines after it
+  # and NO footer at all -- the exact shape the previous "near the bottom"
+  # guess accepted as empty (confirmed against that implementation before
+  # this fix), because proximity alone cannot tell a live box from a
+  # leftover one. The footer-witness requirement refuses it.
+  : > "$ARGV_LOG"
+  printf '›\n\n\n' > "$AGMSG_TEST_FLAT_SCREEN_FILE"
+  run bash "$SCRIPTS/poke.sh" testteam codex1 "hello"
+  [ "$status" -eq 14 ]
+  [ "$(grep -c '^herdr \[agent\] \[prompt\]' "$ARGV_LOG")" -eq 0 ]
+
+  # plain (#1321 review): the input-box check must not block plain's
+  # existing agent-registration -- but see #1229 for what plain does with a
+  # real Claude Code caller (a hard refusal, no fallback needed here since
+  # this run has no ambient caller identity, matching the earlier `unset`
+  # in setup()); the point of this assertion is only that it did NOT come
+  # back as exit 14 (the input-box refusal), proving the check was skipped.
+  _write_named_record plaintarget 'plain:-'
+  run bash "$SCRIPTS/poke.sh" testteam plaintarget "hello"
+  [ "$status" -ne 14 ]
 }

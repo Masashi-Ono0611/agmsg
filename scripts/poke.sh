@@ -29,6 +29,15 @@ set -euo pipefail
 # and the Enter becomes a newline instead of submitting (#619). herdr's
 # `agent prompt` submits by itself and needs no Enter dance. plain refuses
 # with "unsupported: <why>" on stderr, non-zero — never a silent 0.
+#
+# Before typing, a type that opted in (input_prompt_marker set in its
+# manifest) has its input box checked for a draft — see
+# scripts/lib/input-box.sh. That check narrows the window a poke can
+# corrupt a draft; it does NOT close it: a person can start typing in the
+# instant between the check and the actual keystroke below, and that
+# keystroke can still land mixed with theirs (maintainer-accepted residual
+# risk, #1321 review). "poke checked the box first" is not "poke cannot
+# ever type into a non-empty box".
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"  # actas-lock.sh requires SKILL_DIR
@@ -42,13 +51,48 @@ source "$SCRIPT_DIR/lib/type-registry.sh"       # required by detect-cli-type.sh
 source "$SCRIPT_DIR/lib/compat.sh"              # required by detect-cli-type.sh
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/detect-cli-type.sh"     # agmsg_detect_cli_type (#1229 plain fallback)
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/input-box.sh"           # agmsg_input_box_empty (#1321)
 
 die() { echo "poke: $*" >&2; exit 1; }
 
 TEAM="${1:-}"; NAME="${2:-}"
-USAGE="Usage: poke.sh <team> <name> --body-file <path> | --body - | <text>"
+USAGE="Usage: poke.sh <team> <name> [--retries N] [--retry-delay SECONDS] [--backoff fixed|exponential] --body-file <path> | --body - | <text>"
 [ -n "$TEAM" ] && [ -n "$NAME" ] || die "$USAGE"
 shift 2
+
+# Retry options, default off (RETRIES=0 means the loop near the bottom of
+# this script runs exactly once, same as before this existed). Pulled out
+# of the remaining args first, in any position, so they never disturb the
+# body-spec parsing below. Retries exist only for the input-box refusal
+# (#1321) — a transient condition (the person finishes typing) — never for
+# a driver-level failure (unreachable pane, no placement record, and so
+# on), which retrying would not fix.
+RETRIES=0
+RETRY_DELAY=2
+BACKOFF=exponential
+_REMAINING=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --retries)
+      [ $# -ge 2 ] || die "--retries needs a number"
+      case "$2" in ''|*[!0-9]*) die "--retries must be a non-negative integer, got: $2" ;; esac
+      RETRIES="$2"; shift 2 ;;
+    --retry-delay)
+      [ $# -ge 2 ] || die "--retry-delay needs a number of seconds"
+      case "$2" in ''|*[!0-9]*) die "--retry-delay must be a non-negative integer, got: $2" ;; esac
+      RETRY_DELAY="$2"; shift 2 ;;
+    --backoff)
+      [ $# -ge 2 ] || die "--backoff must be 'fixed' or 'exponential'"
+      case "$2" in
+        fixed|exponential) BACKOFF="$2" ;;
+        *) die "--backoff must be 'fixed' or 'exponential', got: $2" ;;
+      esac
+      shift 2 ;;
+    *) _REMAINING+=("$1"); shift ;;
+  esac
+done
+set -- "${_REMAINING[@]+"${_REMAINING[@]}"}"
 
 TEXT=""
 case "${1:-}" in
@@ -96,8 +140,74 @@ agmsg_terminal_load "$TERMINAL" \
 # driver's stdout is protocol, not for the operator — swallow it, keep the
 # driver's exit status (plain's unsupported 13 included), and put a one-line
 # human answer on each side.
+#
+# Input-box check (#1321), immediately before EVERY attempt including
+# retries — never once up front, since the box's own state is exactly what
+# each retry exists to wait out. INPUT_MARKER empty (this type set none in
+# its manifest) skips the check entirely: unconditional single terminal_poke
+# call, the same as before this existed.
+#
+# Also skipped outright for the plain terminal (review): plain has no
+# addressable screen to read at all (terminal_peek always fails there, by
+# contract), so treating that failure as "could not confirm empty" would
+# refuse EVERY plain poke with exit 14 and never reach the existing
+# plain-specific fallback below (an agmsg message, when the caller can
+# resolve one) — a real regression, not a safety win, since plain never had
+# a screen for a draft to corrupt in the first place.
+INPUT_MARKER="$(agmsg_type_get "$TYPE" input_prompt_marker)"
+INPUT_BOXED="$(agmsg_type_get "$TYPE" input_prompt_boxed)"
+[ "$TERMINAL" = plain ] && INPUT_MARKER=""
+
 RC=0
-terminal_poke "$BARE_ID" "$TEXT" >/dev/null || RC=$?
+ATTEMPT=0
+while :; do
+  RC=0
+  if [ -n "$INPUT_MARKER" ]; then
+    SCREEN="" PEEK_RC=0
+    # No 2>/dev/null here (unlike before): on failure this is terminal_peek's
+    # own diagnosis, not an "input in progress" refusal, and it must reach
+    # the operator verbatim -- the same message terminal_poke would have
+    # printed for the same underlying cause (#1321 review round 2).
+    SCREEN="$(terminal_peek "$BARE_ID")" || PEEK_RC=$?
+    if [ "$PEEK_RC" -ne 0 ]; then
+      # The read itself failed for a driver-level reason (unreachable,
+      # confirmed gone, unsupported, ...). Return it unchanged instead of
+      # collapsing every peek failure into 14.
+      RC="$PEEK_RC"
+    else
+      # A successful-but-EMPTY read is NOT proof the box is empty: a real
+      # pane can transiently show nothing during a screen redraw or a
+      # switch to an alternate screen, and typing there would still land on
+      # top of a real draft. Refuse (14) the same as any other
+      # not-confirmed-empty screen; do not special-case empty content
+      # (#1321 review round 3 — reverts round 2's peek/poke-asymmetry
+      # shortcut).
+      agmsg_input_box_empty "$INPUT_MARKER" "$INPUT_BOXED" "$SCREEN" || RC=14
+    fi
+  fi
+  if [ "$RC" -eq 0 ]; then
+    terminal_poke "$BARE_ID" "$TEXT" >/dev/null || RC=$?
+    break
+  fi
+  # Retries exist to wait out a draft being typed (RC=14) — a driver-level
+  # failure propagated above, or from terminal_poke's own attempt, would not
+  # be fixed by waiting and must not be retried.
+  [ "$RC" -eq 14 ] || break
+  [ "$ATTEMPT" -lt "$RETRIES" ] || break
+  ATTEMPT=$((ATTEMPT + 1))
+  if [ "$BACKOFF" = exponential ]; then
+    WAIT=$((RETRY_DELAY * (1 << (ATTEMPT - 1))))
+    [ "$WAIT" -le 60 ] || WAIT=60
+  else
+    WAIT="$RETRY_DELAY"
+  fi
+  sleep "$WAIT"
+done
+
+if [ "$RC" -eq 14 ]; then
+  echo "poke: '$TEAM/$NAME' has a draft in its input box — refusing to type over it (input in progress)" >&2
+  exit 14
+fi
 
 # #1229: a bare plain:- target (id '-') has no pane at all — not a
 # reachability failure worth retrying, a structural absence. See
