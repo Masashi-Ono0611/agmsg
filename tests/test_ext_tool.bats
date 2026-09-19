@@ -87,6 +87,25 @@ setup() {
     printf '%s\n' 'wait'
   } > "$SLOWTOOL_DIR/handle"
   chmod +x "$SLOWTOOL_DIR/handle"
+
+  # A third tool whose setup echoes back exactly the arguments it received,
+  # for the argument-forwarding regression below (dogfood finding: `setup
+  # ... save`/`check` used to drop or wrongly inject config_path).
+  ARGTOOL_DIR="$SCRIPTS/drivers/ext-tools/argtool"
+  mkdir -p "$ARGTOOL_DIR"
+  printf '%s\n' 'name=argtool' > "$ARGTOOL_DIR/tool.conf"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'set -euo pipefail'
+    printf '%s\n' 'case "${1:-}" in'
+    printf '%s\n' '  save) shift; printf "save:%s\n" "$*" ;;'
+    printf '%s\n' '  check) shift; printf "check:%s\n" "$*" ;;'
+    printf '%s\n' '  status) echo "{\"missing\":[]}" ;;'
+    printf '%s\n' '  test) exit 0 ;;'
+    printf '%s\n' '  *) exit 1 ;;'
+    printf '%s\n' 'esac'
+  } > "$ARGTOOL_DIR/setup"
+  chmod +x "$ARGTOOL_DIR/setup"
 }
 
 teardown() { teardown_test_env; }
@@ -217,4 +236,69 @@ teardown() { teardown_test_env; }
   # Positive evidence, not just an inference from the test having passed:
   # the fake `timeout` was genuinely never invoked.
   [ ! -f "$fake_bin/timeout.invoked" ]
+
+  # (vi) `secret --from-clipboard` reads the system clipboard instead of a
+  # TTY (dogfood finding: `secret`'s plain form refuses under an agent's `!`,
+  # which has no real TTY). A fake pbpaste that FAILS (not just a fake
+  # pbpaste that works) is put ahead of a fake wl-paste that succeeds, on
+  # PATH -- proving a failing first candidate is not fatal on its own and the
+  # search actually moves on to the next one (review finding: an earlier
+  # version stopped at the first candidate FOUND, not the first one that
+  # actually worked). Its stderr, which names the fake secret to prove it
+  # would otherwise leak, must never reach this command's own output.
+  local clip_bin="$BATS_TEST_TMPDIR/fake-bin"
+  mkdir -p "$clip_bin"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    'echo "pbpaste: connection failed near clip-secret-1284" >&2' \
+    'exit 1' \
+    > "$clip_bin/pbpaste"
+  chmod +x "$clip_bin/pbpaste"
+  printf '%s\n' '#!/usr/bin/env bash' 'printf %s "clip-secret-1284"' > "$clip_bin/wl-paste"
+  chmod +x "$clip_bin/wl-paste"
+  local secret_file="$TEST_SKILL_DIR/ext-tools/et-team/bot.secret"
+  run env PATH="$clip_bin:$PATH" bash "$SCRIPTS/ext-tool.sh" secret et-team bot --from-clipboard
+  [ "$status" -eq 0 ]
+  # Exact match, not just a substring grep: pins the ENTIRE output to this
+  # one line, so a leaked stderr fragment from a failed candidate (or
+  # anything else unexpected) would fail this assertion, not just get missed
+  # by a loose grep. The path is expected in the line (dogfood finding: the
+  # calling LLM needs it verbatim as the next step's key_file argument).
+  [ "$output" = "Saved to $secret_file. (The value itself is not shown or logged.)" ]
+  [ -f "$secret_file" ]
+  [ "$(stat -c '%a' "$secret_file" 2>/dev/null || stat -f '%Lp' "$secret_file")" = "600" ]
+  grep -qF "clip-secret-1284" "$secret_file"
+
+  # When EVERY candidate found on PATH fails, the caller must be told "found
+  # but failed", not "nothing found" -- these were being conflated (review
+  # finding): the function signaled "at least one was tried" through a plain
+  # variable assignment made from inside a `value="$(...)"` command
+  # substitution, which runs in a subshell, so the caller's own copy of that
+  # variable never actually changed. A separate PATH with ONLY the failing
+  # fake pbpaste (no wl-paste fallback this time) reproduces it.
+  local fail_only_bin="$BATS_TEST_TMPDIR/fail-only-bin"
+  mkdir -p "$fail_only_bin"
+  cp "$clip_bin/pbpaste" "$fail_only_bin/pbpaste"
+  run env PATH="$fail_only_bin:$PATH" bash "$SCRIPTS/ext-tool.sh" secret et-team bot2 --from-clipboard
+  [ "$status" -eq 1 ]
+  [ "$output" = "agmsg: found a clipboard reader on PATH but it failed to read the clipboard." ]
+}
+
+@test "ext-tool: setup save forwards extra args after config_path, check forwards them WITHOUT config_path" {
+  # Expected, written before running: a real adapter's own save may need
+  # more than config_path (a key file path, a channel id), and its own
+  # check verifies a raw, not-yet-saved value, so it must never receive
+  # config_path at all. This was reported against a real Slack adapter that
+  # bypassed this entry point entirely because save silently dropped its
+  # extra arguments and check silently injected one it never asked for.
+  local config_path="$TEST_SKILL_DIR/ext-tools/argteam/argbot.conf"
+
+  run bash "$SCRIPTS/ext-tool.sh" setup argteam argbot argtool save /path/key_file C0CHANNEL
+  [ "$status" -eq 0 ]
+  grep -qF "save:$config_path /path/key_file C0CHANNEL" <<<"$output"
+
+  run bash "$SCRIPTS/ext-tool.sh" setup argteam argbot argtool check channel /path/key_file C0CHANNEL
+  [ "$status" -eq 0 ]
+  grep -qF "check:channel /path/key_file C0CHANNEL" <<<"$output"
+  refute grep -qF "$config_path" <<<"$output"
 }
