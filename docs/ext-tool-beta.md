@@ -132,10 +132,10 @@ or a non-zero exit all come back to the sender as one line.
 posting only. `setup test` posts a real message and returns its permalink.
 Inbound Slack replies are not carried back into agmsg yet.
 
-**`jev`** asks a typed question and answers in one line, for example:
+**`jev`** asks one or more typed questions and answers in one line, for example:
 
 ```
-jev: sonnet / high (choice p=0.96, confidence=0.94, cost $0.000021)
+jev: model=sonnet (p=0.92, confidence=0.89) / effort=medium (p=0.85, confidence=0.79) (cost $0.000022)
 ```
 
 That line is the OpenRouter form. Reached through TypeSafe's own API the
