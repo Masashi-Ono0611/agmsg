@@ -110,3 +110,38 @@
   run grep -F "format('push-{0}', github.ref)" "$workflow"
   [ "$status" -eq 0 ]
 }
+
+# #1304: a merged/closed PR used to keep its own in-flight run alive with
+# nothing left to cancel it (only a further push to the same PR ever
+# re-triggered the pr-<number> concurrency group). Pins both halves of the
+# fix: the trigger fires on close, and the run it produces does no real work
+# -- it exists only to land in the group and let cancel-in-progress cancel
+# whatever was still running for this PR.
+@test "a closed PR triggers a run that skips the suite instead of running it (#1304)" {
+  local workflow="$BATS_TEST_DIRNAME/../.github/workflows/tests.yml"
+
+  run grep -F 'types: [opened, synchronize, reopened, closed]' "$workflow"
+  [ "$status" -eq 0 ]
+
+  run grep -F 'if [ "$ACTION" = "closed" ]; then' "$workflow"
+  [ "$status" -eq 0 ]
+  run bash -c "grep -A25 'if \[ \"\$ACTION\" = \"closed\" \]; then' '$workflow' | grep -c 'GITHUB_OUTPUT'"
+  [ "$status" -eq 0 ]
+  [ "$output" -eq 5 ]
+
+  # Every heavy job must skip at the JOB level on a closed event, not merely
+  # skip its own steps -- a job-level `if:` that still evaluates true lets
+  # the matrix expand and each leg claim a runner for a no-op checkout, which
+  # defeats the point of freeing macOS slots on close (review finding). Pins
+  # both that the guarded form is present the expected number of times AND
+  # that the old, unguarded form is gone everywhere -- a partial fix (some
+  # jobs updated, one missed) would otherwise still pass a "present somewhere"
+  # check.
+  run bash -c "grep -c 'if: \${{ !cancelled() && github.event.action != .closed. }}' '$workflow'"
+  [ "$status" -eq 0 ]
+  [ "$output" -eq 8 ]
+  # grep -c exits 1 on a zero count, which is the expected/wanted outcome
+  # here, so only $output (not $status) is asserted on this one.
+  run bash -c "grep -c 'if: \${{ !cancelled() }}\$' '$workflow'"
+  [ "$output" -eq 0 ]
+}
