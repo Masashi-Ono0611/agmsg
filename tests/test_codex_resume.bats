@@ -120,15 +120,15 @@ recorded_uuid() {
     bash "$TYPES/codex/codex-record-session.sh"
   [ "$status" -eq 0 ]
   [ -z "$output" ]
-  [[ "$stderr" == *"nothing recorded"* ]]
-  [[ "$stderr" == *"<team> <agent>"* ]]
+  printf '%s\n' "$stderr" | grep -qF "nothing recorded"
+  printf '%s\n' "$stderr" | grep -qF "<team> <agent>"
   [ -z "$(recorded_uuid team alice)" ]
 }
 
 @test "codex template: actas step passes <team> <name> to codex-record-session.sh" {
   local slot
   slot="$(sed -n '/<!-- agmsg:slot actas -->/,/<!-- \/agmsg:slot actas -->/p' "$TYPES/codex/template.md")"
-  [[ "$slot" == *"codex-record-session.sh <team> <name>"* ]]
+  printf '%s\n' "$slot" | grep -qF "codex-record-session.sh <team> <name>"
 }
 
 # Read back the recorded project for (team, agent).
