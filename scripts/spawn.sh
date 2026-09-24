@@ -524,19 +524,21 @@ PLAIN_WITNESS="${BOOT}.plain-witness"
   # suppresses the "rename this session" tip meant for hand-started sessions.
   echo 'export AGMSG_SPAWNED=1'
   # Record boot-process presence before the CLI runs (see agmsg_boot_pid_path):
-  # $$ here is the boot script's own shell pid, not spawn.sh's -- it stays
-  # alive for exactly as long as the CLI below runs (foreground, not exec'd),
-  # so a liveness check on this pid tracks the CLI's lifetime even if the
-  # CLI/model never reaches its own watcher-registration step. A consumer
-  # always validates via kill(pid, 0) (same contract as every other sentinel
-  # here), so a stale file is harmless -- but the trap below still clears it
-  # on the common abnormal-exit paths (closed window/tab -> HUP, killed pane
-  # -> TERM, Ctrl-C -> INT) so it doesn't needlessly linger; only a SIGKILL
-  # (untrappable) leaves it behind for the next liveness check to invalidate.
+  # $$ is this boot shell, which owns the foreground CLI. This proves only that
+  # the boot process is present; it says nothing about agent readiness or
+  # responsiveness. Include a process-start witness so a later check can reject
+  # a reused PID. The token follows the plain-terminal witness convention.
   printf 'mkdir -p %q 2>/dev/null || true\n' "$(_actas_lock_dir)"
   printf 'AGMSG_BOOT_PID_PATH=%q\n' "$BOOT_PID_PATH"
-  printf 'echo $$ > "$AGMSG_BOOT_PID_PATH" 2>/dev/null || true\n'
-  printf 'trap '\''rm -f "$AGMSG_BOOT_PID_PATH" 2>/dev/null'\'' EXIT HUP TERM INT\n'
+  echo 'AGMSG_BOOT_PID_START="$(ps -o lstart= -p "$$" 2>/dev/null | sed '\''s/^ *//; s/ *$//'\'' | tr '\'' '\'' '\''_'\'')"'
+  echo 'AGMSG_BOOT_PID_RECORD="$$	$AGMSG_BOOT_PID_START"'
+  echo 'AGMSG_BOOT_PID_TMP="$AGMSG_BOOT_PID_PATH.tmp.$$"'
+  echo 'printf "%s" "$AGMSG_BOOT_PID_RECORD" > "$AGMSG_BOOT_PID_TMP" 2>/dev/null && echo >> "$AGMSG_BOOT_PID_TMP" && mv -f "$AGMSG_BOOT_PID_TMP" "$AGMSG_BOOT_PID_PATH" 2>/dev/null || rm -f "$AGMSG_BOOT_PID_TMP" 2>/dev/null'
+  echo '_agmsg_boot_pid_cleanup() { if [ "$(cat "$AGMSG_BOOT_PID_PATH" 2>/dev/null)" = "$AGMSG_BOOT_PID_RECORD" ]; then rm -f "$AGMSG_BOOT_PID_PATH" 2>/dev/null || true; fi; return 0; }'
+  echo 'trap _agmsg_boot_pid_cleanup EXIT'
+  echo 'trap '\''exit 129'\'' HUP'
+  echo 'trap '\''exit 130'\'' INT'
+  echo 'trap '\''exit 143'\'' TERM'
   # Drop inherited same-type session-identity vars before exec'ing the CLI (#294).
   # An entry ending in `*` is a NAMESPACE: every exported variable whose name
   # starts with that prefix is unset, enumerated from `env` at boot time, so a
@@ -608,8 +610,7 @@ PLAIN_WITNESS="${BOOT}.plain-witness"
     agmsg_role_cli_args "$AGENT_TYPE" "$SESSION_NAME" "$ACTAS_PROMPT"
     printf '\n'
   fi
-  echo 'trap - EXIT HUP TERM INT'  # CLI returned normally -- the explicit rm below covers it, not the trap
-  echo 'rm -f "$AGMSG_BOOT_PID_PATH" 2>/dev/null'  # presence over
+  echo '_agmsg_boot_pid_cleanup'  # CLI returned; exec below would replace this shell without EXIT
   echo 'rm -f "$0" 2>/dev/null'   # self-clean once the agent exits
   echo 'exec "${SHELL:-/bin/bash}" -i'
 } > "$BOOT"
