@@ -50,6 +50,15 @@
 # this file sources it.
 # shellcheck disable=SC1091
 . "${SKILL_DIR:?}/scripts/lib/token-locate.sh"
+# agmsg_canonical_path, for _fix_codex_thread_reassign's project comparison
+# (#1468) -- actas-lock.sh/self-write.sh pull in role-session.sh and
+# instance-id.sh already, but nothing before this reached resolve-project.sh.
+# shellcheck disable=SC1091
+. "${SKILL_DIR:?}/scripts/lib/resolve-project.sh"
+# agmsg_sha1, needed by _bridge-key.sh's agmsg_codex_bridge_key (sourced
+# lazily from _fix_codex_thread_synced) for its own multi-pair hash.
+# shellcheck disable=SC1091
+. "${SKILL_DIR:?}/scripts/lib/hash.sh"
 
 # The seats whose actas lock this session OWNS, one line per seat:
 #   ok\t<team>\t<agent>\t<owner>            resolved -- safe to use
@@ -231,6 +240,209 @@ _fix_locate() {   # <team> <agent> <owner>
   return "$rc"
 }
 
+# The bridge state at ONE candidate bridge_key: nothing wrong there (rc 0,
+# no output) when there is no LIVE pidfile at this key at all -- a thread
+# file is only ever consulted when its own pidfile's pid is alive (#1470
+# review round 7). A thread file does not disappear when its bridge dies,
+# and a role's safe set can move it from the single-pair key to the
+# multi-pair key (or back) without either key's old file being cleaned up
+# -- so a stale, ownerless thread file must never be read as "still on the
+# old thread": that reads a leftover as a live fact and can never clear
+# (session-start.sh has nothing to make it go away, and deleting a file
+# this function does not own would need an ownership check beyond this
+# round's scope). Only once the pidfile at this SAME key proves something
+# is actually running here does its thread file get to speak: matches
+# CODEX_THREAD_ID (rc 0), names a different thread (rc 1,
+# bridge_thread_still_old), or is simply absent while the pid is alive (rc
+# 1, bridge_thread_unknown -- round 5 finding 1, an install/upgrade
+# boundary or a bridge still starting; "no file" is not "nothing to
+# compare" when something is plainly running).
+_fix_codex_bridge_key_state() {   # <bridge_key>
+  local key="$1" pidfile bridge_pid thread_file thread_now
+  [ -n "$key" ] || return 0
+  pidfile="$(_actas_lock_dir)/codex-bridge.$key.pid"
+  [ -f "$pidfile" ] || return 0
+  bridge_pid="$(cat "$pidfile" 2>/dev/null || true)"
+  [ -n "$bridge_pid" ] && _agmsg_pid_alive "$bridge_pid" || return 0
+
+  thread_file="$(_actas_lock_dir)/codex-bridge.$key.thread"
+  if [ -f "$thread_file" ]; then
+    thread_now="$(cat "$thread_file" 2>/dev/null || true)"
+    [ "$thread_now" = "${CODEX_THREAD_ID:-}" ] || { printf 'bridge_thread_still_old\n'; return 1; }
+    return 0
+  fi
+  printf 'bridge_thread_unknown\n'
+  return 1
+}
+
+# Whether (team, agent)'s codex thread state matches CODEX_THREAD_ID, by
+# READING THE RESULT rather than trusting an exit code (#1470 review round
+# 4 finding 3): codex-record-session.sh routinely exits 0 having recorded
+# nothing (its own "poison-record guard" -- a thread it cannot resolve is a
+# no-op, not a failure), and session-start.sh exits 0 on every early return
+# (no app-server yet, no seat key, an already-live bridge) -- none of those
+# are evidence the state this function cares about actually changed.
+#
+# Checks the role-session record first, then the bridge's own recorded
+# thread -- at BOTH candidate bridge_keys (#1470 review round 6), because
+# the two writer architectures do not agree on which one a role actually
+# uses. The out-of-sandbox launcher's dispatcher spawns one CHILD PER ROLE
+# PAIR, so its bridge_key is always the single-pair "team.agent" form, even
+# when two roles share the same thread. The direct session-start.sh path
+# instead bundles every "safe" pair (every registered pair whose OWN record
+# already names this project+thread) into ONE bridge process, so its key
+# can be the multi-pair hash form -- agmsg_codex_bridge_key(project,
+# CODEX_THREAD_ID), the exact derivation that path uses, computed through
+# the shared function rather than re-derived here (round 5 finding 2: two
+# independent re-derivations is how a reader and a writer land on
+# different keys in the first place). Nothing here tells which
+# architecture actually wrote a given seat's bridge, so both keys are
+# checked; a project with only one seat on this thread has them coincide
+# (checked once, not twice). Either key reporting a problem is enough.
+#
+# Prints nothing and returns 0 when synced (including "no bridge_key at
+# all" -- a seat whose record was just updated and has never had a bridge
+# has nothing to contradict, at either key); prints a one-word reason and
+# returns 1 otherwise.
+_fix_codex_thread_synced() {   # <team> <agent> <project>
+  local team="$1" agent="$2" project="$3" rec_thread single_key safe_key reason
+  rec_thread="$(agmsg_role_session_uuid "$team" "$agent" 2>/dev/null || true)"
+  [ "$rec_thread" = "${CODEX_THREAD_ID:-}" ] || { printf 'role_session_record_still_old\n'; return 1; }
+
+  if ! declare -F agmsg_codex_bridge_key >/dev/null 2>&1; then
+    # shellcheck disable=SC1091
+    . "$SKILL_DIR/scripts/drivers/types/codex/_bridge-key.sh"
+  fi
+  single_key="$team.$agent"
+  safe_key="$(agmsg_codex_bridge_key "$project" "${CODEX_THREAD_ID:-}" 2>/dev/null || true)"
+
+  reason="$(_fix_codex_bridge_key_state "$single_key")" || { printf '%s\n' "$reason"; return 1; }
+  if [ -n "$safe_key" ] && [ "$safe_key" != "$single_key" ]; then
+    reason="$(_fix_codex_bridge_key_state "$safe_key")" || { printf '%s\n' "$reason"; return 1; }
+  fi
+  return 0
+}
+
+# Run the two existing recovery commands -- codex-record-session.sh, then
+# session-start.sh codex <project>, the same order and the same two
+# commands a seat has always run by hand -- and re-check by STATE, never by
+# their exit codes (see _fix_codex_thread_synced). Already-synced short-
+# circuits without running either (idempotent either way, but no reason to
+# shell out twice on every `fix` once a seat has caught up). Prints nothing
+# and returns 0 when synced afterward; prints the still-stale reason and
+# returns 1 otherwise.
+_fix_codex_thread_sync() {   # <team> <agent> <project>
+  local team="$1" agent="$2" project="$3" reason
+  reason="$(_fix_codex_thread_synced "$team" "$agent" "$project")" && return 0
+  "$SKILL_DIR/scripts/drivers/types/codex/codex-record-session.sh" "$team" "$agent" "$project" >/dev/null 2>&1 || true
+  "$SKILL_DIR/scripts/session-start.sh" codex "$project" </dev/null >/dev/null 2>&1 || true
+  reason="$(_fix_codex_thread_synced "$team" "$agent" "$project")" && return 0
+  printf '%s\n' "$reason"
+  return 1
+}
+
+# codex's `/clear` mints a new CODEX_THREAD_ID inside the same TUI process
+# (#1468). The actas lock this seat claimed under the OLD thread id is now
+# owned by a sid this session's AGMSG_SESSION_ID (= the new CODEX_THREAD_ID,
+# see fix.sh) can never match, so _fix_seats_of finds nothing and a plain
+# `fix` reports no_seat_for_this_session even though the seat is still right
+# here, in the same pane, under the same OS process. This reassigns it --
+# but ONLY when every one of the following holds, checked in order, the
+# first miss reported and nothing guessed past it:
+#
+#   1. CODEX_THREAD_ID is set (this really is a codex session, and we know
+#      its current, trustworthy thread id).
+#   2. Exactly ONE registered codex seat for the current project PROVES for
+#      this pane (agmsg_self_proof, the same proof `fix` always uses --
+#      proof is about OS process ancestry, which /clear never changes, so a
+#      seat whose actas lock is stale by SID still proves here).
+#   3. That seat's role-session record's project matches this one, and its
+#      recorded thread is a DIFFERENT thread than CODEX_THREAD_ID (there is
+#      actually something stale to fix).
+#
+# On success: re-claim the actas lock under the NEW sid, then run the exact
+# two commands a seat has always run by hand to recover from this (#1468) --
+# codex-record-session.sh to move the role-session record onto the current
+# thread, then session-start.sh codex <project> to hand the bridge off
+# again. No new bridge-restart machinery: the out-of-sandbox launcher
+# (codex-bridge-launcher.sh, the path codex-monitor.sh actually arms) already
+# polls the role-session record and its own request file and retires+
+# respawns a bridge bound to the wrong thread on its own -- confirmed by
+# reading its child loop, not assumed. Prints the reassigned seat in the same
+# `ok\t<team>\t<agent>\t<owner>` shape _fix_seats_of emits, so the normal
+# proved/write loop below picks it up unchanged; prints nothing and returns
+# 1 when any condition is not met (the caller reports the skip by name).
+_fix_codex_thread_reassign() {
+  local project env kind cand pairs team agent
+  local proof_out proof_rc proof_state proved_team="" proved_agent="" proved_n=0
+  local rec_thread rec_project rec_project_phys project_phys new_owner claim_out claim_rc=0
+
+  [ -n "${CODEX_THREAD_ID:-}" ] || { printf 'codex_thread_id_not_set\n'; return 1; }
+
+  project="$PWD"
+  env="$(agmsg_terminal_self_env 2>/dev/null)"
+  [ -n "$env" ] || { printf 'no_candidate_in_env\n'; return 1; }
+  kind="${env%%$'\t'*}"
+  cand="$(printf '%s' "$env" | cut -f2)"
+  agmsg_terminal_load "$kind" 2>/dev/null || true
+
+  pairs="$("$SKILL_DIR/scripts/identities.sh" "$project" codex 2>/dev/null || true)"
+  [ -n "$pairs" ] || { printf 'no_registered_codex_seat_for_project\n'; return 1; }
+
+  while IFS=$'\t' read -r team agent; do
+    [ -n "$team" ] && [ -n "$agent" ] || continue
+    proof_rc=0
+    proof_out="$(agmsg_self_proof "$team" "$agent" "$cand" 2>/dev/null)" || proof_rc=$?
+    proof_state="${proof_out%%$'\t'*}"
+    if [ "$proof_rc" -eq 0 ] && [ "$proof_state" = proved ]; then
+      proved_n=$((proved_n + 1))
+      proved_team="$team"; proved_agent="$agent"
+    fi
+  done <<< "$pairs"
+
+  [ "$proved_n" -ge 1 ] || { printf 'no_proved_codex_seat_in_this_pane\n'; return 1; }
+  [ "$proved_n" -eq 1 ] || { printf 'multiple_proved_codex_seats_in_this_pane\n'; return 1; }
+
+  rec_thread="$(agmsg_role_session_uuid "$proved_team" "$proved_agent" 2>/dev/null || true)"
+  [ -n "$rec_thread" ] || { printf 'no_role_session_record\n'; return 1; }
+  rec_project="$(agmsg_role_session_get "$proved_team" "$proved_agent" project 2>/dev/null || true)"
+  rec_project_phys="$(agmsg_canonical_path "$rec_project" 2>/dev/null || printf '%s' "$rec_project")"
+  project_phys="$(agmsg_canonical_path "$project" 2>/dev/null || printf '%s' "$project")"
+  [ "$rec_project_phys" = "$project_phys" ] || { printf 'recorded_project_mismatch\n'; return 1; }
+  [ "$rec_thread" != "$CODEX_THREAD_ID" ] || { printf 'record_already_on_current_thread\n'; return 1; }
+
+  # Eligible. Re-claim first -- proof and record are about to change under
+  # it, and a caller reading the lock between here and the record rewrite
+  # below should see this session, not the dead one.
+  new_owner="$(agmsg_normalize_instance_id "$CODEX_THREAD_ID" codex 2>/dev/null)"
+  [ -n "$new_owner" ] || { printf 'owner_token_unresolvable\n'; return 1; }
+  # Not a plain actas_lock_claim: the old owner's pid is the SAME os process
+  # (only its codex thread id changed), so it is genuinely alive and a plain
+  # claim would report held:<old-owner> forever. actas_lock_reclaim_same_process
+  # is the one lock write allowed to move a live-owned lock, and only when the
+  # new owner's pid -- derived the identical way -- matches the current one.
+  claim_out="$(actas_lock_reclaim_same_process "$proved_team" "$proved_agent" "$new_owner" 2>/dev/null)" || claim_rc=$?
+  [ "$claim_rc" -eq 0 ] && [ "$claim_out" = ok ] || { printf 'actas_lock_reclaim_failed\n'; return 1; }
+
+  # The lock move above is the one step this function is willing to leave in
+  # place on a downstream failure (rolling it back would only trade "seat
+  # right here, bridge on the old thread" for "seat nowhere at all" -- worse,
+  # not safer). A caller must still be told when the rest did not actually
+  # converge: silently reporting proved when it did not is exactly what
+  # #1470 review caught. Checked by STATE (_fix_codex_thread_sync), not by
+  # the two commands' exit codes -- both routinely exit 0 without having
+  # changed anything.
+  local sync_reason sync_rc=0
+  sync_reason="$(_fix_codex_thread_sync "$proved_team" "$proved_agent" "$project")" || sync_rc=$?
+  if [ "$sync_rc" -ne 0 ]; then
+    printf 'partial\t%s\t%s\t%s\t%s\n' "$proved_team" "$proved_agent" "$new_owner" "$sync_reason"
+    return 2
+  fi
+
+  printf 'ok\t%s\t%s\t%s\n' "$proved_team" "$proved_agent" "$new_owner"
+  return 0
+}
+
 # The entry. Refuses any argument by name.
 agmsg_fix_run() {
   if [ "$#" -ne 0 ]; then
@@ -238,10 +450,45 @@ agmsg_fix_run() {
     return 1
   fi
   local sid seats line status a b c team agent owner loc st payload via rc=0 any=0 failed=0
+  local reassign_line reassign_reason
   sid="$(agmsg_instance_bare_sid "${AGMSG_SESSION_ID:-}" 2>/dev/null)"
   [ -n "$sid" ] || { echo "fix none:no_session_id" >&2; return 1; }
   seats="$(_fix_seats_of "$sid")"
-  [ -n "$seats" ] || { echo "fix none:no_seat_for_this_session" >&2; return 1; }
+  if [ -z "$seats" ]; then
+    # #1468: this session's own seat may be a codex seat stranded by /clear
+    # rather than one that never existed -- see _fix_codex_thread_reassign's
+    # own header for the exact conditions and why they are safe.
+    #
+    # Lifted errexit, as terminal-registry.sh's own sourcing does: a bare
+    # assignment from a failing command substitution kills the shell right
+    # there under `set -e`, before the `rc=$?` on the next line ever runs
+    # (bash 3.2 dies here even behind `|| rc=$?`; check-errexit-status-reads.sh).
+    local _rl_restore_e=0
+    case $- in *e*) _rl_restore_e=1 ;; esac
+    set +e
+    reassign_line="$(_fix_codex_thread_reassign)"
+    rc=$?
+    [ "$_rl_restore_e" = 1 ] && set -e
+    if [ "$rc" -eq 0 ]; then
+      seats="$reassign_line"
+    elif [ "$rc" -eq 2 ]; then
+      # The actas lock moved, but the role-session record and/or bridge did
+      # not converge -- the seat is not fully repaired, so this is reported
+      # as a failure by name, never as proved. The lock move is left in
+      # place (see _fix_codex_thread_reassign's own comment for why undoing
+      # it is not safer): running `fix` again from here re-enters through
+      # the seats-found branch below, which now also re-checks and retries
+      # the sync for exactly this reason (#1470 review round 4 finding 2).
+      IFS=$'\t' read -r _ team agent owner detail <<<"$reassign_line"
+      printf 'fix seat=%s/%s state=partial reason=%s (lock reclaimed under %s; fix again once the bridge catches up)\n' \
+        "$team" "$agent" "$detail" "$owner"
+      return 2
+    else
+      reassign_reason="$reassign_line"
+      echo "fix none:no_seat_for_this_session reason=${reassign_reason:-not_a_codex_seat}" >&2
+      return 1
+    fi
+  fi
   while IFS=$'\t' read -r status a b c; do
     [ -n "$status" ] || continue
     any=1
@@ -256,6 +503,26 @@ agmsg_fix_run() {
       continue
     fi
     team="$a"; agent="$b"; owner="$c"
+    # #1470 review round 4 finding 2: a seat _fix_seats_of already found
+    # normally (its actas lock is correctly ours) can still be a codex seat
+    # whose role-session record or bridge is stale relative to THIS
+    # session's current thread -- exactly the state a prior `partial` left
+    # behind. Without this, running `fix` again after a partial would find
+    # the seat via the ordinary path above, report proved (the lock and
+    # pane genuinely ARE fine), and never retry the two recovery commands --
+    # "fix again" would not actually converge. Only runs at all when
+    # CODEX_THREAD_ID is in this shell; a non-codex seat has no such
+    # variable to compare against, so this is a no-op for it.
+    if [ -n "${CODEX_THREAD_ID:-}" ]; then
+      local sync_reason sync_rc=0
+      sync_reason="$(_fix_codex_thread_sync "$team" "$agent" "$PWD")" || sync_rc=$?
+      if [ "$sync_rc" -ne 0 ]; then
+        printf 'fix seat=%s/%s state=partial reason=%s (lock already ours; fix again once the bridge catches up)\n' \
+          "$team" "$agent" "$sync_reason"
+        failed=1
+        continue
+      fi
+    fi
     loc="$(_fix_locate "$team" "$agent" "$owner")" || true
     st="${loc%%$'\t'*}"; payload="${loc#*$'\t'}"; via="${payload##*$'\t'}"; payload="${payload%$'\t'*}"
     if [ "$st" = proved ]; then
