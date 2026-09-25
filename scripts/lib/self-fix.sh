@@ -155,46 +155,41 @@ _fix_seats_of() {   # <bare-sid>
   done
 }
 
-# The locator a proof established. The proof's canonical ref names the kind
-# and the pane; the INSTANCE is the one the proof's observation went through --
-# the socket the driver was talking to while it observed the pane's processes.
-# That is the name of the observation's path, not the environment as an
-# authority: if the proof did not say proved, this is never consulted.
+# The locator a proof established. Ask the registered driver for its instance;
+# do not maintain a second terminal-name-to-environment table here.
 _fix_locator_of_proof() {   # <canonical-ref>
-  local ref="$1" kind pane inst=""
-  kind="${ref%%:*}"; pane="${ref#*:}"
-  case "$kind" in
-    herdr) inst="${HERDR_SOCKET_PATH:-}" ;;
-    tmux)  case "$pane" in *:*) inst="${pane%:*}"; pane="${pane##*:}" ;; *) inst="${TMUX:-}"; inst="${inst%%,*}" ;; esac ;;
-    plain) case "$pane" in *:*) inst="${pane%%:*}"; pane="${pane#*:}" ;; esac ;;
-  esac
-  [ -n "$inst" ] || { printf '%s\n' "$ref"; return 0; }   # bare: ambient instance
-  agmsg_locator_compose "$kind" "$inst" "$pane" 2>/dev/null || printf '%s\n' "$ref"
+  agmsg_terminal_ref_qualify "$1"
 }
 
 # Prove one seat's location. Prints "<state>\t<payload>\t<via>"; rc as the proof's.
 _fix_locate() {   # <team> <agent> <owner>
   local team="$1" agent="$2" owner="$3" env kind cand out rc=0 st
   env="$(agmsg_terminal_self_env 2>/dev/null)"
-  if [ -n "$env" ]; then
-    kind="${env%%$'\t'*}"
-    cand="$(printf '%s' "$env" | cut -f2)"
-    # agmsg_terminal_self_env is deliberately driver-free (its own header: "no
-    # driver loaded, no terminal called"). Nothing else in this call path loads
-    # one either, so terminal_pane_process_observe was never defined here and
-    # the proof always answered unsupported:driver_no_process_binding -- proved
-    # was unreachable for every terminal, not just the ones without the hook.
-    # Best-effort: a load failure still reaches the proof, whose own
-    # declare -F guard reports the right unsupported reason.
-    agmsg_terminal_load "$kind" 2>/dev/null || true
-    out="$(agmsg_self_proof "$team" "$agent" "$cand")" || rc=$?
-    st="${out%%$'\t'*}"
-    if [ "$rc" -eq 0 ] && [ "$st" = proved ]; then
-      printf 'proved\t%s\tproof\n' "$(_fix_locator_of_proof "${out#*$'\t'}")"; return 0
-    fi
-  else
-    out="undetermined"$'\t'"no_candidate_in_env"; rc=2
-  fi
+  case "$env" in
+    unknown:*) out="undetermined"$'\t'"${env#unknown:}"; rc=2 ;;
+    '') out="undetermined"$'\t'"no_candidate_in_env"; rc=2 ;;
+    *)
+      kind="${env%%$'\t'*}"
+      cand="$(printf '%s' "$env" | cut -f2)"
+      # The environment-only driver query does not alter this shell's loaded
+      # driver. Load the selected driver here so process observation uses its ABI.
+      # Best-effort: a load failure still reaches the proof, whose own
+      # declare -F guard reports the right unsupported reason.
+      agmsg_terminal_load "$kind" 2>/dev/null || true
+      out="$(agmsg_self_proof "$team" "$agent" "$cand")" || rc=$?
+      st="${out%%$'\t'*}"
+      if [ "$rc" -eq 0 ] && [ "$st" = proved ]; then
+        local qualified proof_ref
+        proof_ref="${out#*$'\t'}"
+        if qualified="$(_fix_locator_of_proof "$proof_ref")"; then
+          printf 'proved\t%s\tproof\n' "$qualified"
+          return 0
+        fi
+        printf 'undetermined\tterminal_instance_unresolved\tproof\n'
+        return 2
+      fi
+      ;;
+  esac
   # not proved: the emit-and-observe fallback (#1188), when it is present.
   # Split across two SEPARATE calls to this whole script (#1386): a caller
   # that emits and observes within the same call never sees its own token,
