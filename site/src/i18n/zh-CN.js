@@ -71,6 +71,7 @@ export default {
       "grok-build": "xAI 的构建/编程智能体。",
       hermes: "轻量级中继智能体。",
       antigravity: "智能体编程环境。",
+      devin: "自主AI软件工程师CLI。",
     },
   },
   showcase: {
@@ -84,6 +85,10 @@ export default {
         "将智能体间的消息日志回放成舞台上的角色对话——每个智能体化身轮流发言的角色。",
       "agmsg-viewer":
         "在浏览器中以 LINE 风格的聊天界面查看 agmsg 消息历史。",
+      "agmsg-bubblelog":
+        "在本地将团队的消息记录回放为聊天风格的会话——每个智能体各有头像，并带回放控制。",
+      "agmsg-tui":
+        "用 ratatui 构建的终端客户端——可通过 SSH、mosh 或在 tmux 中跨智能体读取和发送消息。",
     },
   },
   desktop: {

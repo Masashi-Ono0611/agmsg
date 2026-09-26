@@ -8,11 +8,6 @@ set -euo pipefail
 TEAM="${1:?Usage: join.sh <team> <agent_id> <type> <project_path> [--force]}"
 AGENT_ID="${2:?Missing agent_id}"
 AGENT_TYPE="${3:?Missing type (a registered type under scripts/drivers/types/<name>/)}"
-PROJECT_PATH="${4:?Missing project_path}"
-FORCE=0
-if [ "${5:-}" = "--force" ]; then
-  FORCE=1
-fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 # shellcheck disable=SC1091
@@ -31,10 +26,36 @@ SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 TEAMS_DIR="$SCRIPT_DIR/../teams"
 
 # Reject team names that would escape teams/ as a path segment (#140).
+# Ahead of the per-type join plug below: a type's own parse_args hook (e.g.
+# ext-tool's) may turn $TEAM into a path segment of its own before the rest
+# of this script runs, so it must be validated before that, not after.
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/validate.sh"
 agmsg_validate_team_name "$TEAM" || exit 1
 agmsg_validate_agent_name "$AGENT_ID" || exit 1
+
+# Generic per-type join plug (scripts/drivers/types/<type>/_join.sh): lets a
+# type parse its own trailing arguments (they need not look like <project_path>
+# [--force] at all -- ext-tool's shape is `--tool <tool> [--force]`) and
+# control the resolve/pane steps below, all without this script knowing any
+# type's name. Neither hook function may call exit -- this script decides
+# what a non-zero return means. A type without a _join.sh (or without one of
+# the two functions) gets the unchanged generic behavior.
+_AGMSG_JOIN_TYPE_DIR="$(agmsg_type_dir "$AGENT_TYPE" 2>/dev/null || true)"
+if [ -n "$_AGMSG_JOIN_TYPE_DIR" ] && [ -f "$_AGMSG_JOIN_TYPE_DIR/_join.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$_AGMSG_JOIN_TYPE_DIR/_join.sh"
+fi
+
+if declare -F agmsg_join_type_parse_args >/dev/null 2>&1; then
+  agmsg_join_type_parse_args "${@:4}" || exit 1
+else
+  PROJECT_PATH="${4:?Missing project_path}"
+  FORCE=0
+  if [ "${5:-}" = "--force" ]; then
+    FORCE=1
+  fi
+fi
 
 # Resolve the session's real project root from the passed pwd (see #92), so an
 # agent-driven join from a subdir/worktree registers under the project the
@@ -47,6 +68,8 @@ source "$SCRIPT_DIR/lib/resolve-project.sh"
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/registry-lock.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/roster-journal.sh"
 # Scope resolution to the join target team (#357): a poison registration in an
 # unrelated team must not steer this join's ancestor/git-common fallback.
 # Registering a project AT $HOME or / is deliberately allowed -- both claude and
@@ -54,8 +77,22 @@ source "$SCRIPT_DIR/lib/registry-lock.sh"
 # legitimate use case. The #357 protection is on the resolution side: the
 # ancestor walk never LANDS on $HOME/`/`, so such a registration only ever
 # matches its exact path and cannot silently vacuum up sessions beneath it.
-PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE" "$TEAM")"
-PROJECT_PATH="$(agmsg_normalize_project_path "$PROJECT_PATH")"
+#
+# A type's _join.sh may say (via agmsg_join_type_skip_resolve) that its
+# PROJECT_PATH is not a real filesystem path at all -- ext-tool's is the
+# synthetic "(ext-tool:<tool>)" placeholder set above, which resolve/
+# normalize's session-marker and ancestor-directory lookups would have
+# nothing meaningful to match against. This same flag also governs the pane
+# resolution/recording step further down (one shared check for both).
+_AGMSG_JOIN_SKIP_RESOLVE=0
+if declare -F agmsg_join_type_skip_resolve >/dev/null 2>&1 && agmsg_join_type_skip_resolve; then
+  _AGMSG_JOIN_SKIP_RESOLVE=1
+fi
+
+if [ "$_AGMSG_JOIN_SKIP_RESOLVE" -eq 0 ]; then
+  PROJECT_PATH="$(agmsg_resolve_project "$PROJECT_PATH" "$AGENT_TYPE" "$TEAM")"
+  PROJECT_PATH="$(agmsg_normalize_project_path "$PROJECT_PATH")"
+fi
 
 TEAM_CONFIG="$TEAMS_DIR/$TEAM/config.json"
 
@@ -67,11 +104,17 @@ agmsg_lock_acquire "$TEAMS_DIR/$TEAM" || exit 1
 
 # --- Ensure team config exists ---
 if [ ! -f "$TEAM_CONFIG" ]; then
-  INITIAL_CONFIG=$(printf '{\n  "name": "%s",\n  "agents": {},\n  "created_at": "%s"\n}' \
-    "$TEAM" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
+  INITIAL_CONFIG=$(printf '{\n  "name": "%s",\n  "team_id": "%s",\n  "agents": {},\n  "created_at": "%s"\n}' \
+    "$TEAM" "$(compat_uuid7)" "$(date -u +%Y-%m-%dT%H:%M:%SZ)")
   agmsg_write_atomic "$TEAM_CONFIG" "$INITIAL_CONFIG"
   echo "Created team: $TEAM"
 fi
+
+# Identity state is journal-owned for id-bearing teams. Bootstrap teams created
+# in the short pre-journal window, then refresh the config's derived agents
+# cache before making any membership decision under this same registry lock.
+agmsg_roster_ensure "$TEAMS_DIR/$TEAM" "$TEAM_CONFIG"
+agmsg_roster_project_config "$TEAMS_DIR/$TEAM" "$TEAM_CONFIG"
 
 # --- Refuse silently reviving a name that rename.sh just renamed away (#360) ---
 # A CLI's slash-command history can resubmit `/agmsg actas <old_name>` well
@@ -118,15 +161,43 @@ EXISTING=$(agmsg_sqlite_mem "
 ")
 
 if [ -z "$EXISTING" ] || [ "$EXISTING" = "null" ]; then
-  AGENT_OBJ=$(sqlite3 :memory: "SELECT json_object('registrations', json_array(json('$REGISTRATION_ESCAPED')));")
+  TEAM_HAS_IDS=$(agmsg_sqlite_mem "
+    SELECT json_type(CAST(readfile('$(agmsg_sql_readfile_path "$TEAM_CONFIG")') AS TEXT), '\$.team_id');
+  ")
+  if [ "$TEAM_HAS_IDS" = "text" ]; then
+    NAME_OWNER=$(agmsg_roster_name_owner "$TEAMS_DIR/$TEAM" "$AGENT_ID")
+    if [ -n "$NAME_OWNER" ]; then
+      RETIRED_ID=$(agmsg_sqlite_mem "
+        SELECT COALESCE(json_extract(
+          CAST(readfile('$(agmsg_sql_readfile_path "$TEAM_CONFIG")') AS TEXT),
+          '\$.retired_members.' || '$AGENT_ID_SQL' || '.member_id'),'');")
+      if [ "$RETIRED_ID" != "$NAME_OWNER" ]; then
+        echo "Error: '$AGENT_ID' is permanently bound to another active identity in team '$TEAM'." >&2
+        exit 1
+      fi
+      MEMBER_ID="$NAME_OWNER"
+    else
+      MEMBER_ID="$(compat_uuid7)"
+    fi
+    JOINED_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    agmsg_roster_append_joined "$TEAMS_DIR/$TEAM" "$MEMBER_ID" "$AGENT_ID" "$JOINED_AT"
+    AGENT_OBJ=$(sqlite3 :memory: "SELECT json_object(
+      'member_id', '$MEMBER_ID',
+      'registrations', json_array(json('$REGISTRATION_ESCAPED'))
+    );")
+  else
+    AGENT_OBJ=$(sqlite3 :memory: \
+      "SELECT json_object('registrations', json_array(json('$REGISTRATION_ESCAPED')));")
+  fi
 else
   EXISTING_ESCAPED=$(printf '%s' "$EXISTING" | sed "s/'/''/g")
   NORMALIZED=$(agmsg_sqlite_mem "
     WITH agent(a) AS (SELECT '$EXISTING_ESCAPED')
     SELECT CASE
       WHEN json_type(json_extract(a, '\$.registrations')) = 'array' THEN a
-      ELSE json_object(
-        'registrations',
+      ELSE json_set(
+        a,
+        '\$.registrations',
         json_array(json_object(
           'type', json_extract(a, '\$.type'),
           'project', json_extract(a, '\$.project')
@@ -189,6 +260,62 @@ UPDATED=$(agmsg_sqlite_mem \
   )
   FROM cfg;")
 agmsg_write_atomic "$TEAM_CONFIG" "$UPDATED"
+if agmsg_roster_has_journal "$TEAMS_DIR/$TEAM"; then
+  agmsg_roster_project_config "$TEAMS_DIR/$TEAM" "$TEAM_CONFIG"
+fi
 agmsg_lock_release
+
+# Name this pane for the seat just joined -- the VISIBLE name only. join does not
+# write a placement record, and must not: it is not a claim of the seat. The same
+# identity can be joined from a second session while a first one holds it through
+# actas, and a record written here would point peek/poke/despawn at the pane that
+# does NOT hold it. Showing your own name on your own pane is harmless; declaring
+# yourself the seat's placement is not. (The 6th argument is omitted deliberately;
+# its default is the safe half.)
+#
+# A type may publish its current session id through the manifest's `session_env=`
+# variable. This is deliberately NOT inferred from `detect=`: detection answers
+# whether a runtime is present and may name several markers or credentials,
+# while session_env names exactly one value with exactly this meaning. A missing
+# key or unset value remains the honest "this type/session publishes no id" and
+# drivers that do not need one (tmux, via $TMUX_PANE) still name normally.
+#
+# The source carries the errexit lift: on bash 3.2 a failure inside a sourced
+# file fires THIS script's `set -e`, so a plain `. x || true` would take the join
+# down instead of skipping the naming. Nothing here may fail a join.
+#
+# Skipped when the type's own _join.sh asked to (agmsg_join_type_skip_resolve,
+# same flag as the resolve-project step above) -- a type with no pane of its
+# own has nothing here to resolve or name. Attempting it anyway for ext-tool
+# used to resolve THIS SEAT's own pane instead and print a confusing
+# "already recorded as ..." warning (harmless, but misleading; a maintainer
+# dogfood finding). Every other type's behavior here is unchanged.
+if [ "$_AGMSG_JOIN_SKIP_RESOLVE" -eq 0 ]; then
+  _agmsg_tr_rc=0; _agmsg_tr_e=0
+  case $- in *e*) _agmsg_tr_e=1 ;; esac
+  set +e
+  # shellcheck disable=SC1091
+  [ -r "$SCRIPT_DIR/lib/terminal-registry.sh" ] && . "$SCRIPT_DIR/lib/terminal-registry.sh"
+  _agmsg_tr_rc=$?
+  [ "$_agmsg_tr_e" = 1 ] && set -e
+  if [ "$_agmsg_tr_rc" -eq 0 ] && declare -F agmsg_terminal_name_self_safe >/dev/null 2>&1; then
+    _agmsg_session_id=""
+    _agmsg_session_env="$(agmsg_type_get "$AGENT_TYPE" session_env)"
+    if [ -n "$_agmsg_session_env" ]; then
+      case "$_agmsg_session_env" in
+        [A-Za-z_]*)
+          case "$_agmsg_session_env" in
+            *[!A-Za-z0-9_]*)
+              printf "agmsg: type '%s' has invalid session_env=%s; session id ignored\n" \
+                "$AGENT_TYPE" "$_agmsg_session_env" >&2 ;;
+            *) _agmsg_session_id="${!_agmsg_session_env:-}" ;;
+          esac ;;
+        *) printf "agmsg: type '%s' has invalid session_env=%s; session id ignored\n" \
+             "$AGENT_TYPE" "$_agmsg_session_env" >&2 ;;
+      esac
+    fi
+    agmsg_terminal_name_self_safe "$_agmsg_session_id" "$TEAM" "$AGENT_ID" "$PROJECT_PATH" "$AGENT_TYPE" || true
+  fi
+fi
 
 echo "Joined team $TEAM as $AGENT_ID"

@@ -73,6 +73,7 @@ export default {
       "grok-build": "xAI 的建置／編碼代理。",
       hermes: "輕量級中繼代理。",
       antigravity: "代理式編碼環境。",
+      devin: "自主AI軟體工程師CLI。",
     },
   },
   showcase: {
@@ -86,6 +87,10 @@ export default {
         "將代理間的訊息日誌重現為舞台上角色的對話——每個代理化身為輪流發言的角色。",
       "agmsg-viewer":
         "在瀏覽器中以 LINE 風格的聊天介面檢視 agmsg 訊息紀錄。",
+      "agmsg-bubblelog":
+        "在本機將團隊的訊息紀錄回放成通訊軟體風格的對話串——每個代理各有頭像，並附回放控制。",
+      "agmsg-tui":
+        "以 ratatui 打造的終端機用戶端——可透過 SSH、mosh 或在 tmux 中跨代理讀取與傳送訊息。",
     },
   },
   desktop: {

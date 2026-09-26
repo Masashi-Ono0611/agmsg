@@ -73,6 +73,7 @@ export default {
       "grok-build": "L'agent de build/codage de xAI.",
       hermes: "Agent relais léger.",
       antigravity: "Environnement de codage agentique.",
+      devin: "CLI d'ingénieur logiciel IA autonome.",
     },
   },
   showcase: {
@@ -86,6 +87,10 @@ export default {
         "Rejoue les journaux de messages entre agents comme des personnages qui parlent sur une scène — chaque agent devient un personnage qui prend la parole à son tour.",
       "agmsg-viewer":
         "Consulte l'historique des messages agmsg dans une interface de chat façon LINE, dans le navigateur.",
+      "agmsg-bubblelog":
+        "Rejoue localement le journal de messages d'une équipe sous forme de fil façon messagerie — avatars par agent et contrôles de lecture.",
+      "agmsg-tui":
+        "Client terminal construit avec ratatui — lire et envoyer des messages entre agents via SSH, mosh ou dans tmux.",
     },
   },
   desktop: {
