@@ -210,7 +210,7 @@ codex:
   --dangerously-skip-permissions: false  # `false`の値はフラグ自体を出力しない
 ```
 
-9種類のエージェントタイプのうち8つがspawn可能 — `claude-code`、`codex`、`grok-build`、`cursor`、`gemini`、`antigravity`、`copilot`、`opencode`。`hermes` は不可 — そのCLIには初期プロンプトを事前に仕込んだインタラクティブセッションを開始するモードがない（#279）。macOSが主なターゲットで、LinuxとWindowsはベストエフォート（ターミナルが未対応の場合はissueまたはPRを歓迎）。ヘッドレス環境 — tmuxもなく使えるターミナルもない — はエージェントCLIがインタラクティブなターミナルを必要とするためエラーになる。
+10種類のエージェントタイプのうち8つがspawn可能 — `claude-code`、`codex`、`grok-build`、`cursor`、`gemini`、`antigravity`、`copilot`、`opencode`。`hermes` は、初期プロンプトを事前に仕込んだインタラクティブセッションを開始する既知のCLIモードがないためspawn不可（#279）。`devin` は、同等のインタラクティブ起動方法がまだ検証されていないため、現時点ではspawnableとして扱っていない。macOSが主なターゲットで、LinuxとWindowsはベストエフォート（ターミナルが未対応の場合はissueまたはPRを歓迎）。ヘッドレス環境 — tmuxもなく使えるターミナルもない — はエージェントCLIがインタラクティブなターミナルを必要とするためエラーになる。
 
 ### spawnしたエージェントを終了する（`despawn`）
 
@@ -397,13 +397,18 @@ DBとチーム設定は保持される。更新されるのはスクリプトと
 
 ## アンインストール
 
+`uninstall.sh`のコピーは各installの中にも入っているので、`git clone`・`npx agmsg`・curlのワンライナー、どの方法でinstallしても以下の形で使える:
+
 ```bash
-./uninstall.sh              # インタラクティブ（各ステップを確認）
-./uninstall.sh --yes        # すべて削除
-./uninstall.sh --keep-data  # スキルは削除するがDBとチームは残す
+~/.agents/skills/agmsg/uninstall.sh              # そのinstallだけ（各ステップを確認）
+~/.agents/skills/agmsg/uninstall.sh --yes        # そのinstallだけ、確認なし
+~/.agents/skills/agmsg/uninstall.sh --keep-data  # スキルは削除するがDBとチームは残す
+~/.agents/skills/agmsg/uninstall.sh --all        # このマシン上のagmsgのinstallを全部
 ```
 
-インストール済みのスキルディレクトリを自動検出し、スキルファイル、スラッシュコマンド、フック、AGENTS.mdのセクション、チーム設定をクリーンアップする。
+`--all`が無ければ、実行した1つのinstallだけを削除する。クリーンアップされるのは: スキルファイル、スラッシュコマンド、フック、AGENTS.mdのセクション、チーム設定。
+
+`git clone`したチェックアウトが手元にあれば、リポジトリルートの`./uninstall.sh`も、このマシンにinstallが1つだけなら同じように動く。2つ以上ある場合は、どれを指しているか推測せずに断る。削除したいinstallの中にある`uninstall.sh`を実行するか、`--all`を渡してマシン上の全installを削除する(`--yes`を付けない限り、まとめて1回だけ確認し、加えて各installのDBとチームも消すかを別途1回確認する)。
 
 ## 設定
 

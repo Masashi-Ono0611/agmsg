@@ -33,6 +33,14 @@
 [ -n "${_AGMSG_INSTANCE_ID_SH:-}" ] && return 0
 _AGMSG_INSTANCE_ID_SH=1
 
+# For _agmsg_detect_platform / _agmsg_platform, used below by
+# _agmsg_pid_alive_local's MSYS branch. compat.sh has no include guard of its
+# own (several other libs already source it unconditionally the same way;
+# re-sourcing only resets the cheap, deterministic platform detection, not
+# any state that matters).
+# shellcheck disable=SC1091
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/compat.sh"
+
 # Cross-platform pid liveness check, and the ONLY one any shipped script should
 # use. A bare `kill -0 "$pid" 2>/dev/null` is not a liveness check: it answers
 # "can I signal this", and the two differ exactly where it matters.
@@ -110,7 +118,7 @@ _agmsg_pid_valid() {
 # The EPERM reading and the ps cross-check are the same as _agmsg_pid_alive's --
 # a pid we minted is still a pid a sandbox may refuse to let us signal (#505).
 _agmsg_pid_alive_local() {
-  local pid="$1" err stat
+  local pid="$1" err stat probe rc canary tstat _p _s _rest
   # The POSIX ceiling, explicitly, whatever the host. _agmsg_pid_valid widens to
   # the DWORD range when MSYSTEM is set, which is right for a number tasklist
   # will be asked about and wrong for one kill(1) will parse: past INT32_MAX kill
@@ -131,11 +139,151 @@ _agmsg_pid_alive_local() {
   esac
   # kill(2) says gone. ps does not depend on signalling permission at all, so
   # requiring it to agree is what keeps a sandbox from turning "cannot signal"
-  # into "not running".
-  stat="$(ps -o stat= -p "$pid" 2>/dev/null | tr -d ' ')"
-  [ -n "$stat" ] || return 1
-  case "$stat" in Z*) return 1 ;; esac   # exited, just not reaped yet
+  # into "not running" (#505). But an EMPTY ps result is NOT proof of death: a
+  # transient ps failure and a truly-absent pid both produce nothing, and reading
+  # that as "gone" is #954 -- callers delete files, release locks, and respawn on
+  # it. Distinguish "proof of absence" from "absence of proof". Which technique
+  # does that split by platform (#970 Windows follow-up): MSYS ps has no -o, so
+  # the whole-table-snapshot-plus-canary approach below cannot run there at all;
+  # _agmsg_detect_platform reads real uname(1) output, not the spoofable
+  # MSYSTEM env var, so this only takes the MSYS branch on an actual MSYS host.
+  _agmsg_detect_platform
+  # shellcheck disable=SC2154  # set by compat.sh's _agmsg_detect_platform, sourced above
+  case "$_agmsg_platform" in
+    msys)
+      # _agmsg_pid_gone_msys's own convention (0 = yes, gone) is the
+      # inverse of this function's (0 = alive) -- branch explicitly rather
+      # than propagating $? and hoping the two conventions happen to
+      # cancel out.
+      if _agmsg_pid_gone_msys "$pid"; then return 1; else return 0; fi
+      ;;
+  esac
+  # Co-observe a known-live pid -- our own $$ -- in the SAME observation. Take
+  # a FULL snapshot (no -p filter, so the target pid is never handed to ps and
+  # cannot poison the query, e.g. macOS "process id too large"), parsed with
+  # builtins so only ps is external and a stripped PATH cannot itself become
+  # the failed observation:
+  #   - $$ absent from the snapshot => ps produced nothing usable => UNKNOWN =>
+  #     assume alive, exactly as the EPERM branch above. A failed observation is
+  #     not proof of absence.
+  #   - $$ present, target absent  => ps listed us and did not list the target =>
+  #     positive proof the target is gone => dead.
+  #   - target present, zombie     => gone too.
+  # `|| rc=$?` keeps the assignment out of set -e's reach: a command-substitution
+  # assignment returns the substituted command's exit status as its OWN, so under
+  # errexit in a caller that did NOT invoke us as a condition, a non-zero ps would
+  # terminate the shell right here -- leaking a failed observation to caller death
+  # instead of the UNKNOWN => alive verdict below. The leaf helper's contract must
+  # not depend on how the caller spelled the call.
+  rc=0
+  probe="$(ps -Ao pid=,stat= 2>/dev/null)" || rc=$?
+  canary=0; tstat=""
+  # IFS=$' \t' on the read, not inherited from the caller: this function is
+  # called from inside `IFS=$'\t' read ... < <(...)` (cmd_sync_start's own
+  # engine-status read), and that IFS leaks into the process substitution's
+  # subshell -- everything run inside it, this loop included, otherwise reads
+  # under a tab-only IFS. A tab-only IFS cannot split ps's space-separated
+  # `pid= stat=` columns, so every line (including our own canary line) fails
+  # to parse, canary stays 0 even in a complete listing, and the UNKNOWN path
+  # below reads that as alive -- a genuinely dead engine then reports as
+  # running (#970). The read that decides liveness must not depend on
+  # whatever IFS happened to be in scope when it was called.
+  while IFS=$' \t' read -r _p _s _rest; do
+    if [ "$_p" = "$$" ]; then canary=1; fi
+    if [ "$_p" = "$pid" ]; then tstat="${_s:-?}"; fi
+  done <<PROBE
+$probe
+PROBE
+  if [ -n "$tstat" ]; then
+    case "$tstat" in Z*) return 1 ;; esac  # zombie: exited, not yet reaped
+    return 0                                # target present -> alive (seeing it is proof enough)
+  fi
+  # Target not listed. Trust "absent" ONLY when ps COMPLETED the snapshot (exit 0)
+  # AND that snapshot included our own $$. A non-zero exit means the listing was
+  # truncated -- ps can print part of it (even our own line) and then fail -- and a
+  # pid that would have come later proves nothing; canary presence shows only that
+  # WE were listed, never that the listing FINISHED. Anything short of a complete,
+  # self-including snapshot is UNKNOWN -> assume alive (#954), which also fails safe
+  # where "ps -Ao" is unsupported (it exits non-zero rather than lying "gone").
+  if [ "$rc" -eq 0 ] && [ "$canary" = 1 ]; then return 1; fi
   return 0
+}
+
+# MSYS counterpart of the POSIX whole-table-snapshot-plus-canary technique
+# above, for _agmsg_pid_alive_local only. `ps -Ao pid=,stat=` is not available
+# under MSYS2's ps (no -o support, scripts/lib/compat.sh's own header
+# comment).
+#
+# #970's first attempt at this queried `ps -l -p PID` (pid-filtered) instead
+# -- the same primitive compat_get_ppid/_compat_get_winpid already use for a
+# LIVE pid, but never measured against a DEAD one before this. Measured live
+# on real Windows Git Bash (2026-09-23): a dead pid makes `ps -l -p` exit 1,
+# header line and all -- so requiring rc=0 before trusting absence (#954's
+# own rule, correctly applied) made the dead case UNREACHABLE, permanently.
+# The Windows CI hang this was meant to close never actually closed, because
+# the query could never satisfy its own proof condition.
+#
+# The fix is the query, not the rule. `ps -l` with NO -p filter behaves like
+# the POSIX `ps -Ao` snapshot: it exits 0 and lists every process, including
+# our own -- so the SAME canary technique applies. Measured header (real
+# Windows Git Bash, 2026-09-23): `PID PPID PGID WINPID TTY UID STIME
+# COMMAND` -- PID is the list's own first column ordinarily; WINPID is a
+# different number (the native Windows pid) and must never be read here. No
+# process-state column exists in this shape, so unlike the POSIX branch
+# above, a zombie cannot be told apart from a live process here -- out of
+# scope for what #970 needs (a genuinely-exited pid, which the CI hang could
+# never detect at all).
+#
+# review: Cygwin/MSYS `ps -l` documents an optional single-character state
+# flag (S/I/O) that some rows -- not all, and not reflected in the header at
+# all -- get PREPENDED as an extra leading field, pushing PID to the second
+# column on exactly those rows. Reading column 1 unconditionally means a
+# flagged row's real PID is never matched: an unflagged self row still
+# proves the canary, so a flagged but genuinely LIVE target row reads as
+# "absent" -- a live process misread as dead, #954's own failure shape.
+# Fixed-width reading was considered and rejected: the flag is not a
+# declared column at all, so there is no header position to key a fixed
+# width on; detecting the flag value itself is the only thing that is
+# actually documented.
+#
+#   - ps fails (rc != 0)                => UNKNOWN => caller reads as alive.
+#   - rc = 0, but no row's PID field is our own $$ => the listing cannot be
+#     trusted as complete (same canary logic as the POSIX branch) =>
+#     UNKNOWN => alive.
+#   - rc = 0, our own row present, target's row absent => positive proof of
+#     death.
+#   - rc = 0, our own row present, target's row also present => alive.
+# A normal shell predicate: returns 0 (success) when the pid is proven gone,
+# 1 otherwise (alive or unknown) -- `if _agmsg_pid_gone_msys ...; then` reads
+# naturally. This is the OPPOSITE sense of _agmsg_pid_alive_local's own
+# 0-means-alive convention, which is why the caller above branches on it
+# explicitly instead of returning it straight through.
+_agmsg_pid_gone_msys() {
+  local pid="$1" out rc=0 verdict
+  # `|| rc=$?` keeps the assignment out of set -e's reach, same reason the
+  # POSIX snapshot above does this.
+  out="$(ps -l 2>/dev/null)" || rc=$?
+  [ "$rc" -eq 0 ] || return 1
+  # awk's own field splitting, not the caller's IFS -- #970's original bug
+  # was exactly a parse that silently inherited an ambient IFS it was never
+  # written to expect; this reads each non-header row itself, with nothing
+  # shell-side to leak into.
+  verdict="$(printf '%s\n' "$out" | awk -v self="$$" -v want="$pid" '
+    NR == 1 { next }
+    {
+      # A row whose first field is exactly one documented flag letter has
+      # PID pushed to the next field -- a real pid is always numeric, so
+      # this never misreads an actual pid value as the flag.
+      p = ($1 ~ /^[SIO]$/) ? $2 : $1
+      if (p == self) canary = 1
+      if (p == want) found = 1
+    }
+    END {
+      if (!canary) { print "unknown"; exit }
+      print (found ? "alive" : "gone")
+    }
+  ')"
+  [ "$verdict" = gone ]
 }
 
 # Liveness for a pid that came from OUTSIDE these shells -- reached by walking
@@ -407,7 +555,51 @@ EOF
 #                            "<sid>.<numeric>" counts — a pre-upgrade lock holds
 #                            a bare sid while cc-instance may already store the
 #                            composite, and we must not stale it out instantly.
+# Read one cc-instance marker. Prints "<read>\t<content>".
+#
+#   ok\t<content>   the file was read; an EMPTY content is a fact about the file
+#   absent\t        there is no such file, and its directory is searchable
+#   unreadable\t    it is there and unreadable, or its directory cannot be
+#                   searched, so absence is not something we can conclude
+#
+# The two branches of agmsg_instance_alive below both read this file, and they
+# kept disagreeing about it -- in BOTH directions, one round apart: the composite
+# branch answered ALIVE where bare answered 2 (an inaccessible run/), and then
+# bare answered 2 where composite answered DEAD (an empty marker). Each fix moved
+# the disagreement rather than removing it. So the read is here, once, and each
+# branch only decides what its own answer means. Same shape, and the same reason,
+# as _actas_lock_read_path. (Review, axis 5.)
+_agmsg_marker_read() {   # <path>
+  local f="$1" content _dir
+  if content="$(cat "$f" 2>/dev/null)"; then
+    printf 'ok\t%s\n' "$content"
+    return 0
+  fi
+  _dir="${f%/*}"
+  if [ -e "$_dir" ] && { [ ! -r "$_dir" ] || [ ! -x "$_dir" ]; }; then
+    printf 'unreadable\t\n'
+    return 0
+  fi
+  if [ -e "$f" ]; then
+    printf 'unreadable\t\n'
+    return 0
+  fi
+  printf 'absent\t\n'
+}
+
 agmsg_instance_alive() {
+  # 0 alive | 1 dead | 2 CANNOT TELL.
+  #
+  # The third value is the point. This was a boolean, and every "could not find
+  # out" arrived as `dead` — which is the destructive direction for every caller:
+  # a dead owner gets its lock reclaimed and deleted, and the watcher's own
+  # self-check exits the process. An unreadable `run/` therefore did not degrade,
+  # it swept: locks removed, watchers gone, on nothing more than a read failure.
+  # (#983; the lock side of the same collapse is actas_lock_state.)
+  #
+  # The pid layer below is already conservative in the right direction —
+  # _agmsg_pid_alive_local treats EPERM and any unrecognised kill(2) error as
+  # ALIVE — so only this layer needed the extra value.
   local token="$1"
   [ -n "$token" ] || return 1
   if agmsg_instance_is_composite "$token"; then
@@ -415,25 +607,71 @@ agmsg_instance_alive() {
     _agmsg_pid_alive "$pid" || return 1
     local f s
     f="$SKILL_DIR/run/cc-instance.$pid"
-    [ -f "$f" ] || return 0
-    s="$(cat "$f" 2>/dev/null || true)"
+    local _m
+    _m="$(_agmsg_marker_read "$f")"
+    case "${_m%%$'\t'*}" in
+      # Absent is alive-by-default and that is deliberate: the pid IS alive and
+      # nothing contradicts it. Inaccessible is not absent -- `[ -e ]` is false
+      # for both, and this arm used to answer ALIVE for the second one, which
+      # blocks a legitimate reclaim forever (review).
+      absent)     return 0 ;;
+      unreadable) return 2 ;;
+    esac
+    s="${_m#*$'\t'}"
+    # An EMPTY marker is not a mismatch. It is a write that started and did not
+    # finish, and composite is the ORDINARY owner token, so reading it as "this
+    # live pid is not you" makes a live seat's lock reclaimable. Not `return 0`
+    # by analogy with absent above: absent means the marker was never written,
+    # and the pid is then the evidence; a half-written file says a writer WAS
+    # here and we do not know what it meant to say. (Review.)
+    [ -n "$s" ] || return 2
     [ "$s" = "$token" ] && return 0
     return 1
   fi
-  local run f p s
+  local run f p s undecided=0
   run="$SKILL_DIR/run"
-  [ -d "$run" ] || return 1
+  # Absent and unreadable are different facts: nothing ever registered (dead) vs
+  # we cannot look (cannot tell).
+  [ -e "$run" ] || return 1
+  # -r and -x are DIFFERENT permissions and this branch needs both. -r lets the
+  # glob enumerate the directory; -x is what lets `[ -f ]` and `cat` reach the
+  # entries it enumerated. At mode 0400 the glob happily produces every
+  # cc-instance.* path and then every `[ -f "$f" ]` is false, so the loop skipped
+  # all of them and fell through to `return 1` -- a confident DEAD, produced by a
+  # scan that read nothing. The composite branch above already asked for both,
+  # which is the giveaway: one function, two paths, two answers. (Review.)
+  #
+  # Measured after the shared reader landed, so the next reader is not misled
+  # about which line is load-bearing: this guard is now REDUNDANT. Deleting the
+  # -x from it produces no reds, because _agmsg_marker_read answers `unreadable`
+  # for every entry in an unsearchable directory and the loop then reports 2 on
+  # its own. It stays as the cheap early answer -- and because "we cannot search
+  # this directory" is the fact the branch rests on, which is not something to
+  # infer from what the per-entry reads happened to return.
+  { [ -d "$run" ] && [ -r "$run" ] && [ -x "$run" ]; } || return 2
+  local _m
   for f in "$run"/cc-instance.*; do
-    [ -f "$f" ] || continue
     p=${f##*.}
     case "$p" in ''|*[!0-9]*) continue ;; esac
     _agmsg_pid_alive "$p" || continue
-    s="$(cat "$f" 2>/dev/null || true)"
+    # Same reader as the composite branch. One unreadable or half-written entry
+    # does not settle the question either way -- the token may be exactly the one
+    # we could not read -- so keep scanning (a positive match anywhere still
+    # answers alive) and report "cannot tell" only if we finish without one. An
+    # EMPTY marker counts as unread here for the same reason it does above.
+    _m="$(_agmsg_marker_read "$f")"
+    case "${_m%%$'\t'*}" in
+      absent)     continue ;;
+      unreadable) undecided=1; continue ;;
+    esac
+    s="${_m#*$'\t'}"
+    if [ -z "$s" ]; then undecided=1; continue; fi
     [ "$s" = "$token" ] && return 0
     # upgrade compat: cc-instance stores "<sid>.<pid>" but the lock holds "<sid>"
     if agmsg_instance_is_composite "$s" && [ "${s%.*}" = "$token" ]; then
       return 0
     fi
   done
+  [ "$undecided" -eq 1 ] && return 2
   return 1
 }

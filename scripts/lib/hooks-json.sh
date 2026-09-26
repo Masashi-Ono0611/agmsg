@@ -10,7 +10,7 @@
 # #162 byte-count validation, #134 JSON escaping) — can be read and tested on
 # its own.
 #
-# Sourced by delivery.sh AFTER it defines SKILL_NAME (used to detect
+# Sourced by delivery.sh AFTER it defines SKILL_DIR (used to detect
 # agmsg-owned entries); the existing lib convention is for sourced modules to
 # reference caller-set globals rather than re-resolve them.
 
@@ -40,6 +40,16 @@ strip_agmsg_event_file() {
   local tmp tmp_sql
   tmp=$(mktemp "${TMPDIR:-/tmp}/agmsg.XXXXXX")
   tmp_sql=$(agmsg_sql_readfile_path "$tmp")
+  # Ownership is decided against the absolute install directory, not the bare
+  # skill name (#1038): a project's OWN hook whose command happens to contain
+  # the substring "agmsg" -- a natural name for a hook that cooperates with
+  # this tool -- used to match `instr(command, '$SKILL_NAME')` and get
+  # silently stripped alongside agmsg's real entries. $SKILL_DIR is this
+  # install's own absolute path; every command agmsg ever writes invokes a
+  # script under it, and nothing legitimately outside agmsg's install would
+  # ever contain that exact path as a substring.
+  local skill_dir_sql
+  skill_dir_sql=$(printf '%s' "$SKILL_DIR" | sed "s/'/''/g")
   # Write the result with writefile() rather than redirecting sqlite3's CLI
   # output. On strict sqlite3 builds (>= 3.50, shipped on Windows) the CLI
   # renders control bytes — e.g. a CR that rode in on a CRLF settings file —
@@ -62,7 +72,7 @@ strip_agmsg_event_file() {
       WHEN (SELECT count(*) FROM json_each(json_extract(src.j, '\$.hooks.$event')) AS s
             WHERE NOT EXISTS (
               SELECT 1 FROM json_each(json_extract(s.value, '\$.hooks')) AS h
-              WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
+              WHERE instr(json_extract(h.value, '\$.command'), '$skill_dir_sql') > 0
             )) = 0 THEN
         json_remove(src.j, '\$.hooks.$event')
       ELSE
@@ -71,7 +81,7 @@ strip_agmsg_event_file() {
            FROM json_each(json_extract(src.j, '\$.hooks.$event')) AS s
            WHERE NOT EXISTS (
              SELECT 1 FROM json_each(json_extract(s.value, '\$.hooks')) AS h
-             WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
+             WHERE instr(json_extract(h.value, '\$.command'), '$skill_dir_sql') > 0
            ))
         )
     END, '') AS blob FROM src)
@@ -85,11 +95,41 @@ strip_agmsg_event_file() {
 # Bash. On native Windows, Codex runs each hook command via PowerShell, which
 # cannot execute a bare POSIX ".sh" path, so the hook exits non-zero. Codex hook
 # config supports a "commandWindows" key that takes precedence on Windows.
+#
+# The shell stays a LOGIN shell, and the payload no longer travels on its stdout
+# (#1015). `-l` reads the profile chain, and everything the profile prints goes
+# to that same stdout, ahead of the JSON -- codex parses the whole stream as one
+# document, so one line of profile chatter makes the payload unparseable, and by
+# then the hook has already consumed the rows. Measured on macOS and Linux as
+# well as reported on Windows: the mechanism is bash's, not Windows's.
+#
+# Dropping `-l` would close it and was the first plan. Measured instead: with a
+# profile that exports a PATH the command needs, the non-login shell cannot find
+# the tool and the hook exits without emitting anything. That trades a silent
+# loss for a total one, and only under a premise nobody has measured -- whether a
+# given Git Bash profile provides something the hook relies on. Keeping `-l`
+# needs no such premise.
+#
+# So: bash writes the command's own stdout to a file, PowerShell -- which read no
+# profile -- prints the file, and the login shell's stdout is discarded. The
+# braces are there so the redirect covers the whole command however it is
+# composed, not just its last element. The exit status is carried across
+# explicitly; without it the hook would report on `Remove-Item`.
+#
+# No `\"` anywhere in what is emitted: PowerShell reads a backslash-escaped
+# quote as a literal backslash and ends the string there (see the codex
+# template's warning).
 windows_wrap() {
   local posix_cmd="$1"
   local bash_cmd_ps
-  bash_cmd_ps=$(printf '%s' "$posix_cmd" | sed "s/'/''/g")
-  printf "\$b=\$env:GIT_BASH; if (-not \$b) { \$b=\$env:AGMSG_BASH }; if (-not \$b) { \$b='C:\\\\Program Files\\\\Git\\\\bin\\\\bash.exe' }; & \$b -lc '%s'" "$bash_cmd_ps"
+  bash_cmd_ps=$(printf '%s' "{ $posix_cmd ; } > \"\$AGMSG_HOOK_OUT\"" | sed "s/'/''/g")
+  # `printf '%s'`, never a format string. This text carries backslashes into
+  # PowerShell, and a format string puts a second round of escape processing
+  # between what is written here and what is emitted -- measured: three attempts
+  # at `Replace('\','/')` through a format emitted `\\`, `\` and then nothing,
+  # and only the last one was visible as wrong. One layer, and the layer is
+  # bash's own double-quote rules.
+  printf '%s' "\$b=\$env:GIT_BASH; if (-not \$b) { \$b=\$env:AGMSG_BASH }; if (-not \$b) { \$b='C:\\Program Files\\Git\\bin\\bash.exe' }; \$o=[IO.Path]::GetTempFileName(); \$s=[IO.Path]::GetTempFileName(); [IO.File]::WriteAllText(\$s,'$bash_cmd_ps',(New-Object System.Text.UTF8Encoding \$false)); \$env:AGMSG_HOOK_OUT=\$o; & \$b -l (\$s.Replace('\\','/')) | Out-Null; \$rc=\$LASTEXITCODE; Get-Content -Raw -LiteralPath \$o; Remove-Item -Force -LiteralPath \$o,\$s -ErrorAction SilentlyContinue; exit \$rc"
 }
 
 # Append a single entry of the form {"matcher":"","hooks":[{"type":"command","command":"<cmd>"}]}
@@ -155,6 +195,122 @@ add_event_entry_file() {
   ") || { rm -f "$tmp"; return 1; }
   [ "$wrote" = "1" ] || { rm -f "$tmp"; return 1; }
   mv "$tmp" "$path"
+}
+
+# Detect the indent unit an existing pretty-printed JSON file uses, taken
+# from its own SECOND line: the first line of anything this codebase or a
+# human writes by hand is the opening brace alone, so the second line's
+# leading whitespace run (if any) IS the indent unit, verbatim -- a file
+# indented with tabs is matched with tabs, not assumed to be spaces. Prints
+# nothing and returns 1 when <path> does not exist, has fewer than two
+# lines, or its second line has no leading whitespace (already
+# minified/compact) -- callers treat "no indent detected" as "leave the
+# content exactly as this function's caller already built it" (#1429).
+_agmsg_json_detect_indent() {
+  local path="$1" line2
+  [ -f "$path" ] || return 1
+  line2=$(sed -n '2p' "$path" 2>/dev/null)
+  [ -n "$line2" ] || return 1
+  case "$line2" in
+    [\ $'\t']*) ;;
+    *) return 1 ;;
+  esac
+  printf '%s' "${line2%%[!\ $'\t']*}"
+}
+
+# Do <a> and <b> hold the same JSON content, ignoring formatting (whitespace,
+# indentation) AND object key order, while still treating array element
+# order as significant? Compares each file as a canonical, order-independent
+# signature: every (fullkey, type, atom) row from sqlite's json_tree(),
+# SORTED BY fullkey, concatenated into one string.
+#
+# Sorting by fullkey -- not json_tree's own traversal order -- is what makes
+# this key-order independent: fullkey spells out an OBJECT member as
+# ...".matcher" / ...".hooks" by NAME, so two objects with the same members
+# in a different source order (e.g. one hand-edited through `jq -S`, which
+# sorts keys) produce the exact same set of (fullkey, type, atom) rows and
+# therefore the same sorted signature. This was review-round-1's actual bug:
+# comparing via plain json() instead (a canonical *compact* rendering, but
+# NOT canonical on key order -- json('{"a":1,"b":2}') != json('{"b":2,"a":1}')
+# in sqlite) called a same-content, key-reordered hooks_file "different" and
+# triggered exactly the spurious rewrite (or read-only refusal) this
+# comparison exists to prevent (#1429 review round 2). An ARRAY member's
+# fullkey embeds its numeric index (e.g. "$.hooks[0]"), so array order still
+# participates in the sort and is not collapsed away.
+#
+# json_tree, like json() above, is core json1 (SQLite 3.9.0) -- no
+# availability probe needed, unlike _agmsg_json_pretty_supported below.
+#
+# Any sqlite error (e.g. either file holds invalid JSON) is treated as "not
+# equal" -- falls through to the normal write path, the same behavior this
+# codebase had before this comparison existed.
+_agmsg_json_content_equal() {
+  local a="$1" b="$2"
+  local a_sql b_sql result
+  a_sql=$(agmsg_sql_readfile_path "$a")
+  b_sql=$(agmsg_sql_readfile_path "$b")
+  result=$(agmsg_sqlite_mem "
+    WITH a_rows AS (
+      SELECT fullkey, type, atom FROM json_tree(readfile('$a_sql')) ORDER BY fullkey
+    ),
+    b_rows AS (
+      SELECT fullkey, type, atom FROM json_tree(readfile('$b_sql')) ORDER BY fullkey
+    ),
+    a_sig AS (
+      SELECT group_concat(fullkey || char(31) || type || char(31) || quote(atom), char(30)) AS sig
+      FROM a_rows
+    ),
+    b_sig AS (
+      SELECT group_concat(fullkey || char(31) || type || char(31) || quote(atom), char(30)) AS sig
+      FROM b_rows
+    )
+    SELECT CASE WHEN a_sig.sig IS b_sig.sig THEN 1 ELSE 0 END FROM a_sig, b_sig;
+  ") || return 1
+  [ "$result" = "1" ]
+}
+
+# 0 iff this sqlite3 build's json1 extension has json_pretty (added in
+# SQLite 3.46.0; this project's own floor is unversioned -- see README,
+# "requires sqlite3" with no minimum stated). Probed once per process and
+# cached: calling the function and checking whether it errors answers
+# exactly the question that matters here, without parsing a version string
+# that describes the CLI, not necessarily the linked json1 build.
+_agmsg_json_pretty_supported() {
+  if [ -z "${_AGMSG_JSON_PRETTY_SUPPORTED:-}" ]; then
+    if agmsg_sqlite_mem "SELECT json_pretty('{}');" >/dev/null 2>&1; then
+      _AGMSG_JSON_PRETTY_SUPPORTED=yes
+    else
+      _AGMSG_JSON_PRETTY_SUPPORTED=no
+    fi
+  fi
+  [ "$_AGMSG_JSON_PRETTY_SUPPORTED" = yes ]
+}
+
+# Rewrite <tmp> IN PLACE (same path) to json_pretty-format its content with
+# <indent> as the indent unit. A no-op, successfully, when json_pretty is
+# not supported (_agmsg_json_pretty_supported) -- a caller that always
+# calls this and then compares bytes against the original gets today's
+# plain/compact behavior on a build without json_pretty, not an error, and
+# not a behavior this project's stated floor ("requires sqlite3", no
+# version pinned) does not actually guarantee.
+_agmsg_json_reindent() {
+  local tmp="$1" indent="$2"
+  _agmsg_json_pretty_supported || return 0
+  local tmp2 tmp2_sql tmp_sql wrote indent_sql
+  tmp_sql=$(agmsg_sql_readfile_path "$tmp")
+  tmp2=$(mktemp "${TMPDIR:-/tmp}/agmsg.XXXXXX")
+  tmp2_sql=$(agmsg_sql_readfile_path "$tmp2")
+  indent_sql=$(printf '%s' "$indent" | sed "s/'/''/g")
+  wrote=$(agmsg_sqlite_mem "
+    WITH src AS (SELECT json_pretty(readfile('$tmp_sql'), '$indent_sql') AS blob)
+    SELECT writefile('$tmp2_sql', blob) = length(CAST(blob AS BLOB)) FROM src;
+  ") || wrote=""
+  if [ "$wrote" = "1" ]; then
+    mv "$tmp2" "$tmp"
+  else
+    rm -f "$tmp2"
+  fi
+  return 0
 }
 
 # Drop the entire .hooks object if it ended up empty after stripping. Reads

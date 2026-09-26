@@ -61,6 +61,54 @@ teardown() {
   [ "$n" -eq 1 ]
 }
 
+# --- send.sh: --body-file / flag-shaped body (#1101) ---
+
+@test "send: --body-file delivers a body that begins with a hyphen, intact (#1101)" {
+  # The exact trap #1101 filed: a caller reaches for poke's flag on send, and the
+  # body here IS a flag string. It must arrive as content, not be consumed. Through
+  # the supported route (--body-file) the recipient receives it whole.
+  printf -- '--body-file is the literal message here' > "$TEST_SKILL_DIR/body.txt"
+  run bash "$SCRIPTS/send.sh" testteam alice bob --body-file "$TEST_SKILL_DIR/body.txt"
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/inbox.sh" testteam bob
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"--body-file is the literal message here"* ]]
+}
+
+@test "send: a bare --body-file with no path is refused, not sent (#1101)" {
+  run bash "$SCRIPTS/send.sh" testteam alice bob --body-file
+  [ "$status" -ne 0 ]
+  grep -qF -- "takes exactly one path" <<<"$output"
+  # Nothing was delivered: the refusal happens at parse, before any write.
+  run bash "$SCRIPTS/inbox.sh" testteam bob
+  [[ "$output" == *"No new messages"* ]]
+}
+
+@test "send: a flag-shaped message is refused rather than sent as content (#1101)" {
+  # Before the fix, send took a leading-flag string as the body and exited zero, so a
+  # mistyped flag landed silently as a one-word message. It must be refused, and the
+  # recipient must receive nothing (not the string "--nope").
+  run bash "$SCRIPTS/send.sh" testteam alice bob --nope
+  [ "$status" -ne 0 ]
+  grep -qF -- "unrecognized option" <<<"$output"
+  run bash "$SCRIPTS/inbox.sh" testteam bob
+  [[ "$output" == *"No new messages"* ]]
+}
+
+@test "send: --body-file rides alongside a trailing --force (#1101)" {
+  printf 'delivered from a file' > "$TEST_SKILL_DIR/b2.txt"
+  run bash "$SCRIPTS/send.sh" brandnewteam ghost nobody --body-file "$TEST_SKILL_DIR/b2.txt" --force
+  [ "$status" -eq 0 ]
+  [[ "$output" =~ "Sent to nobody" ]]
+}
+
+@test "send: --body - reads the message from stdin (#1101)" {
+  run bash -c "printf 'from stdin, intact' | bash '$SCRIPTS/send.sh' testteam alice bob --body -"
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/inbox.sh" testteam bob
+  [[ "$output" == *"from stdin, intact"* ]]
+}
+
 # --- send.sh: team-name validation (#414) ---
 
 @test "send: rejects a team name with path traversal (../) and never consults a config outside teams/" {
@@ -373,6 +421,41 @@ line"
   [ "$status" -eq 0 ]
   [[ "$output" =~ "msg1" ]]
   [[ "$output" =~ "msg2" ]]
+}
+
+@test "history: uses batch mode for redirected sqlite input on Windows" {
+  bash "$SCRIPTS/send.sh" testteam alice bob "batch-required"
+
+  # Reproduce the Windows sqlite3.exe behavior: redirected stdin without
+  # -batch exits successfully without evaluating the SQL. Other invocations
+  # are delegated to the real sqlite3 binary.
+  local real_stub="$BATS_TEST_TMPDIR/sqlite3"
+  local real_sqlite; real_sqlite="$(command -v sqlite3)"
+  cat >"$real_stub" <<EOF
+#!/usr/bin/env bash
+has_batch=0
+has_sql_arg=0
+for arg in "\$@"; do
+  [ "\$arg" = -batch ] && has_batch=1
+  case "\$arg" in *SELECT*|*PRAGMA*|*INSERT*|*CREATE*) has_sql_arg=1 ;; esac
+done
+if [ "\$has_batch" -eq 0 ] && [ "\$has_sql_arg" -eq 0 ] && [ ! -t 0 ]; then
+  exit 0
+fi
+exec "$real_sqlite" "\$@"
+EOF
+  chmod +x "$real_stub"
+  PATH="$BATS_TEST_TMPDIR:$PATH"
+
+  run bash "$SCRIPTS/history.sh" testteam
+  [ "$status" -eq 0 ]
+  # The body comes from the ROWS query's own -batch (first site); the ●
+  # (unread) marker comes from the SEPARATE ids=$(...) query a few lines
+  # below in history.sh (second site) -- dropping -batch from THAT query
+  # alone still lets ROWS through untouched, so body-only used to stay
+  # green while every message silently read back as ○ (review finding:
+  # the first version of this test covered only the first site).
+  [[ "$output" == *"● "*"batch-required"* ]]
 }
 
 @test "history: filters by agent" {

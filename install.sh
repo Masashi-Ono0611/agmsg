@@ -26,6 +26,45 @@ AGENTS_DIR="$HOME/.agents"
 # helpers; safe to source.
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/scripts/lib/type-registry.sh"
+# type-registry.sh no longer computes $AGMSG_RENDERABLE_SKILL_TYPES at source
+# time (it is also sourced from resolve-project.sh, on a hot path that never
+# needs this list -- #631); install.sh runs once per invocation, so loading
+# it eagerly here, right after sourcing, costs nothing and keeps every read
+# below unchanged.
+agmsg_load_renderable_skill_types
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/scripts/lib/skill-render.sh"
+# agmsg_codex_config_paths — the Codex config.toml paths this install writes
+# writable_roots entries to. Shared with uninstall.sh's own cleanup (#1469)
+# so the two cannot silently disagree about which files exist again.
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/scripts/lib/codex-config.sh"
+
+# Types that already get their OWN dedicated skill file, written elsewhere in
+# this script -- always in that type's own format, unconditionally, gated
+# only on whether that CLI's own directory exists, never on --agent-type:
+#   claude-code  -> ~/.claude/commands/<cmd>.md
+#   copilot      -> ~/.copilot/skills/<cmd>/SKILL.md
+#   opencode     -> $OPENCODE_SKILL_DIR/SKILL.md
+#   hermes       -> $HERMES_SKILL_DIR/SKILL.md
+#   grok-build   -> $GROK_SKILL_DIR/SKILL.md
+#   antigravity  -> ~/.gemini/config/skills/<cmd>/SKILL.md (install_antigravity_skill)
+#
+# The shared ~/.agents/skills/<cmd>/SKILL.md can hold only ONE type's
+# instructions at a time, and it is what any type NOT in this list reads as
+# its ONLY instructions (today: codex, gemini, cursor, devin -- Codex in
+# particular has no dedicated file of its own). So --agent-type may retype
+# the shared file ONLY for a type not in this list; for a type that IS in
+# this list, the shared file must stay at whatever it already is, since that
+# type gets its own correctly-typed file regardless of what the shared file
+# says (#1449 -- an --agent-type other than codex used to silently retype
+# the shared file too, breaking Codex specifically, since Codex has no file
+# of its own to fall back to).
+#
+# Adding a new type's OWN dedicated file at a new site below means adding
+# that type here too, or it will keep silently retyping the shared file the
+# way #1449 describes.
+AGMSG_TYPES_WITH_OWN_SKILL_FILE="claude-code copilot opencode hermes grok-build antigravity"
 
 # Resolve a provenance version for the source being installed, so an installed
 # copy is uniquely identifiable even between tagged releases (the canonical
@@ -34,7 +73,7 @@ AGENTS_DIR="$HOME/.agents"
 # uncommitted changes. Non-git (tarball via setup.sh/npx, no .git): fall back to
 # the canonical VERSION file. See #117.
 agmsg_source_version() {
-  local v top
+  local v top native
   # Only describe when SCRIPT_DIR is ITS OWN git checkout. `git describe`
   # searches ancestors for a .git, so a non-git copy unpacked under some other
   # git repo would otherwise record that PARENT repo's describe instead of
@@ -49,7 +88,34 @@ agmsg_source_version() {
   # app's own version comparison (agmsg_core_version_status in agmsg.rs)
   # can't parse as semver, which it then treats as "outdated" unconditionally.
   top="$(git -C "$SCRIPT_DIR" rev-parse --show-toplevel 2>/dev/null || true)"
-  if [ -n "$top" ] && [ "$top" = "$SCRIPT_DIR" ] \
+  # THE TWO SIDES ARE IN DIFFERENT PATH SPACES ON WINDOWS, so the equality was
+  # always false there and every Git Bash install recorded the VERSION file
+  # instead of the describe string (#830):
+  #
+  #   $SCRIPT_DIR            /tmp/tmp.XXXX/agmsg        MSYS form, from bash
+  #   git --show-toplevel    C:/Users/.../tmp.XXXX/agmsg  native form, from git
+  #
+  # `cygpath -m` is the mixed form git reports — the same second chance this
+  # file already takes for the writable paths below, and the same one
+  # `agmsg_cmdline_names_path` takes in compat.sh, where the identical mismatch
+  # made four watcher-ownership checks answer "not ours" on Windows.
+  #
+  # The condition below is a CAPABILITY, not an operating system: where cygpath
+  # is not on PATH, `native` stays empty and this is the plain comparison and
+  # nothing else. Saying "off Windows" instead would be wider than the code —
+  # this file's own test drives the second branch on macOS and Linux by putting
+  # a cygpath stub on PATH.
+  #
+  # Where cygpath is absent, fails, returns nothing, or returns a path unequal
+  # to git's toplevel, the recorded value is the fallback, exactly as before.
+  # A wrong answer that happened to equal the toplevel would still take the
+  # describe branch, so this is a set of conditions and not a guarantee that
+  # the worst case is the old behaviour.
+  native=""
+  if command -v cygpath >/dev/null 2>&1; then
+    native="$(cygpath -m "$SCRIPT_DIR" 2>/dev/null || true)"
+  fi
+  if [ -n "$top" ] && { [ "$top" = "$SCRIPT_DIR" ] || { [ -n "$native" ] && [ "$top" = "$native" ]; }; } \
       && v="$(git -C "$SCRIPT_DIR" describe --tags --always --dirty --abbrev=7 --match 'v[0-9]*' 2>/dev/null)" \
       && [ -n "$v" ]; then
     printf '%s' "$v"
@@ -66,27 +132,157 @@ UPDATE_ONLY=false
 INTERACTIVE=true
 AGENT_TYPE=""  # claude-code, codex, gemini, antigravity — passed via --agent-type, or empty for auto/default
 
-configure_codex_sandbox() {
-  # --- Configure Codex sandbox (if Codex is installed) ---
-  # The Codex bridge writes pidfiles/sockets/request files under the
-  # skill's db/, teams/, run/ dirs; Codex's sandbox blocks those writes unless
-  # they are listed as writable_roots. See docs/codex-monitor-beta.md.
-  local code_config="$HOME/.codex/config.toml"
+# The registry derives this list from eligible manifests with template= keys.
+# It is shared by fresh install, --update selection, and --update re-detection;
+# adding a templated type therefore cannot silently fall back to the wrong flavor.
+
+# A relative scripts/ path is safe to use as a trash destination component
+# only if it cannot resolve outside the tree it was found in: no embedded
+# newline (see the NUL-delimited note below), no ".." component anywhere,
+# no leading "/". Shared by both functions below -- the same escape a mv
+# target is exposed to is the one an rm target was.
+agmsg_scripts_rel_is_safe() {
+  case "$1" in
+    ""|*$'\n'*|..|../*|*/../*|*/..|/*) return 1 ;;
+  esac
+  return 0
+}
+
+# Before `cp -R` (used at both call sites below) overwrites $dest with
+# $src, back up any file it is about to change -- i.e. present in both
+# trees with DIFFERENT content -- into $trash_root, keyed by its relative
+# path. `cp -R` only ever adds or overwrites; a file a user (or their
+# agent) had edited in place under scripts/ was overwritten with no record
+# of what was there before, silently, mid-upgrade, with nobody reading the
+# output. This runs against the WHOLE src tree, drivers/ included: backing
+# a file up never removes it or changes whether it loads, so #1249's
+# contract (a user-added driver directory must survive an update) is
+# untouched by this step -- that contract is only about the prune below.
+# Identical content is skipped so an ordinary upgrade doesn't fill .trash/
+# with copies of files nobody touched.
+agmsg_stage_overwrite_backups() {
+  local src="$1" dest="$2" trash_root="$3"
+  local entry rel
+  while IFS= read -r -d '' entry; do
+    rel="${entry#./}"
+    agmsg_scripts_rel_is_safe "$rel" || continue
+    [ -f "$dest/$rel" ] || continue
+    cmp -s "$src/$rel" "$dest/$rel" && continue
+    mkdir -p "$(dirname "$trash_root/$rel")"
+    cp -p "$dest/$rel" "$trash_root/$rel"
+    AGMSG_TRASH_COUNT=$((AGMSG_TRASH_COUNT + 1))
+  done < <(cd "$src" && find . -type f -print0)
+}
+
+# After `cp -R`: move any file under $dest that $src does not ship into
+# $trash_root instead of deleting it, so a wrong "not shipped anymore"
+# judgment (this function's own past mistake, or a future one) is a mv, not
+# data loss. Every prior release that dropped a file needed its own
+# one-off `rm -f` here (rearm.sh in 1.3.2/#1321, the Antigravity resume
+# helper's move) -- that hand-maintenance is what this generalizes. One of
+# those leftovers (rearm.sh) was run by hand after it had already been
+# removed from the release and behaved like the retired tool it used to
+# be, not like the current procedure.
+#
+# Scoped to exclude scripts/drivers/ entirely: that tree is the driver
+# discovery surface (ADR 0002, scripts/lib/driver-registry.sh), and #1249
+# already established -- with a test -- that a user-added driver directory
+# there must survive an update even though it ships nothing this release
+# knows about (it stays untrusted/unloaded until the user opts in, but it is
+# not deleted). Nothing else under scripts/ has a comparable drop-in
+# contract, so everywhere else is safe to move against the release's own
+# file list. (The backup step above still covers drivers/'s own shipped
+# files -- only the "not shipped anymore" judgment excludes that tree.)
+#
+# NUL-delimited throughout, not newline-delimited: a `find | while read`
+# split on newline lets an embedded newline in a filename forge a second,
+# fake "line". A file at scripts/<name-containing-LF>../ext-tools/<team>/
+# <name>.secret would, read back newline-split, produce a second entry that
+# reads as the literal relative path ../ext-tools/<team>/<name>.secret --
+# which resolves OUTSIDE scripts/, onto a real secret this function must
+# never touch. Same shape as the jev adapter's curl-config parser fixed the
+# same night: a line-delimited format fed a value from outside the format
+# can smuggle an extra line. `-print0` / `read -d ''` keeps one filesystem
+# entry as one value, embedded newline and all, so it can never be split.
+# NUL-safety on its own is still only a delimiter fix, not a check on what
+# the delimiter protects, so `$rel` is also validated immediately before the
+# `mv` that acts on it -- not merely before the membership compare -- and
+# anything with `..`, a leading `/`, or an embedded newline is left alone
+# and named on stderr instead of being moved.
+agmsg_prune_removed_scripts() {
+  local src="$1" dest="$2" trash_root="$3"
+  local entry rel s found
+  local -a shipped=()
+  while IFS= read -r -d '' entry; do
+    shipped+=("${entry#./}")
+  done < <(cd "$src" && find . -type f -print0)
+  while IFS= read -r -d '' entry; do
+    rel="${entry#./}"
+    [ -n "$rel" ] || continue
+    case "$rel" in drivers/*) continue ;; esac
+    if ! agmsg_scripts_rel_is_safe "$rel"; then
+      echo "    ! not moving -- suspicious scripts/ entry: $rel" >&2
+      continue
+    fi
+    found=""
+    for s in "${shipped[@]}"; do
+      if [ "$s" = "$rel" ]; then
+        found=1
+        break
+      fi
+    done
+    if [ -z "$found" ]; then
+      echo "    - moving to .trash/ (no longer shipped): scripts/$rel"
+      mkdir -p "$(dirname "$trash_root/$rel")"
+      mv "$dest/$rel" "$trash_root/$rel"
+      AGMSG_TRASH_COUNT=$((AGMSG_TRASH_COUNT + 1))
+    fi
+  done < <(cd "$dest" && find . -type f -print0)
+}
+
+# One generation of .trash/ -- cleared at the start of the update/install
+# that is about to populate it, so a mistake from two upgrades ago cannot
+# still be sitting there when this one is trying to be readable. $trash_root
+# must be a sibling of scripts/ (as both call sites pass it), never inside
+# it -- a .trash/ nested under scripts/ would have its OWN prior contents
+# picked up by the very next prune as "not shipped".
+agmsg_reset_trash() {
+  rm -rf "$1"
+  mkdir -p "$1"
+}
+
+# Put <src> at <dest>, then remove any leftover <src>. The arm is chosen by
+# <dest>, so the fix's scope matches the defect's (#747):
+#   - regular <dest>: `mv` — an atomic rename, so an interrupted install leaves
+#     either the whole old config or the whole new one, never a torn file. This
+#     is the common path and must stay atomic.
+#   - symlinked <dest>: write THROUGH the link (a redirect follows it) so a
+#     config.toml managed as a symlink (stow/chezmoi/manual dotfiles) keeps its
+#     link and its target receives the edit. `mv` would replace the link with a
+#     plain file and strand the edit on a detached copy — the actual #747 bug.
+#     This arm is non-atomic (there is no atomic write-through-a-link with plain
+#     POSIX tools), but the exposure is confined to symlink users, whose target
+#     is typically a version-controlled dotfile.
+move_into_place() {
+  if [ -L "$2" ]; then
+    cat "$1" > "$2" && rm -f "$1"
+  else
+    mv "$1" "$2"
+  fi
+}
+
+# Adds this install's writable_paths (below) to ONE Codex config.toml.
+# Split out of configure_codex_sandbox() because that function now targets
+# more than one file (see there) and every one of them gets the identical
+# missing-detection/backup/insert treatment.
+_configure_codex_sandbox_file() {
+  local code_config="$1"
+  shift
+  local writable_paths=("$@")
   if [ ! -f "$code_config" ]; then
     return 0
   fi
 
-  local writable_paths=("$SKILL_DIR/db" "$SKILL_DIR/teams" "$SKILL_DIR/run")
-  # On Windows (MSYS2/Git Bash), $SKILL_DIR is in MSYS form (/c/Users/...).
-  # Codex is a native Windows binary whose Rust path resolution cannot parse
-  # MSYS paths — /c/Users/... is resolved to C:\c\Users\... (a phantom path).
-  # Convert to the mixed C:/Users/... form that both the shell and Codex accept.
-  if command -v cygpath >/dev/null 2>&1; then
-    local i
-    for i in "${!writable_paths[@]}"; do
-      writable_paths[$i]="$(cygpath -m "${writable_paths[$i]}" 2>/dev/null || printf '%s' "${writable_paths[$i]}")"
-    done
-  fi
   local missing=()
   local p
   for p in "${writable_paths[@]}"; do
@@ -96,7 +292,7 @@ configure_codex_sandbox() {
   done
 
   if [ ${#missing[@]} -eq 0 ]; then
-    echo "  ~ Codex writable_roots already configured"
+    echo "  ~ Codex writable_roots already configured ($code_config)"
     return 0
   fi
 
@@ -119,18 +315,74 @@ configure_codex_sandbox() {
         done=1
       }
       { print }
-    ' "$code_config" > "$code_config.tmp" && mv "$code_config.tmp" "$code_config"
+    ' "$code_config" > "$code_config.tmp" && move_into_place "$code_config.tmp" "$code_config"
   elif grep -q '^\[sandbox_workspace_write\]' "$code_config" 2>/dev/null; then
     # Section exists but no writable_roots
     awk -v entries="$entries" '
       { print }
       /^\[sandbox_workspace_write\]/ { print "writable_roots = [" entries "]" }
-    ' "$code_config" > "$code_config.tmp" && mv "$code_config.tmp" "$code_config"
+    ' "$code_config" > "$code_config.tmp" && move_into_place "$code_config.tmp" "$code_config"
   else
     # No section at all
     printf '\n[sandbox_workspace_write]\nwritable_roots = [%s]\n' "$entries" >> "$code_config"
   fi
-  echo "  + added Codex writable_roots for db/, teams/, and run/"
+  echo "  + added Codex writable_roots for db/, teams/, run/, and ext-tools/ ($code_config)"
+}
+
+configure_codex_sandbox() {
+  # --- Configure Codex sandbox (if Codex is installed) ---
+  # The Codex bridge writes pidfiles/sockets/request files under the
+  # skill's db/, teams/, run/ dirs; Codex's sandbox blocks those writes unless
+  # they are listed as writable_roots. See docs/codex-monitor-beta.md.
+  #
+  # ext-tools/ is here for the same reason: an ext-tool member's `setup`
+  # (secret and save) writes its config/key under the skill's ext-tools/
+  # dir, and a sandboxed Codex seat could not write there without this --
+  # measured directly against a real seat (`codex exec -s workspace-write`,
+  # not the `codex sandbox` debug subcommand, which does not apply
+  # config.toml's writable_roots at all and rejects every write regardless),
+  # which failed with `mkdir: .../ext-tools/<team>: Operation not permitted`
+  # before this entry existed, and succeeded once it was added.
+  #
+  # Codex resolves its own config against $CODEX_HOME (default ~/.codex), not
+  # always ~/.codex -- a machine running more than one Codex identity/account
+  # sets CODEX_HOME per profile, and this function used to only ever write
+  # ~/.codex/config.toml, so a seat actually running under a CODEX_HOME
+  # profile never got these entries at all (measured: `mkdir: .../ext-tools/
+  # <team>: Operation not permitted` persisted for that seat even after this
+  # function reported success, because it had edited a file nothing read).
+  # The reverse also happens on the same machine: the Codex desktop app
+  # (codex-app) uses the plain ~/.codex default regardless of a shell's
+  # CODEX_HOME. Writing to only one when they differ silently breaks
+  # whichever surface wasn't written, so when CODEX_HOME is set and does not
+  # already point at ~/.codex, this configures BOTH -- via
+  # agmsg_codex_config_paths (scripts/lib/codex-config.sh), the one place
+  # this list is computed, shared with uninstall.sh's own cleanup (#1469: the
+  # two used to compute it separately, and drifted apart when only this
+  # function's copy was updated).
+  local codex_configs=()
+  local _cfg
+  while IFS= read -r _cfg; do
+    codex_configs+=("$_cfg")
+  done < <(agmsg_codex_config_paths)
+  unset _cfg
+
+  local writable_paths=("$SKILL_DIR/db" "$SKILL_DIR/teams" "$SKILL_DIR/run" "$SKILL_DIR/ext-tools")
+  # On Windows (MSYS2/Git Bash), $SKILL_DIR is in MSYS form (/c/Users/...).
+  # Codex is a native Windows binary whose Rust path resolution cannot parse
+  # MSYS paths — /c/Users/... is resolved to C:\c\Users\... (a phantom path).
+  # Convert to the mixed C:/Users/... form that both the shell and Codex accept.
+  if command -v cygpath >/dev/null 2>&1; then
+    local i
+    for i in "${!writable_paths[@]}"; do
+      writable_paths[$i]="$(cygpath -m "${writable_paths[$i]}" 2>/dev/null || printf '%s' "${writable_paths[$i]}")"
+    done
+  fi
+
+  local cfg
+  for cfg in "${codex_configs[@]}"; do
+    _configure_codex_sandbox_file "$cfg" "${writable_paths[@]}"
+  done
 }
 
 is_windows_host() {
@@ -168,6 +420,57 @@ install_windows_helpers() {
   fi
 }
 
+install_antigravity_tui_shim() {
+  local source target target_dir owner expected_owner tmp quoted_source
+  source="$1"
+  target="$AGENTS_DIR/bin/agy-tui"
+  target_dir="$(dirname "$target")"
+  owner="# agmsg-shim-owner: $source"
+  expected_owner=""
+  mkdir -p "$target_dir"
+  if [ -e "$target" ] || [ -L "$target" ]; then
+    expected_owner="$(grep '^# agmsg-shim-owner: ' "$target" 2>/dev/null || true)"
+    if ! grep -q '^# agmsg Antigravity TUI launcher shim$' "$target" 2>/dev/null; then
+      echo "  ~ left existing ~/.agents/bin/agy-tui untouched"
+      return 0
+    fi
+    if [ "$expected_owner" != "$owner" ]; then
+      echo "  ~ left ~/.agents/bin/agy-tui owned by a different or legacy install untouched"
+      return 0
+    fi
+  fi
+  printf -v quoted_source '%q' "$source"
+  tmp="$(mktemp "$target_dir/.agy-tui.XXXXXX")"
+  {
+    printf '%s\n' '#!/usr/bin/env bash'
+    printf '%s\n' 'set -euo pipefail'
+    printf '%s\n' '# agmsg Antigravity TUI launcher shim'
+    printf '%s\n' "$owner"
+    printf 'exec bash %s "$@"\n' "$quoted_source"
+  } > "$tmp"
+  chmod +x "$tmp"
+  mv "$tmp" "$target"
+  if [ -n "$expected_owner" ]; then
+    echo "  + refreshed Antigravity TUI shim (~/.agents/bin/agy-tui)"
+  else
+    echo "  + installed Antigravity TUI shim (~/.agents/bin/agy-tui)"
+  fi
+}
+
+install_antigravity_skill() {
+  # Antigravity looks for global skills under ~/.gemini/config/skills, not the
+  # cross-vendor ~/.agents/skills tree. Treat either of the installed agy
+  # markers as evidence that this destination is available; the config tree
+  # itself may not exist yet on a fresh CLI install.
+  if [ ! -d "$HOME/.gemini/antigravity-cli" ] && [ ! -d "$HOME/.gemini/config" ]; then
+    return 0
+  fi
+  local skill_dir="$HOME/.gemini/config/skills/$CMD_NAME"
+  mkdir -p "$skill_dir"
+  agmsg_render_skill antigravity "$CMD_NAME" "$skill_dir/SKILL.md"
+  echo "  + installed /$CMD_NAME skill to ~/.gemini/config/skills/"
+}
+
 # --- Parse args ---
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -180,9 +483,12 @@ while [[ $# -gt 0 ]]; do
       echo "Options:"
       echo "  --cmd <name>      Command & skill folder name (default: agmsg)"
       echo "                    Claude Code: /<cmd>, Codex/Gemini/Antigravity: \$<cmd>"
-      echo "  --agent-type <t>  Agent type: claude-code, codex, gemini, antigravity, opencode, hermes, cursor, grok-build"
-      echo "                    Selects which template becomes SKILL.md (matches the"
-      echo "                    <type> arg passed to join.sh / whoami.sh)"
+      echo "  --agent-type <t>  Agent type: claude-code, codex, gemini, antigravity, opencode, hermes, cursor, grok-build, devin"
+      echo "                    codex, gemini, cursor, devin: selects the template the"
+      echo "                    shared SKILL.md is rendered from. Other types leave the"
+      echo "                    shared SKILL.md's type unchanged (codex on a fresh install);"
+      echo "                    they have their own skill file."
+      echo "                    (<t> matches the type arg passed to join.sh / whoami.sh)"
       echo "  --update          Update skill scripts only (preserve DB and teams)"
       echo ""
       echo "After install, join a team per-project:"
@@ -226,8 +532,22 @@ if [ "$UPDATE_ONLY" = true ]; then
   # exactly that, not "we ended up with some skill name one way or another").
   CMD_WAS_EXPLICIT=false
   [ -n "$CMD_NAME" ] && CMD_WAS_EXPLICIT=true
-  # Find existing install. If --cmd was passed, update exactly that skill;
-  # otherwise preserve the historical "first installed agmsg skill" behavior.
+  # Find existing install. If --cmd was passed, update exactly that skill.
+  # Otherwise, scan for installs and require exactly one: a glob expands in
+  # collation order, not installation order, and nothing records which
+  # install came first, so guessing from a list of more than one is a
+  # silent coin flip on which install (and the shared ~/.agents/bin/codex
+  # shim it refreshes) gets updated (#599). A single install is unaffected
+  # -- this is the common case and it still "just works".
+  #
+  # No name-based exclusion for backup-shaped directories: --cmd has no
+  # reserved-name validation, so any pattern that would catch a real backup
+  # (e.g. "agmsg.bak-20260731") can equally match a legitimately chosen
+  # install name (e.g. "agmsg.bak-tool") -- there is no substring that is
+  # guaranteed to mean "not a real install" (review of #659). A leftover
+  # backup directory that still carries the .agmsg marker is therefore just
+  # another candidate: it makes the set ambiguous, and ambiguous is exactly
+  # what this fix already refuses to guess through, below.
   if [ -n "$CMD_NAME" ]; then
     SKILL_DIR="$AGENTS_DIR/skills/$CMD_NAME"
     if [ ! -f "$SKILL_DIR/.agmsg" ]; then
@@ -235,13 +555,23 @@ if [ "$UPDATE_ONLY" = true ]; then
       exit 1
     fi
   else
-    SKILL_DIR=""
+    candidates=()
     for d in "$AGENTS_DIR"/skills/*/; do
-      if [ -f "${d}.agmsg" ]; then
-        SKILL_DIR="${d%/}"
-        break
-      fi
+      d="${d%/}"
+      [ -f "$d/.agmsg" ] && candidates+=("$d")
     done
+    case "${#candidates[@]}" in
+      0) SKILL_DIR="" ;;
+      1) SKILL_DIR="${candidates[0]}" ;;
+      *)
+        echo "  ! Several agmsg installs found:" >&2
+        for d in "${candidates[@]}"; do
+          echo "      $(basename "$d")" >&2
+        done
+        echo "  ! --update with no --cmd cannot tell which one you mean. Pass --cmd <name> to pick one." >&2
+        exit 1
+        ;;
+    esac
   fi
   if [ -z "$SKILL_DIR" ]; then
     echo "  ! Not installed. Run ./install.sh first." >&2
@@ -250,29 +580,104 @@ if [ "$UPDATE_ONLY" = true ]; then
   SKILL_NAME="$(basename "$SKILL_DIR")"
   CMD_NAME="$SKILL_NAME"
   echo "  Updating $SKILL_NAME..."
-  if [ -z "$AGENT_TYPE" ]; then
-    if grep -q "whoami.sh.*antigravity" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
-      AGENT_TYPE="antigravity"
-    elif grep -q "whoami.sh.*gemini" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
-      AGENT_TYPE="gemini"
-    elif grep -q "whoami.sh.*grok-build" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
-      AGENT_TYPE="grok-build"
-    else
-      AGENT_TYPE="codex"
-    fi
+  # #963: a sync engine that is running when the write below starts either
+  # survives on the code it already loaded (silent -- `remote.sh status` still
+  # reports it as running, and nothing about the new scripts takes effect) or
+  # spawns a driver mid-write, reads a half-written file, and exits (visible,
+  # but stops syncing all the same). Snapshot which teams have an engine
+  # running NOW, before any file below is touched, using the install still on
+  # disk -- this is a plain read against a complete, unwritten tree, not the
+  # "must not depend on the tree mid-write" case agmsg_shq below is about.
+  # Restarting after the rewrite (further down) covers BOTH outcomes:
+  # a survivor is stopped and replaced, and a crasher is simply started fresh
+  # since its pidfile already reads as stale by then.
+  AGMSG_RUNNING_TEAMS=""
+  if [ -x "$SKILL_DIR/scripts/remote.sh" ]; then
+    while IFS= read -r _agmsg_status_line; do
+      [ -n "$_agmsg_status_line" ] || continue
+      _agmsg_running_team="$(printf '%s' "$_agmsg_status_line" | python3 -c '
+import json, sys
+try:
+    row = json.loads(sys.stdin.read())
+except Exception:
+    sys.exit(0)
+if row.get("engine_state") == "running":
+    print(row.get("local_team", ""))
+' 2>/dev/null || true)"
+      [ -n "$_agmsg_running_team" ] && AGMSG_RUNNING_TEAMS="$AGMSG_RUNNING_TEAMS
+$_agmsg_running_team"
+    done < <("$SKILL_DIR/scripts/remote.sh" status --json 2>/dev/null || true)
   fi
-  # The shared SKILL.md uses the codex template by default; gemini/antigravity/
-  # opencode get their own. (claude-code and copilot reuse the codex-typed
-  # shared SKILL.md; their dedicated copies are dropped separately below.)
-  TPL_TYPE="codex"
-  case "$AGENT_TYPE" in
-    gemini|antigravity|opencode|hermes|cursor|grok-build) TPL_TYPE="$AGENT_TYPE" ;;
+  unset _agmsg_status_line _agmsg_running_team
+  # Captured before the auto-detect below can fill AGENT_TYPE in for other
+  # reasons: an EXPLICIT --agent-type is what #1449's rule below cares about,
+  # not whatever AGENT_TYPE ends up holding once auto-detected too.
+  _agmsg_explicit_agent_type="$AGENT_TYPE"
+  # Re-detect the type this install's shared SKILL.md is CURRENTLY rendered
+  # for, from the whoami.sh line its own template prints (#846) -- every
+  # renderable type's line is unambiguous against every other's; see the
+  # cross-grep this list is built from, noted alongside
+  # AGMSG_RENDERABLE_SKILL_TYPES above. codex remains the fallback when an
+  # older or hand-written SKILL.md has no recognizable whoami line.
+  #
+  # Always run, even when --agent-type was given explicitly: #1449's rule
+  # below needs this as the shared file's fallback type precisely when an
+  # explicit --agent-type asks for a type that must not retype it.
+  _agmsg_detected_type="codex"
+  for _agmsg_t in $AGMSG_RENDERABLE_SKILL_TYPES; do
+    if grep -q "whoami.sh.*$_agmsg_t" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
+      _agmsg_detected_type="$_agmsg_t"
+      break
+    fi
+  done
+  unset _agmsg_t
+  [ -z "$AGENT_TYPE" ] && AGENT_TYPE="$_agmsg_detected_type"
+  # The shared SKILL.md can hold only ONE type's instructions at a time (see
+  # AGMSG_TYPES_WITH_OWN_SKILL_FILE near the top). An EXPLICIT --agent-type
+  # for a type that already gets its own dedicated file elsewhere in this
+  # script must not retype the shared file too -- it stays at the type just
+  # detected above instead. An --agent-type for a type with no file of its
+  # own (today: codex, gemini, cursor, devin) still renders the shared file
+  # as that type, same as before #1449.
+  TPL_TYPE="$_agmsg_detected_type"
+  case " $AGMSG_TYPES_WITH_OWN_SKILL_FILE " in
+    *" $_agmsg_explicit_agent_type "*)
+      echo "  shared SKILL.md stays $_agmsg_detected_type: $_agmsg_explicit_agent_type has its own skill file"
+      ;;
+    *)
+      case " $AGMSG_RENDERABLE_SKILL_TYPES " in
+        *" $AGENT_TYPE "*) TPL_TYPE="$AGENT_TYPE" ;;
+      esac
+      ;;
   esac
-  sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path "$TPL_TYPE")" > "$SKILL_DIR/SKILL.md"
+  unset _agmsg_explicit_agent_type _agmsg_detected_type
+  agmsg_render_skill "$TPL_TYPE" "$SKILL_NAME" "$SKILL_DIR/SKILL.md"
+  TRASH_DIR="$SKILL_DIR/.trash"
+  AGMSG_TRASH_COUNT=0
+  agmsg_reset_trash "$TRASH_DIR"
+  agmsg_stage_overwrite_backups "$SCRIPT_DIR/scripts" "$SKILL_DIR/scripts" "$TRASH_DIR"
   # Recursive copy so nested helper dirs (scripts/lib/, scripts/drivers/types/)
   # ship without enumerating files. The agent-type manifests and per-type runtimes
   # live under scripts/drivers/types/ now, so this single copy carries them too.
   cp -R "$SCRIPT_DIR/scripts/." "$SKILL_DIR/scripts/"
+  agmsg_prune_removed_scripts "$SCRIPT_DIR/scripts" "$SKILL_DIR/scripts" "$TRASH_DIR"
+  echo "  ~ $AGMSG_TRASH_COUNT file(s) backed up to .trash/ (cleared on next upgrade)"
+  # #1249: drivers/terminals/{herdr,plain,tmux}/SKILL.md used to name each
+  # driver's own doc file, and a directory-scanning skill loader (e.g.
+  # codex's) treated it as a standalone skill missing YAML frontmatter,
+  # warning on every start. Renamed to README.md. A plain `cp -R` never
+  # deletes a file absent from the source tree, so an --update over an
+  # install from before this rename would otherwise keep the stale
+  # SKILL.md side by side with the new README.md forever. Named
+  # individually -- NOT a scripts/drivers/terminals/*/SKILL.md glob --
+  # because a user can drop a custom driver directory straight under
+  # scripts/drivers/terminals/ (nothing about that path is exclusive to
+  # agmsg's own three); a glob there would delete a file this install
+  # does not own (#1249 review).
+  for _agmsg_builtin_driver in herdr plain tmux; do
+    rm -f "$SKILL_DIR/scripts/drivers/terminals/$_agmsg_builtin_driver/SKILL.md"
+  done
+  unset _agmsg_builtin_driver
   # Ship the external-plugin drop-in dir (just its README) so the location exists
   # post-install. A plain cp — not cp -R --delete — preserves any plugins the
   # user dropped in and their db/trusted-plugins opt-ins.
@@ -286,7 +691,7 @@ if [ "$UPDATE_ONLY" = true ]; then
   # Refresh the Claude Code slash command file (was missed in earlier --update flows).
   CC_COMMANDS_DIR="$HOME/.claude/commands"
   if [ -d "$CC_COMMANDS_DIR" ] && [ -f "$CC_COMMANDS_DIR/$SKILL_NAME.md" ]; then
-    sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path claude-code)" > "$CC_COMMANDS_DIR/$SKILL_NAME.md"
+    agmsg_render_skill claude-code "$SKILL_NAME" "$CC_COMMANDS_DIR/$SKILL_NAME.md"
   fi
   # Refresh / install the Copilot CLI skill (Copilot reads SKILL.md from its
   # own skills dir; the shared ~/.agents/skills/<name>/SKILL.md is
@@ -296,29 +701,101 @@ if [ "$UPDATE_ONLY" = true ]; then
   COPILOT_SKILL_DIR="$HOME/.copilot/skills/$SKILL_NAME"
   if [ -d "$HOME/.copilot" ]; then
     mkdir -p "$COPILOT_SKILL_DIR"
-    sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path copilot)" > "$COPILOT_SKILL_DIR/SKILL.md"
+    agmsg_render_skill copilot "$SKILL_NAME" "$COPILOT_SKILL_DIR/SKILL.md"
   fi
   # Refresh / install the OpenCode skill (same reasoning as Copilot above).
   OPENCODE_SKILL_DIR="$HOME/.config/opencode/skills/$SKILL_NAME"
   if [ -d "$HOME/.config/opencode" ]; then
     mkdir -p "$OPENCODE_SKILL_DIR"
-    sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path opencode)" > "$OPENCODE_SKILL_DIR/SKILL.md"
+    agmsg_render_skill opencode "$SKILL_NAME" "$OPENCODE_SKILL_DIR/SKILL.md"
   fi
   # Refresh / install the Hermes Agent skill (same reasoning as Copilot above).
   HERMES_SKILL_DIR="$HOME/.hermes/skills/$SKILL_NAME"
   if [ -d "$HOME/.hermes" ]; then
     mkdir -p "$HERMES_SKILL_DIR"
-    sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path hermes)" > "$HERMES_SKILL_DIR/SKILL.md"
+    agmsg_render_skill hermes "$SKILL_NAME" "$HERMES_SKILL_DIR/SKILL.md"
   fi
   # Refresh / install the Grok Build skill (same reasoning as Copilot above).
   GROK_SKILL_DIR="$HOME/.grok/skills/$SKILL_NAME"
   if [ -d "$HOME/.grok" ]; then
     mkdir -p "$GROK_SKILL_DIR"
-    sed "s/__SKILL_NAME__/$SKILL_NAME/g" "$(agmsg_type_template_path grok-build)" > "$GROK_SKILL_DIR/SKILL.md"
+    agmsg_render_skill grok-build "$SKILL_NAME" "$GROK_SKILL_DIR/SKILL.md"
   fi
+  install_antigravity_skill
   cp "$SCRIPT_DIR/openai.yaml" "$SKILL_DIR/agents/openai.yaml" 2>/dev/null || true
+  # A team config written by an older release can be group- or world-writable,
+  # and the sync engine refuses to read one that is (#804). Upgrading does not
+  # rewrite files that already exist, so without this the release we are asking
+  # people to install is the release that stops them: joined on v1.2.0-rc.5,
+  # upgraded as told, and now the binding they already had is rejected.
+  #
+  # This is a HISTORICAL correction, not a sweep of every authority file. The
+  # set an older release's write path could have left wrong is exactly
+  # `teams/<team>/config.json`, because it is the only one written by shell
+  # under the caller's umask; `<storage>/remote-sync/<team>.json` and the
+  # retained age checkpoint are written by Node with an explicit 0600 on a
+  # fresh `wx` file, and that code is byte-identical at v1.2.0-rc.5. Those two
+  # are still authority files the engine refuses on mode -- a mode changed by
+  # hand is outside this walk, and the pasteable remedy in the refusal is what
+  # covers that case.
+  #
+  # Within what it does walk, the selection is meant to be exactly the files
+  # the engine refuses ON MODE, so this cannot correct a file into a state the
+  # engine still refuses, and cannot touch one it would have accepted:
+  #
+  #   -type f      a symlink is refused by the engine BEFORE mode is consulted
+  #                ("must not be a symbolic link"), so chmod-ing one would
+  #                change a file OUTSIDE the store and announce a repair that
+  #                repaired nothing. `[ -f ]` follows symlinks; this does not.
+  #   -perm -g+w   two tests, not one `-go+w`: `-perm -MODE` means ALL of the
+  #   -perm -o+w   named bits, so the combined form skips a file writable by
+  #                only one of them.
+  #   find, glob   `teams/*/config.json` silently drops a team whose name
+  #                begins with a dot, and lib/validate.sh allows those -- it
+  #                rejects `.` and `..` but not `.anything`. find descends
+  #                regardless of the leading character.
+  #   one traversal, not two `find` starts per binding.
+  #
+  # `go-w` rather than a numeric mode: the owner's bits and any read access the
+  # operator deliberately granted are theirs, not ours to normalise.
+  #
+  # Skipped on Windows, where the engine skips the mode check itself
+  # (`process.platform !== "win32"` guards it, and it is the LAST thing it
+  # consults). MSYS reports modes the filesystem does not really carry, so
+  # without this the walk would announce that the sync engine refuses a file the
+  # sync engine is perfectly happy with -- on every update, on the one platform
+  # where the sentence cannot be true.
+  #
+  # Said out loud, per file. A permission change the operator cannot see is
+  # indistinguishable from one that did not happen, and this one runs without
+  # being asked for.
+  if ! is_windows_host; then
+    # Same scheme as lib/shquote.sh, inline rather than sourced: the installer
+    # must not depend on the tree it is in the middle of writing. A team name
+    # may contain a space or a single quote -- lib/validate.sh rejects only
+    # empty / `.` / `..` / `/` / `\` / a leading `-` / control characters -- so
+    # a path printed for someone to paste has to survive both.
+    agmsg_shq() {
+      printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+    }
+    # -print0 and `read -d ''` because the path is arbitrary UTF-8. A newline
+    # cannot appear in a team name (validate.sh rejects control characters), but
+    # nothing here needs to rely on that.
+    find "$SKILL_DIR/teams" -mindepth 2 -maxdepth 2 -name config.json -type f \
+      \( -perm -g+w -o -perm -o+w \) -print0 2>/dev/null |
+      while IFS= read -r -d '' agmsg_binding; do
+        if chmod go-w "$agmsg_binding" 2>/dev/null; then
+          echo "  + tightened $agmsg_binding (an older release left it group- or world-writable; the sync engine refuses those)"
+        else
+          printf '  ! could not tighten %s -- run: chmod go-w %s\n' \
+            "$agmsg_binding" "$(agmsg_shq "$agmsg_binding")" >&2
+        fi
+      done || true
+    unset -f agmsg_shq
+  fi
   chmod +x "$SKILL_DIR/scripts/"*.sh
   chmod +x "$SKILL_DIR/scripts/drivers/types/codex/"*.sh 2>/dev/null || true
+  install_antigravity_tui_shim "$SKILL_DIR/scripts/drivers/types/antigravity/agy-tui.sh"
   # Refresh the Codex monitor shim (~/.agents/bin/codex) if it's ours. --update
   # cp's the new codex-shim-install.sh but does not re-run it, so a shim from an
   # older install keeps its stale baked exec path after the
@@ -370,7 +847,26 @@ if [ "$UPDATE_ONLY" = true ]; then
   configure_codex_sandbox
   echo ""
   echo "  ! Restart any running agent sessions to pick up the updated scripts."
-  echo "    In-flight watch.sh processes keep the old code until they restart."
+  echo "    In-flight watch.sh processes detect this and stand down on their own;"
+  echo "    reopening the session brings delivery back."
+  echo ""
+  # #963: a sync engine has no equivalent self-detection, so this update
+  # restarts one itself for every team the snapshot above found running.
+  if [ -n "$AGMSG_RUNNING_TEAMS" ]; then
+    while IFS= read -r _agmsg_team; do
+      [ -n "$_agmsg_team" ] || continue
+      if ! "$SKILL_DIR/scripts/remote.sh" sync restart "$_agmsg_team"; then
+        echo "  ! could not restart the sync engine for '$_agmsg_team'; run:" >&2
+        echo "      bash $SKILL_DIR/scripts/remote.sh sync restart $_agmsg_team" >&2
+      fi
+    done <<< "$AGMSG_RUNNING_TEAMS"
+    unset _agmsg_team
+  else
+    echo "  ~ no sync engine was running before this update; nothing to restart"
+  fi
+  echo ""
+  echo "    'engine stale' after this is not proof a restart above failed on its"
+  echo "    own -- check: remote.sh status <team> (#963, #954)."
   echo ""
   echo "  ! If a project uses 'monitor'/'both'/'turn' delivery, re-run"
   echo "    'delivery.sh set <mode> <type> <project>' there. An upgrade (or a skill"
@@ -400,18 +896,38 @@ SKILL_DIR="$AGENTS_DIR/skills/$CMD_NAME"
 echo "  Installing to ~/.agents/skills/$CMD_NAME/ ..."
 mkdir -p "$SKILL_DIR"/{scripts,types,db,agents}
 
-# SKILL.md is generated from the agent-specific command template, resolved from
-# the type manifest (scripts/drivers/types/<type>/template.md). The shared SKILL.md uses the
-# codex template by default; gemini/antigravity/opencode get their own.
+# SKILL.md is composed from the shared root and the agent-specific overlay
+# resolved from the type manifest (scripts/drivers/types/<type>/template.md).
+#
+# The shared SKILL.md can hold only ONE type's instructions at a time (see
+# AGMSG_TYPES_WITH_OWN_SKILL_FILE near the top). --agent-type for a type
+# that already gets its own dedicated file elsewhere in this script must not
+# retype the shared file too -- a fresh install has no existing file to fall
+# back to, so it stays at the plain codex default. --agent-type for a type
+# with no file of its own (today: codex, gemini, cursor, devin) still
+# renders the shared file as that type, same as before #1449.
 TPL_TYPE="codex"
-case "$AGENT_TYPE" in
-  gemini|antigravity|opencode|hermes|cursor|grok-build) TPL_TYPE="$AGENT_TYPE" ;;
+case " $AGMSG_TYPES_WITH_OWN_SKILL_FILE " in
+  *" $AGENT_TYPE "*)
+    echo "  shared SKILL.md stays codex: $AGENT_TYPE has its own skill file"
+    ;;
+  *)
+    case " $AGMSG_RENDERABLE_SKILL_TYPES " in
+      *" $AGENT_TYPE "*) TPL_TYPE="$AGENT_TYPE" ;;
+    esac
+    ;;
 esac
-sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path "$TPL_TYPE")" > "$SKILL_DIR/SKILL.md"
+agmsg_render_skill "$TPL_TYPE" "$CMD_NAME" "$SKILL_DIR/SKILL.md"
+TRASH_DIR="$SKILL_DIR/.trash"
+AGMSG_TRASH_COUNT=0
+agmsg_reset_trash "$TRASH_DIR"
+agmsg_stage_overwrite_backups "$SCRIPT_DIR/scripts" "$SKILL_DIR/scripts" "$TRASH_DIR"
 # Recursive copy so nested helper dirs (scripts/lib/, scripts/drivers/types/) ship
 # without enumerating files. The agent-type manifests and per-type runtimes live
 # under scripts/drivers/types/ now, so this single copy carries them too.
 cp -R "$SCRIPT_DIR/scripts/." "$SKILL_DIR/scripts/"
+agmsg_prune_removed_scripts "$SCRIPT_DIR/scripts" "$SKILL_DIR/scripts" "$TRASH_DIR"
+echo "  ~ $AGMSG_TRASH_COUNT file(s) backed up to .trash/ (cleared on next upgrade)"
 # Ship the external-plugin drop-in dir (just its README) so the location exists
 # post-install. A plain cp — not cp -R --delete — preserves any plugins the user
 # dropped in and their db/trusted-plugins opt-ins.
@@ -426,6 +942,7 @@ cp "$SCRIPT_DIR/uninstall.sh" "$SKILL_DIR/uninstall.sh" 2>/dev/null && chmod +x 
 cp "$SCRIPT_DIR/openai.yaml" "$SKILL_DIR/agents/openai.yaml" 2>/dev/null || true
 chmod +x "$SKILL_DIR/scripts/"*.sh
 chmod +x "$SKILL_DIR/scripts/drivers/types/codex/"*.sh 2>/dev/null || true
+install_antigravity_tui_shim "$SKILL_DIR/scripts/drivers/types/antigravity/agy-tui.sh"
 # Re-point an existing Codex monitor shim at the new path on a reinstall over an
 # older layout (no-op when no agmsg shim is present). See the --update block
 # above. NOT forced (#553): unlike --update, a fresh install here gives no
@@ -476,7 +993,7 @@ fi
 CC_COMMANDS_DIR="$HOME/.claude/commands"
 if [ -d "$HOME/.claude" ]; then
   mkdir -p "$CC_COMMANDS_DIR"
-  sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path claude-code)" > "$CC_COMMANDS_DIR/$CMD_NAME.md"
+  agmsg_render_skill claude-code "$CMD_NAME" "$CC_COMMANDS_DIR/$CMD_NAME.md"
   echo "  + installed /$CMD_NAME command to ~/.claude/commands/"
 fi
 
@@ -487,7 +1004,7 @@ fi
 COPILOT_SKILL_DIR="$HOME/.copilot/skills/$CMD_NAME"
 if [ -d "$HOME/.copilot" ]; then
   mkdir -p "$COPILOT_SKILL_DIR"
-  sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path copilot)" > "$COPILOT_SKILL_DIR/SKILL.md"
+  agmsg_render_skill copilot "$CMD_NAME" "$COPILOT_SKILL_DIR/SKILL.md"
   echo "  + installed /$CMD_NAME skill to ~/.copilot/skills/"
 fi
 
@@ -499,7 +1016,7 @@ fi
 OPENCODE_SKILL_DIR="$HOME/.config/opencode/skills/$CMD_NAME"
 if [ -d "$HOME/.config/opencode" ]; then
   mkdir -p "$OPENCODE_SKILL_DIR"
-  sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path opencode)" > "$OPENCODE_SKILL_DIR/SKILL.md"
+  agmsg_render_skill opencode "$CMD_NAME" "$OPENCODE_SKILL_DIR/SKILL.md"
   echo "  + installed \$$CMD_NAME skill to ~/.config/opencode/skills/"
 fi
 
@@ -511,7 +1028,7 @@ fi
 HERMES_SKILL_DIR="$HOME/.hermes/skills/$CMD_NAME"
 if [ -d "$HOME/.hermes" ]; then
   mkdir -p "$HERMES_SKILL_DIR"
-  sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path hermes)" > "$HERMES_SKILL_DIR/SKILL.md"
+  agmsg_render_skill hermes "$CMD_NAME" "$HERMES_SKILL_DIR/SKILL.md"
   echo "  + installed /$CMD_NAME skill to ~/.hermes/skills/"
 fi
 
@@ -519,14 +1036,22 @@ fi
 # Grok Build reads skills from ~/.grok/skills/<name>/SKILL.md (it also accepts
 # the cross-vendor ~/.agents/skills/ fallback, but the shared SKILL.md is
 # Codex-typed and would mis-identify a Grok session — keep the Grok copy
-# separate, same pattern as Copilot). Delivery (turn) registers a Stop hook under
-# ~/.grok/hooks/ via `delivery.sh set` per project.
+# separate, same pattern as Copilot). Delivery (turn/monitor) writes a
+# project-relative rule file, <project>/.grok/rules/agmsg.md, via
+# `delivery.sh set` per project (scripts/drivers/types/grok-build/type.conf's
+# hooks_file; see grok-build/_delivery.sh).
 GROK_SKILL_DIR="$HOME/.grok/skills/$CMD_NAME"
 if [ -d "$HOME/.grok" ]; then
   mkdir -p "$GROK_SKILL_DIR"
-  sed "s/__SKILL_NAME__/$CMD_NAME/g" "$(agmsg_type_template_path grok-build)" > "$GROK_SKILL_DIR/SKILL.md"
+  agmsg_render_skill grok-build "$CMD_NAME" "$GROK_SKILL_DIR/SKILL.md"
   echo "  + installed /$CMD_NAME skill to ~/.grok/skills/"
 fi
+
+# --- Install Antigravity skill ---
+# Antigravity (agy) reads global skills from ~/.gemini/config/skills/<name>/.
+# Its CLI may create ~/.gemini/antigravity-cli before the config directory, so
+# either path is a sufficient installation signal.
+install_antigravity_skill
 
 # Codex sandbox writable_roots are configured by configure_codex_sandbox() at
 # the "Done" step below — the single source of truth for db/, teams/, and run/.

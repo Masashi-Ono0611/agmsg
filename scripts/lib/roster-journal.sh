@@ -136,6 +136,48 @@ agmsg_roster_name_owner() {
      WHERE name='$name_sql' ORDER BY ord LIMIT 1;" 2>/dev/null | tr -d '\r'
 }
 
+# The reverse of agmsg_roster_name_owner: the name a member_id answers to
+# NOW, not the first one it ever had -- a member can be renamed, and a
+# caller resolving an id back to a name needs who it is today (#1457, for
+# self-fix.sh's own id-keyed lock resolution). The most recent join-or-rename
+# binding for this member_id, or empty if the journal never minted one.
+#
+# Empty too when the member's MOST RECENT event is member_left (#1457
+# review round 2): a departed member is not "who it is today", and a
+# caller resolving an id-keyed lock back to a name must not walk a gone
+# member's role into a live, named one just because the journal still
+# remembers the name they left under.
+agmsg_roster_owner_name() {
+  local team_dir="$1" member_id="$2" journal journal_sql id_sql
+  journal="$(agmsg_roster_journal_path "$team_dir")"
+  [ -f "$journal" ] || return 0
+  journal_sql="$(agmsg_sql_readfile_path "$journal")"
+  id_sql="$(_agmsg_roster_sqlesc "$member_id")"
+  sqlite3 :memory: "
+    WITH source(doc) AS (
+      SELECT '[' || replace(
+        rtrim(CAST(readfile('$journal_sql') AS TEXT), char(10)),
+        char(10), ',') || ']'
+    ),
+    records(ord,event) AS (
+      SELECT CAST(key AS INTEGER),value FROM source,json_each(source.doc)
+    ),
+    bindings AS (
+      SELECT ord,
+             json_extract(event,'\$.member_id') AS member_id,
+             json_extract(event,'\$.type') AS type,
+             CASE json_extract(event,'\$.type')
+               WHEN 'member_joined' THEN json_extract(event,'\$.name')
+               WHEN 'member_renamed' THEN json_extract(event,'\$.to')
+             END AS name
+        FROM records
+       WHERE json_extract(event,'\$.type') IN ('member_joined','member_renamed','member_left')
+    )
+    SELECT CASE type WHEN 'member_left' THEN NULL ELSE name END
+      FROM bindings
+     WHERE member_id='$id_sql' ORDER BY ord DESC LIMIT 1;" 2>/dev/null | tr -d '\r'
+}
+
 # Start an id-bearing team journal from its current config. This is needed for
 # teams created after ids landed but before this journal existed, and for a
 # freshly pulled team whose initial roster came from the remote snapshot.
@@ -385,4 +427,77 @@ agmsg_roster_project_config() {
     return 1
   fi
   agmsg_write_atomic "$config" "$updated"
+}
+
+# agmsg_roster_argv_is_ours <cmdline> <script-path> <operation> <config-path>
+#
+# "Is this command line the roster-sync run I started?" — the whole question,
+# in one place, callable.
+#
+# IT LIVES HERE SO IT CAN BE DRIVEN DIRECTLY. It began inside
+# `roster-sync-driver.sh`, where the only way to reach it was to run the
+# driver — so its cases ended up re-implementing the comparison in the test
+# file and asserting on the driver with `grep`. That measures a copy and the
+# spelling of the original, never the original itself (raised in review).
+#
+# The answer must be conservative in ONE direction. A false "yes" sends TERM
+# and KILL to a process that is not ours; a false "no" leaves a lock held and
+# reported. So every widening below is deliberate and bounded, and anything
+# unrecognised is "no".
+agmsg_roster_argv_is_ours() {
+  local cmdline="$1" script="$2" operation="$3" config="$4"
+  [ -n "$cmdline" ] && [ -n "$script" ] && [ -n "$operation" ] && [ -n "$config" ] || return 1
+
+  # QUOTES ARE A BOUNDARY, NOT DECORATION — AND DELETING THEM DESTROYS ONE
+  # (raised in review, after an earlier version of this did exactly that).
+  #
+  # A native Windows command line quotes any argument containing a space, so
+  # `compat_get_cmdline` can return
+  #   "C:/Users/First Last/.../roster-sync.mjs" reconcile "C:/.../config.json"
+  # and an unquoted needle never matches it. The first fix stripped every `"`
+  # from the haystack. That is worse than it looks: it is true that the space
+  # between two arguments survives, but a quote also carries "the spaces INSIDE
+  # me are not argument separators". Strip it and
+  #   node other.js --note "<script> reconcile <config>"
+  # — one quoted data argument that merely CONTAINS the triple — becomes
+  # indistinguishable from a real invocation, and a stranger picked up through
+  # pid reuse would be signalled.
+  #
+  # So the quotes stay, and the FORMS the shell can legitimately produce are
+  # enumerated instead: either path may or may not be quoted, and the quote
+  # then sits outside the argument, where the boundary space still has to be.
+  local haystack=" $cmdline "
+  local script_win="" config_win=""
+  if command -v cygpath >/dev/null 2>&1; then
+    script_win="$(cygpath -m "$script" 2>/dev/null || true)"
+    config_win="$(cygpath -m "$config" 2>/dev/null || true)"
+  fi
+
+  # THE ORDERED TRIPLE, WITH ARGUMENT BOUNDARIES. Three separate `contains`
+  # checks are three questions, and a command line carrying a different
+  # operation and a different config satisfies all three at once. And an
+  # ordered substring is still a substring: without the surrounding spaces,
+  # `/teams/demo/config.json` matches a run using `config.json.bak`, and our
+  # absolute script path is a tail of `/x/opt/.../roster-sync.mjs`. Padding
+  # the haystack lets one pattern require both boundaries, including for an
+  # argument at either end of the line.
+  #
+  # FOUR ACCEPTED FORMS PER PAIR, because either path may arrive quoted and
+  # they are quoted independently — a path with a space in it is quoted, one
+  # without it is not, and the two paths need not agree. The quote goes where
+  # the shell puts it: around the argument, INSIDE the boundary spaces.
+  local s c
+  for s in "$script" "$script_win"; do
+    [ -n "$s" ] || continue
+    for c in "$config" "$config_win"; do
+      [ -n "$c" ] || continue
+      case "$haystack" in
+        *" $s $operation $c "*) return 0 ;;
+        *" \"$s\" $operation \"$c\" "*) return 0 ;;
+        *" \"$s\" $operation $c "*) return 0 ;;
+        *" $s $operation \"$c\" "*) return 0 ;;
+      esac
+    done
+  done
+  return 1
 }

@@ -184,7 +184,7 @@ export function joinDroppedPaths(paths: string[]): string | null {
 // Which pane, if any, a dropped file should land in when it didn't land on
 // any specific pane cell (dropped on the sidebar, tab bar, Team Room, ...)
 // — the active tab's actually-focused pane if it has one, else its first
-// pane, per the spec ("特定できない場合はactiveへ" — a follow-up
+// pane, per the spec ("when it cannot be determined, fall back to active" — a follow-up
 // live-testing feedback: prefer the focused pane specifically, not just
 // whichever leaf happens to be first in the tree). A pane found directly
 // under the cursor is always already in the active window (inactive
@@ -853,6 +853,21 @@ export default function App() {
   useEffect(() => {
     if (team) localStorage.setItem(LAST_TEAM_KEY, team);
   }, [team]);
+
+  // Keep the active team visible in the (now internally-scrolling, #1478)
+  // team list — switching via the rail popup or a restored last-team can
+  // land on a row currently scrolled out of view. Only one .team-status-row
+  // is ever active at a time (collapsed and expanded rails aren't both in
+  // the DOM together), so a single querySelector is unambiguous.
+  // sidebarCollapsed is also a dep: toggling collapsed/expanded swaps in a
+  // DIFFERENT .team-status-rail (a fresh, unscrolled one) without `team`
+  // changing at all, and that one needs the same treatment.
+  useEffect(() => {
+    if (!team) return;
+    document
+      .querySelector(".team-status-rail .team-status-row.active")
+      ?.scrollIntoView({ block: "nearest" });
+  }, [team, sidebarCollapsed]);
 
   // On team change: load members + the most recent history page. Prompt to
   // add an app-user if missing.

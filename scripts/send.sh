@@ -1,153 +1,119 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Usage: send.sh <team> <from> <to> --stdin [--force]
-#    or: send.sh <team> <from> <to> <message> [--force]   (deprecated)
+# Usage:
+#   send.sh <team> <from> <to> --stdin [--force]                # exact body from stdin
+#   send.sh <team> <from> <to> --body-file <path> [--force]     # body read from a file
+#   send.sh <team> <from> <to> --body - [--force]               # body read from stdin
+#   send.sh <team> <from> <to> <message> [--force]              # deprecated positional body
+#   send.sh <team> <from> <to> -- <option-like-body> [--force]  # literal option-like body
 #
-# #378: a message body passed positionally goes through the SENDER's shell
-# before it ever reaches this script — an unescaped `$(...)` in a quoted
-# body can execute, and backticks can be silently evaluated/emptied. On
-# Windows/MSYS a positional body is additionally routed through MSYS's
-# argv-conversion path (build_argv -> globify), which truncates silently at
-# exactly 8186 bytes (fixed MAXPATHLEN 8192 buffer in glob.cc). --stdin reads
-# the body verbatim from a file descriptor instead of argv, so a body sent
-# that way meets neither hazard — no shell re-interpretation, no argv size
-# limit.
-#
-# That makes --stdin the canonical way to send; it does not remove the
-# hazard, because the positional form still exists and still carries both.
-# The positional form is DEPRECATED: it keeps working for now, but a body
-# composed by an agent must not use it. Retiring it is a later, breaking
-# stage of #378 — this stage only moves every first-party example onto the
-# safe path.
-#
-# Three literal bodies DO break here, and `--` is their migration syntax:
-# `--` and `--stdin` are now consumed as a terminator or a mode selector, and
-# `--force` is now rejected outright (it used to arrive as the body, because
-# only argument 5 was checked for the flag). Send any of them — or any other
-# body that happens to start with `--` — as
-# `send.sh <team> <from> <to> -- <body>` — including `-- --`. Every other
-# positional body is unaffected.
+# --body-file matches poke.sh, for the same reason (#507) AND to close #1101: a caller
+# who learned --body-file from poke used to have send take the literal string
+# "--body-file" as the message and exit zero (the flag has different meanings on the two
+# adjacent commands). A positional <message> also passes through the CALLER's shell first,
+# where a backtick or $( ) executes and its span silently vanishes; send bodies are longer
+# and likelier to contain them. So a message that is a bare unconsumed flag (starts with
+# --, and is not --body-file/--body) is now REFUSED rather than sent, and a mistyped flag
+# never lands as content. The upstream --body-file / --body - modes keep their existing
+# command-substitution semantics; --stdin is the #378 exact-byte path and preserves
+# trailing newlines.
 
-USAGE="Usage: send.sh <team> <from> <to> --stdin [--force]
-   or: send.sh <team> <from> <to> <message> [--force]   (deprecated, see #378)"
+die() { echo "send.sh: $*" >&2; exit 1; }
 
-TEAM="${1:?$USAGE}"
+TEAM="${1:?Usage: send.sh <team> <from> <to> <message|--stdin|--body-file PATH|--body -> [--force]}"
 FROM="${2:?Missing from agent}"
 TO="${3:?Missing to agent}"
 shift 3
 
+# -- separates an option-like literal body from the flags, preserving the
+# explicit escape added for #378. A trailing --force after that body remains
+# available when there are at least two arguments after the separator.
+FORCE=0
 MODE="positional"
 BODY=""
-FORCE=0
-
-if [ $# -eq 0 ]; then
-  echo "Error: missing message body. Provide it positionally or via --stdin." >&2
-  exit 1
-fi
-
-case "$1" in
-  --)
-    # Option terminator: everything after it is the body, verbatim. Without
-    # this, adding --stdin silently broke a body that happens to BE the
-    # literal string "--stdin" (or "--force"), which was a perfectly valid
-    # positional body before this change. `--` is the standard escape hatch
-    # and keeps that case working.
-    shift
-    if [ $# -eq 0 ]; then
-      echo "Error: missing message body after '--'." >&2
-      exit 1
-    fi
-    BODY="$1"
-    shift
-    ;;
-  --stdin)
-    MODE="stdin"
-    shift
-    ;;
-  --force)
-    echo "Error: missing message body before --force. Provide it positionally or via --stdin." >&2
-    exit 1
-    ;;
-  *)
-    # A positional body that starts with '--' but isn't a mode this script
-    # recognizes (e.g. a misspelled --stdinn, or a future flag typo) used
-    # to be stored literally as the message — silently accepting whatever the
-    # caller typed instead of failing loudly on the likely mistake. Fail
-    # closed instead: require the explicit '--' separator for any body that
-    # looks like an option. A body that legitimately IS an option-like
-    # string still works via `-- <body>`, same as the recognized flags
-    # above.
-    case "$1" in
-      --*)
-        echo "option-like body: use -- separator" >&2
-        exit 1
-        ;;
-    esac
-    BODY="$1"
-    shift
-    ;;
-esac
-
-# Reject combining two input modes instead of silently picking one — e.g. a
-# positional body followed by --stdin.
-if [ "${1:-}" = "--stdin" ]; then
-  echo "Error: the message body was already given (positional argument or --stdin) — cannot also pass $1. Provide the body exactly one way." >&2
-  exit 1
-fi
-
-if [ "${1:-}" = "--force" ]; then
-  FORCE=1
+if [ "${1:-}" = "--" ]; then
   shift
+  [ "$#" -gt 0 ] || die "missing message body after --"
+  if [ "$#" -ge 2 ] && [ "${!#}" = "--force" ]; then
+    FORCE=1
+    set -- "${@:1:$#-1}"
+  fi
+  [ "$#" -eq 1 ] || die "got extra arguments after --"
+  BODY="$1"
+elif [ "$#" -gt 0 ] && [ "${!#}" = "--force" ]; then
+  FORCE=1
+  set -- "${@:1:$#-1}"
 fi
 
-if [ $# -gt 0 ]; then
-  echo "Error: unexpected extra argument(s) after the message: $*" >&2
-  exit 1
+if [ -z "$BODY" ]; then
+  case "${1:-}" in
+    --stdin)
+      [ "$#" -eq 1 ] || die "--stdin cannot be combined with another body input"
+      MODE="stdin"
+      ;;
+    --body-file)
+      [ "$#" -eq 2 ] || die "--body-file takes exactly one path"
+      [ -r "${2:-}" ] || die "cannot read body file: ${2:-<missing>}"
+      BODY="$(cat -- "$2")"
+      ;;
+    --body)
+      { [ "$#" -eq 2 ] && [ "${2:-}" = "-" ]; } \
+        || die "--body accepts only '-' (read stdin); for a file use --body-file <path>"
+      BODY="$(cat)"
+      ;;
+    '')
+      die "Missing message body"
+      ;;
+    --*)
+      die "unrecognized option '${1}' — option-like body: use -- separator"
+      ;;
+    *)
+      if [ "$#" -gt 1 ] && [ "${2:-}" = "--stdin" ]; then
+        die "the message body was already given (positional argument) — cannot also pass --stdin. Provide the body exactly one way."
+      fi
+      [ "$#" -eq 1 ] || die "unexpected extra argument(s) after the message: ${*:2}"
+      BODY="$1"
+      ;;
+  esac
 fi
+[ "$MODE" = "stdin" ] || [ -n "$BODY" ] || die "the message body is empty — nothing to send"
 
-if [ "$MODE" = "positional" ] && [ -z "$BODY" ]; then
-  echo "Error: missing message body." >&2
-  exit 1
-fi
-
-# Read the body verbatim (no word-splitting, no glob expansion). `IFS= read
-# -r -d ''` slurps to EOF without stripping leading or trailing
-# whitespace/newlines — deliberately: whatever bytes are on stdin land in the
-# message exactly as given, including any trailing newline(s). If you don't
-# want a trailing newline in the sent message, don't put one in the input.
-#
-# The exit status is load-bearing, so it is checked rather than discarded:
-# `read` exits 0 only when it actually found its -d delimiter — which here
-# is NUL — and non-zero when it reached EOF without one. EOF is the normal,
-# complete read. A zero exit therefore means exactly one thing: the input
-# carries a NUL byte, and BODY already stops there, because a bash string
-# cannot hold one. Storing that shortened value and exiting 0 would tell the
-# caller the whole body was sent when it was not, so a NUL-bearing body is
-# refused instead. (A positional <message> cannot hit this: argv strings
-# cannot carry NUL either, so such a body never reaches this script intact
-# in the first place.)
+# --stdin preserves the exact byte stream, including trailing newlines. Bash
+# strings cannot hold NUL, so detect and reject one instead of sending a prefix.
 if [ "$MODE" = "stdin" ]; then
   if IFS= read -r -d '' BODY; then
-    echo "Error: --stdin input contains a NUL byte; a message body must be text, and everything from that byte on would be lost. Nothing was sent." >&2
-    exit 1
+    die "--stdin input contains a NUL byte; nothing was sent"
   fi
-  if [ -z "$BODY" ]; then
-    echo "Error: --stdin was given but no data was read from standard input." >&2
-    exit 1
-  fi
+  [ -n "$BODY" ] || die "--stdin was given but no data was read from standard input"
 fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck disable=SC1091
 source "$SCRIPT_DIR/lib/validate.sh"
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/type-registry.sh"
 
 # #414: TEAM becomes a path segment (teams/$TEAM/config.json) below whether or
 # not --force is given, so validate it unconditionally, before any config-path
 # resolution or DB init. --force bypasses roster *membership* only — it must
 # never bypass team-name path safety.
 agmsg_validate_team_name "$TEAM" || exit 1
+
+# A seat that sends names its own pane if it is not named (self-name.sh): the
+# 1.3.0 rule that every live seat's terminal id/name is right in any state,
+# tied to the action rather than to a CLI's boot path. Best-effort, never fails
+# the send; the common case is one file read.
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/self-name.sh"
+agmsg_self_name_on_action "$TEAM" "$FROM"
+# And, once and early, fix its own CLI session name by typing /rename into its own
+# pane (self-rename.sh, #1081). Best-effort, never fails the send; opt out with
+# AGMSG_SELF_RENAME=off (or the whole family with AGMSG_SELF_NAME=off).
+# shellcheck disable=SC1091
+source "$SCRIPT_DIR/lib/self-rename.sh"
+agmsg_self_rename_on_action "$TEAM" "$FROM"
 
 agmsg_storage_load
 DB="$(agmsg_db_path "$TEAM")"
@@ -156,6 +122,11 @@ DB="$(agmsg_db_path "$TEAM")"
 # command; the message write itself goes through the storage facade below.
 [ -f "$DB" ] || bash "$SCRIPT_DIR/internal/init-db.sh" >/dev/null
 
+# Unconditional (moved ahead of the --force gate below): the generic
+# per-type message plug after storage_send needs this path regardless of
+# --force.
+TEAM_CONFIG="$SCRIPT_DIR/../teams/$TEAM/config.json"
+
 # #355: reject a from/to that isn't registered in <team> — an unnoticed typo
 # (e.g. a stray send to "dummy") used to insert successfully with exit 0,
 # landing an undeliverable message and polluting history. Validation lives
@@ -163,17 +134,15 @@ DB="$(agmsg_db_path "$TEAM")"
 # can keep their own policy. --force bypasses this for intentional
 # pre-registration sends (e.g. notifying a role before its own join.sh runs).
 if [ "$FORCE" -ne 1 ]; then
-  TEAM_CONFIG="$SCRIPT_DIR/../teams/$TEAM/config.json"
-
   _agmsg_roster_check() {
     local role="$1" name="$2"
     if [ ! -f "$TEAM_CONFIG" ]; then
       echo "Error: team '$TEAM' has no registered agents — cannot send as $role '$name' (use --force to bypass)." >&2
       return 1
     fi
-    local cfg_sql name_sql found roster
+    local cfg_sql name_sql found roster q="'"
     cfg_sql=$(agmsg_sql_readfile_path "$TEAM_CONFIG")
-    name_sql=$(printf '%s' "$name" | sed "s/'/''/g")
+    name_sql=${name//$q/$q$q}
     found=$(agmsg_sqlite_mem "
       WITH raw(json) AS (SELECT CAST(readfile('$cfg_sql') AS TEXT)),
       cfg(json) AS (SELECT CASE WHEN json_valid(json) THEN json END FROM raw)
@@ -202,7 +171,67 @@ fi
 # the message log (an append-only message_sent event), not a direct INSERT.
 # storage_send re-inits its schema idempotently before writing, which subsumes the
 # #114 concurrent first-write race the old path retried around (a process seeing
-# the DB file before the table exists just creates it). The new id is not surfaced.
-storage_send "$TEAM" "$FROM" "$TO" "$BODY" >/dev/null
+# the DB file before the table exists just creates it).
+MSG_ID="$(storage_send "$TEAM" "$FROM" "$TO" "$BODY")"
 
 echo "Sent to $TO in team $TEAM"
+
+# Generic per-type "message arrived" plug (scripts/drivers/types/<type>/_message.sh):
+# lets a type react to a message just sent to one of its own members, without
+# this script knowing any type's name (ext-tool's dispatch launch is the
+# first and, so far, only example -- see scripts/drivers/ext-tools/README.md
+# for its own adapter contract). Best-effort: any failure a hook reports must
+# never turn a successful send into a failed one -- the message is already
+# saved by this point. A hook may not call exit.
+if [ -n "${MSG_ID:-}" ] && [ -f "$TEAM_CONFIG" ]; then
+  # Quote held in a variable, not written inline in the pattern (#897): a
+  # literal \' replacement disagrees between bash 3.2 (keeps the backslash,
+  # doubling into \'\') and bash 4+ (doubles into ''), and this scope has no
+  # $q from _agmsg_roster_check's own local above to reuse.
+  q="'"
+  TO_SQL=${TO//$q/$q$q}
+  # Every distinct type $TO is registered as, from its registrations array
+  # (every other type's shape) or its bare top-level type (the shape a team
+  # with no id-bearing roster still has) -- an agent registered under more
+  # than one type gets the hook called once per type that defines one.
+  TO_TYPES="$(agmsg_sqlite_mem "
+    WITH raw(json) AS (SELECT CAST(readfile('$(agmsg_sql_readfile_path "$TEAM_CONFIG")') AS TEXT)),
+    cfg(json) AS (SELECT CASE WHEN json_valid(json) THEN json END FROM raw),
+    agent(a) AS (SELECT value FROM cfg, json_each(json_extract(cfg.json, '\$.agents')) WHERE key = '$TO_SQL')
+    SELECT group_concat(DISTINCT t) FROM (
+      SELECT json_extract(value, '\$.type') AS t
+      FROM agent, json_each(json_extract(agent.a, '\$.registrations'))
+      WHERE json_extract(value, '\$.type') IS NOT NULL
+      UNION
+      SELECT json_extract(agent.a, '\$.type') AS t
+      FROM agent
+      WHERE json_extract(agent.a, '\$.type') IS NOT NULL
+    );
+  " 2>/dev/null)"
+  if [ -n "$TO_TYPES" ]; then
+    IFS=',' read -ra _AGMSG_TO_TYPES <<<"$TO_TYPES"
+    for _agmsg_to_type in "${_AGMSG_TO_TYPES[@]}"; do
+      _agmsg_msg_type_dir="$(agmsg_type_dir "$_agmsg_to_type" 2>/dev/null || true)"
+      if [ -n "$_agmsg_msg_type_dir" ] && [ -f "$_agmsg_msg_type_dir/_message.sh" ]; then
+        # shellcheck disable=SC1090
+        . "$_agmsg_msg_type_dir/_message.sh"
+        if declare -F agmsg_type_on_message >/dev/null 2>&1; then
+          _AGMSG_MSG_BODY_FILE="$(mktemp)"
+          printf '%s' "$BODY" > "$_AGMSG_MSG_BODY_FILE"
+          # The `|| true` is load-bearing, not style: this script runs under
+          # `set -e`, and this hook is SOURCED into it, so `set -e` is still
+          # active inside it -- any command failing partway through the
+          # hook (not just an explicit non-zero return) would otherwise trip
+          # errexit right here and kill send.sh itself, after the message
+          # was already saved and "Sent to ..." already printed, skipping
+          # the cleanup below too (review finding). The hook's own contract
+          # is "a failure never turns a successful send into a failed one,
+          # and the caller decides how this ends" -- shielding the call is
+          # what keeps that true regardless of what happens inside the hook.
+          agmsg_type_on_message "$TEAM" "$FROM" "$TO" "$MSG_ID" "$_AGMSG_MSG_BODY_FILE" || true
+          rm -f "$_AGMSG_MSG_BODY_FILE"
+        fi
+      fi
+    done
+  fi
+fi

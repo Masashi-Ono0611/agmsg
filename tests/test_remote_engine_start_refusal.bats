@@ -133,7 +133,13 @@ skip_if_root() {
   # command fails on a team literally named "'testteam'" -- measured, that is
   # what the first version of this test did. A printed route has to be run the
   # way it is meant to be run.
-  run bash -c "bash '$SCRIPTS/remote.sh' $args"
+  # The lifted command reaches a real engine start against an endpoint that
+  # never answers, so it would otherwise pay this command's full production
+  # readiness-wait ceiling (minutes, not seconds -- #779) just to prove the
+  # remedy parses and runs. AGMSG_TEST_SYNC_START_READY_CEILING shortens only
+  # that wait; the test cares whether the remedy reaches the engine-start
+  # path, not how long that path's own timeout takes.
+  run env AGMSG_TEST_SYNC_START_READY_CEILING=30 bash -c "bash '$SCRIPTS/remote.sh' $args"
   # "not refused" is not enough: a remedy that no longer parses is answered with
   # a usage line, which is also not a refusal. Measured -- changing only the
   # printed verb (start -> begin) left this test green until the two assertions
@@ -159,7 +165,9 @@ skip_if_root() {
 @test "sync start: a writable run dir still starts an engine (#730)" {
   # The control. Without it, every assertion above is satisfied by a
   # `sync start` that refuses unconditionally.
-  run bash "$SCRIPTS/remote.sh" sync start testteam
+  # The engine below never reaches https://remote.example, so this pays the
+  # readiness-wait ceiling in full unless shortened (see the #730 test above).
+  run env AGMSG_TEST_SYNC_START_READY_CEILING=30 bash "$SCRIPTS/remote.sh" sync start testteam
   # The engine is real here and will fail to reach https://remote.example, so
   # this does not assert success -- only that the refusal above is not what
   # happened, and that the pidfile path was reachable.
@@ -192,7 +200,11 @@ skip_if_root() {
   local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
   local starter i=0 j=0 freed=0
 
-  bash "$SCRIPTS/remote.sh" sync start testteam >/dev/null 2>&1 &
+  # Shortened (not removed): this test needs the starter to stay alive for
+  # its own poll window below (up to 3s, j<60), so the ceiling is cut well
+  # below production (1600) but kept comfortably above that window rather
+  # than cut to the same minimum used where nothing else depends on timing.
+  AGMSG_TEST_SYNC_START_READY_CEILING=100 bash "$SCRIPTS/remote.sh" sync start testteam >/dev/null 2>&1 &
   starter=$!
 
   # The engine existing is what says the START is over and the WAIT has begun.
@@ -315,7 +327,10 @@ skip_if_root() {
   local cycles="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
   local starter engine foreign i=0
 
-  bash "$SCRIPTS/remote.sh" sync start testteam >/dev/null 2>&1 &
+  # `wait "$starter"` below blocks on however long the readiness wait takes,
+  # not on any fixed window of ours, so shortening it to the same minimum
+  # used elsewhere is safe here.
+  AGMSG_TEST_SYNC_START_READY_CEILING=30 bash "$SCRIPTS/remote.sh" sync start testteam >/dev/null 2>&1 &
   starter=$!
   while [ ! -f "$pidfile" ] && [ "$i" -lt 400 ]; do i=$((i + 1)); sleep 0.05; done
   [ -f "$pidfile" ]
@@ -364,7 +379,11 @@ skip_if_root() {
   local cycles="$TEST_SKILL_DIR/run/remote-sync.testteam.cycles.json"
   local starter engine i=0 err="$TEST_SKILL_DIR/retake.err"
 
-  bash "$SCRIPTS/remote.sh" sync start testteam >"$err" 2>&1 &
+  # The lock is taken by this test right after the starter releases it (near
+  # the very start of the readiness wait, not gated by its length) and held
+  # until this test's own teardown below, so the starter's eventual retake
+  # attempt fails regardless of how long its own wait took -- safe to shorten.
+  AGMSG_TEST_SYNC_START_READY_CEILING=30 bash "$SCRIPTS/remote.sh" sync start testteam >"$err" 2>&1 &
   starter=$!
   while [ ! -f "$pidfile" ] && [ "$i" -lt 400 ]; do i=$((i + 1)); sleep 0.05; done
   [ -f "$pidfile" ]
@@ -372,7 +391,30 @@ skip_if_root() {
 
   # Somebody else takes the lock and keeps it. Held with mkdir directly, the way
   # the library takes it, so no helper of ours has to survive the wait.
-  mkdir "$lock"
+  #
+  # Taken by RETRYING until it succeeds, not by assuming it is free (#934).
+  # `sync start` holds this team's lock across the launch and releases it only
+  # once the engine is running -- so at the moment the pidfile appears the lock
+  # is still the starter's, and a single `mkdir` here raced that release. It lost
+  # often enough to be the suite's most frequent failure, and it failed in setup,
+  # which reads as a broken fixture rather than as a race.
+  #
+  # Waiting for the lock to disappear first and then taking it would be the same
+  # race one step later. Retrying takes it the instant the starter drops it, and
+  # the window is wide: `cmd_sync_start` releases the lock and immediately enters
+  # its readiness wait -- 1600 turns at 0.01s, a floor of 16 seconds and longer
+  # in practice because each turn also spawns a status probe, a tail and an awk
+  # (remote.sh:2873-2886). That interval is exactly what this test needs to own,
+  # and the retry ceiling below (400 x 0.05s = 20s) is sized to reach into it.
+  local locked=0 t=0
+  while [ "$t" -lt 400 ]; do
+    if mkdir "$lock" 2>/dev/null; then locked=1; break; fi
+    t=$((t + 1)); sleep 0.05
+  done
+  [ "$locked" -eq 1 ] || {
+    echo "the starter never released the team lock, so this test could not take it" >&2
+    false
+  }
   printf '%s\n' "KEPT-CYCLE-STATE" > "$cycles"
 
   kill "$engine" 2>/dev/null || true
@@ -390,4 +432,66 @@ skip_if_root() {
   [ "$(cat "$cycles")" = "KEPT-CYCLE-STATE" ]
 
   rmdir "$lock" 2>/dev/null || true
+}
+
+@test "sync start: readiness cleanup is bounded by the wall clock (#779)" {
+  # The readiness loop starts a status probe, tail, awk and sleep on every
+  # turn. Counting 1600 turns as sixteen seconds is only true when all of that
+  # work is free. Slow the argv and liveness probes: after the engine is ended,
+  # status reaches the latter rather than the former. The old attempt-only loop
+  # would then need about thirty seconds; the clock budget reaches cleanup in
+  # five.
+  local slow_bin="$TEST_SKILL_DIR/slow-status-bin"
+  mkdir -p "$slow_bin"
+  printf '%s\n' '#!/usr/bin/env bash' \
+    'case " $* " in *" -o args= "*|*" -o stat= "*) sleep 0.1 ;; esac' \
+    'exec /bin/ps "$@"' > "$slow_bin/ps"
+  chmod +x "$slow_bin/ps"
+
+  local lock="$TEST_SKILL_DIR/teams/testteam/.config.lock"
+  local pidfile="$TEST_SKILL_DIR/run/remote-sync.testteam.pid"
+  local starter engine i=0 j=0 released=0 err="$TEST_SKILL_DIR/bounded.err"
+
+  # The clock budget is deliberately shorter than the 1600-attempt ceiling
+  # can reach through the slow probe. The ceiling remains a finite fallback,
+  # so an implementation that drops the clock turns this into a bounded red
+  # test, not an unbounded CI hang.
+  env PATH="$slow_bin:$PATH" AGMSG_TEST_SYNC_START_READY_SECONDS=5 \
+    AGMSG_LOCK_SECONDS=2 \
+    bash "$SCRIPTS/remote.sh" sync start testteam >"$err" 2>&1 &
+  starter=$!
+
+  while [ ! -f "$pidfile" ] && [ "$i" -lt 100 ]; do i=$((i + 1)); sleep 0.05; done
+  [ -f "$pidfile" ]
+  engine="$(cat "$pidfile")"
+
+  # Handshake 1: the initial lock is released while this caller is polling.
+  # A free lock after it returns would prove nothing, so require the starter to
+  # still be alive at the same moment.
+  while [ "$j" -lt 100 ]; do
+    if [ ! -d "$lock" ] && kill -0 "$starter" 2>/dev/null; then released=1; break; fi
+    j=$((j + 1)); sleep 0.05
+  done
+  [ "$released" -eq 1 ]
+
+  # Handshake 2: an external holder owns the lock before the engine ends.
+  # Handshake 3 follows immediately: the next branch this starter can take is
+  # the timeout cleanup, which must now fail to retake that holder's lock.
+  mkdir "$lock"
+  kill "$engine" 2>/dev/null || true
+
+  # Assert the cleanup branch, not a fragile elapsed-time threshold. The
+  # helper's ten-second condition wait leaves headroom for a loaded runner;
+  # without the wall-clock bound the finite 300-attempt ceiling exceeds it.
+  if ! wait_for_file_contains "$err" 'could not retake the registry lock'; then
+    kill "$starter" 2>/dev/null || true
+    wait "$starter" 2>/dev/null || true
+    kill "$engine" 2>/dev/null || true
+    rmdir "$lock" 2>/dev/null || true
+    false
+  fi
+
+  [ -f "$pidfile" ]
+  rmdir "$lock" 2>/dev/null || true
+  wait "$starter" 2>/dev/null || true
 }
