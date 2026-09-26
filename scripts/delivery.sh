@@ -549,10 +549,7 @@ agmsg_delivery_find_broad_watcher_pid() {
     _agmsg_pid_alive "$pid" || continue
     cmd=$(compat_get_cmdline "$pid" 2>/dev/null || true)
     if [ -n "$cmd" ]; then
-      case "$cmd" in
-        *"$SKILL_DIR/scripts/watch.sh"*) ;;
-        *) continue ;;
-      esac
+      agmsg_cmdline_names_path "$cmd" "$SKILL_DIR/scripts/watch.sh" || continue
       # Broad watchers invoke `watch.sh <sid> <project> <type>` with NO 4th
       # arg — project/type must be the trailing tokens. An exclusive watcher
       # for some OTHER agent shares the same project/type as a substring but

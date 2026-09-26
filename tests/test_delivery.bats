@@ -3573,8 +3573,8 @@ JSON
 
   run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"mode: monitor"* ]]
-  [[ "$output" == *"Watcher: team/alice alive (exclusive, pid $pidfile_pid)"* ]]
+  printf '%s\n' "$output" | grep -qF -- "mode: monitor"
+  printf '%s\n' "$output" | grep -qF -- "Watcher: team/alice alive (exclusive, pid $pidfile_pid)"
 
   kill "$wpid" 2>/dev/null || true
   kill "$pidfile_pid" 2>/dev/null || true
@@ -3598,9 +3598,9 @@ JSON
 
   run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
   [ "$status" -eq 0 ]
-  [[ "$output" != *"alive (exclusive"* ]]
+  refute grep -qF -- "alive (exclusive" <<< "$output"
   [[ "$output" == *"Watcher: team/alice not running"* ]] || \
-    [[ "$output" == *"no exclusive receiver"* ]]
+    grep -qF -- "no exclusive receiver" <<< "$output"
 
   kill "$agent_pid" 2>/dev/null || true
   trap - EXIT
@@ -3638,8 +3638,8 @@ JSON
 
   run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Watcher: team/bob no exclusive receiver (broad watcher alive, pid $broad_pid)"* ]]
-  [[ "$output" != *"Watcher: team/bob not running"* ]]
+  printf '%s\n' "$output" | grep -qF -- "Watcher: team/bob no exclusive receiver (broad watcher alive, pid $broad_pid)"
+  refute grep -qF -- "Watcher: team/bob not running" <<< "$output"
 
   kill "$wpid" 2>/dev/null || true
   kill "$broad_pid" 2>/dev/null || true
@@ -3652,8 +3652,8 @@ JSON
 
   run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"mode: monitor"* ]]
-  [[ "$output" == *"Watcher: team/alice not running"* ]]
+  printf '%s\n' "$output" | grep -qF -- "mode: monitor"
+  printf '%s\n' "$output" | grep -qF -- "Watcher: team/alice not running"
 }
 
 @test "delivery status (watcher): still reports aggregate watch count (unlike codex)" {
@@ -3662,8 +3662,8 @@ JSON
 
   run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Watcher: team/alice not running"* ]]
-  [[ "$output" == *"watch processes:"* ]]
+  printf '%s\n' "$output" | grep -qF -- "Watcher: team/alice not running"
+  printf '%s\n' "$output" | grep -qF -- "watch processes:"
 }
 
 @test "receiver-live.sh: exits 0 only when watch pidfile is live (not agent pid alone)" {
@@ -3748,8 +3748,8 @@ JSON
 
   run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"Watcher: team/bob not running"* ]]
-  [[ "$output" != *"team/bob no exclusive receiver"* ]]
+  printf '%s\n' "$output" | grep -qF -- "Watcher: team/bob not running"
+  refute grep -qF -- "team/bob no exclusive receiver" <<< "$output"
 
   kill "$wpid" 2>/dev/null || true
   trap - EXIT
@@ -3822,7 +3822,7 @@ EOF
   mockdir="$(_mock_no_ps)"
   PATH="$mockdir:$PATH" run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"no exclusive receiver (broad watcher alive, pid $broad_pid)"* ]]
+  printf '%s\n' "$output" | grep -qF -- "no exclusive receiver (broad watcher alive, pid $broad_pid)"
 
   kill "$wpid" 2>/dev/null || true
   trap - EXIT
