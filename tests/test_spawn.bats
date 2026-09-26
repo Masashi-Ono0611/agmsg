@@ -959,7 +959,7 @@ EOF
     --ready-timeout 300 \
     --terminal "bash $mark_helper {cmd}"
   [ "$status" -eq 0 ]
-  [[ "$output" == *"status=ready"* ]]
+  grep -qF 'status=ready' <<<"$output"
   [[ "$output" != *"skipping readiness wait"* ]]
 
   # The mark is an edge, not liveness: spawn consumes it after observing it.
@@ -976,7 +976,7 @@ EOF
   run env -u TMUX bash "$SCRIPTS/spawn.sh" grok-build alice --project "$PROJ" \
     --ready-timeout 2 --terminal "true # {cmd}"
   [ "$status" -eq 3 ]
-  [[ "$output" == *"status=timeout"* ]]
+  grep -qF 'status=timeout' <<<"$output"
   [[ "$output" != *"status=ready"* ]]
 }
 
@@ -989,9 +989,9 @@ EOF
   run env -u TMUX bash "$SCRIPTS/spawn.sh" grok-build alice --project "$PROJ" \
     --ready-timeout 2 --terminal "true # {cmd}"
   [ "$status" -eq 3 ]
-  [[ "$output" == *"300s minimum"* ]]
-  [[ "$output" == *"status=timeout"* ]]
-  [[ "$output" == *"after=300s"* ]]
+  grep -qF '300s minimum' <<<"$output"
+  grep -qF 'status=timeout' <<<"$output"
+  grep -qF 'after=300s' <<<"$output"
   [[ "$output" != *"status=ready"* ]]
 }
 
@@ -1003,7 +1003,7 @@ EOF
     --terminal "true # {cmd}"
   [ "$status" -eq 0 ]
   [[ "$output" == *"skipping readiness wait"* ]]
-  [[ "$output" == *"status=launched-unconfirmed"* ]]
+  grep -qF 'status=launched-unconfirmed' <<<"$output"
   [[ "$output" == *"note=no-readiness-handshake"* ]]
 }
 

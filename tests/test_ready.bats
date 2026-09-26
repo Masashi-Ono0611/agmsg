@@ -69,11 +69,11 @@ teardown() {
 @test "ready: rejects unknown actions and malformed argv" {
   run bash "$SCRIPTS/ready.sh" nope team alice
   [ "$status" -ne 0 ]
-  [[ "$output" == *"Usage:"* ]]
+  grep -qF 'Usage:' <<<"$output"
 
   run bash "$SCRIPTS/ready.sh" mark team
   [ "$status" -ne 0 ]
-  [[ "$output" == *"Usage:"* ]]
+  grep -qF 'Usage:' <<<"$output"
 
   run bash "$SCRIPTS/ready.sh" mark '' alice
   [ "$status" -ne 0 ]
