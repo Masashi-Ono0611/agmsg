@@ -5,7 +5,7 @@ set -euo pipefail
 #
 # Usage:
 #   delivery.sh set <mode> <type> <project_path>
-#   delivery.sh status [<type> <project_path>]
+#   delivery.sh status [<type> <project_path> [<session_id>]]
 #   delivery.sh stop
 #   delivery.sh restart [<project_path> <type>]
 #
@@ -21,6 +21,10 @@ set -euo pipefail
 #   turn     — Stop hook → check-inbox.sh between turns (legacy)
 #   both     — monitor primary; turn as per-session safety net
 #   off      — no automatic delivery
+#
+# `status` reports configured delivery hooks. For Claude Code, `mode: monitor`
+# means the project is configured for monitor delivery; runtime success still
+# requires Claude Code to start its generic Monitor tool for `agmsg inbox stream`.
 #
 # settings.json injection is idempotent: each `set` call first strips any
 # existing agmsg-owned SessionStart/Stop entries, then re-adds whichever
@@ -58,7 +62,7 @@ RUN_DIR="$SKILL_DIR/run"
 # primitives use it, so source storage first.
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/storage.sh"
-# JSON/SQLite hook-file primitives (sourced after SKILL_NAME is set above —
+# JSON/SQLite hook-file primitives (sourced after SKILL_DIR is set above —
 # strip/add reference it to detect agmsg-owned entries).
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/hooks-json.sh"
@@ -67,14 +71,62 @@ RUN_DIR="$SKILL_DIR/run"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/delivery-rulefile.sh"
 
-# Single-quote-escape $1 for splicing into a hook command string as its own
-# shell argument: replace each embedded ' with '\'' (close the quote, emit an
-# escaped literal quote, reopen the quote), matching the standard POSIX
-# technique. Unlike `'$var'`, this round-trips correctly through the shell
-# that later executes the resulting "command" value even when $var itself
-# contains a single quote.
-_agmsg_shq() {
-  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+# Splices a value into a hook command string as its own shell argument. The
+# implementation is shared with every other place that prints a runnable
+# command; see lib/shquote.sh for why naive `'$var'` is not enough.
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/shquote.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/terminal-registry.sh"
+_agmsg_shq() { agmsg_shq "$1"; }
+
+# Prints the "run this from a normal shell instead" recovery line for a
+# refused hooks_file write (#1392), to stderr.
+#
+# Every argument goes through _agmsg_shq -- the same helper this file already
+# uses for every other command line it prints (see its own comment above) --
+# rather than the naive `'$var'` this replaced (review finding, #1392: a
+# project path containing a single quote broke the quoting outright, and a
+# copy-pasted broken quote is a write-the-wrong-thing hazard, not just a
+# cosmetic one). $0 is included for the same reason: nothing about this
+# script's own invocation path is guaranteed quote-free either.
+_agmsg_print_delivery_recovery() {
+  local mode="$1" type="$2" project="$3"
+  echo "agmsg: if this seat is running in a restricted sandbox (e.g. Codex's workspace-write mode keeps .codex/ read-only), run this same command from a normal, unsandboxed shell instead:" >&2
+  echo "  bash $(_agmsg_shq "$0") set $(_agmsg_shq "$mode") $(_agmsg_shq "$type") $(_agmsg_shq "$project")" >&2
+}
+
+# True (0) iff <cli>'s reported version is >= <min>, compared as MAJOR.MINOR.PATCH.
+# FAIL-CLOSED: returns non-zero when the cli is not on PATH, `--version` fails, or
+# neither the output nor <min> yields a dotted-numeric version — an unknown
+# version must not pass, because the caller installs a hook only for a version
+# confirmed to accept it (#1003). No env override: a version is READ from the CLI,
+# never asserted; tests place a fake `codex` on PATH (both the pass and the fail
+# cases), so no operator seam to claim an unmeasured capability is added.
+_agmsg_cli_version_ge() {
+  local cli="$1" min="$2" raw ver
+  [ -n "$cli" ] && [ -n "$min" ] || return 1
+  command -v "$cli" >/dev/null 2>&1 || return 1
+  raw="$("$cli" --version 2>/dev/null || true)"
+  ver="$(printf '%s' "$raw" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+|[0-9]+\.[0-9]+' | head -1)"
+  [ -n "$ver" ] || return 1
+  _agmsg_ver_ge "$ver" "$min"
+}
+
+# True (0) iff dotted-numeric $1 >= $2, compared component by component (a missing
+# component reads as 0). Patch is significant: the floor is the exact measured
+# version, so a same-minor build BELOW it (0.149.0 vs a 0.149.1 floor) is refused.
+_agmsg_ver_ge() {
+  local a="$1" b="$2" i av bv
+  for i in 1 2 3; do
+    av=$(printf '%s.0.0.0' "$a" | cut -d. -f"$i")
+    bv=$(printf '%s.0.0.0' "$b" | cut -d. -f"$i")
+    case "$av" in ''|*[!0-9]*) av=0 ;; esac
+    case "$bv" in ''|*[!0-9]*) bv=0 ;; esac
+    [ "$av" -gt "$bv" ] && return 0
+    [ "$av" -lt "$bv" ] && return 1
+  done
+  return 0
 }
 
 # The per-project delivery hooks file is the type's manifest `hooks_file=`
@@ -107,7 +159,21 @@ agmsg_delivery_apply_default() {
 
   local hooks_file
   hooks_file=$(resolve_hooks_file "$type" "$project")
-  mkdir -p "$(dirname "$hooks_file")"
+  # A refused write here used to be silent in effect even though `set -e`
+  # (line 2) happened to make the SCRIPT exit non-zero: the failure was a bare
+  # `mkdir: ... Permission denied` with no agmsg context, easy to miss in a
+  # long transcript and giving no next step -- and a caller wrapping this call
+  # in its own `|| true`/subshell would lose even that (#1392, confirmed live:
+  # Codex's workspace-write sandbox keeps .codex/ read-only even inside an
+  # otherwise-writable project, so a re-setup from inside a sandboxed seat hit
+  # exactly this and the seat went deaf with nothing telling anyone). Named
+  # explicitly and unconditionally here rather than left to `set -e` alone, so
+  # this stays loud even from a caller that does not propagate exit codes.
+  mkdir -p "$(dirname "$hooks_file")" || {
+    echo "agmsg: could not create $(dirname "$hooks_file") to write $hooks_file — delivery for $type was NOT set up." >&2
+    _agmsg_print_delivery_recovery "$mode" "$type" "$project"
+    return 1
+  }
 
   # Whether hook entries also need a Windows-native "commandWindows" variant is
   # a per-type manifest fact (hook_windows_wrap=yes). Resolve it here — the layer
@@ -115,6 +181,42 @@ agmsg_delivery_apply_default() {
   # which stays type-agnostic (see hooks-json.sh header).
   local ww
   ww=$(agmsg_type_get "$type" hook_windows_wrap 2>/dev/null || true)
+
+  # Mid-turn delivery (#1003): a type whose manifest carries a posttooluse_output
+  # datum also gets a PostToolUse hook running check-inbox between tool calls, not
+  # only at Stop. The datum's PRESENCE opts the type in (kept type-agnostic here —
+  # no `if type = codex`); its value is the wire shape check-inbox emits.
+  #
+  # But opt-in is not enough to INSTALL: the entry is meaningless to a CLI that
+  # cannot execute PostToolUse, and — the concern that first motivated the gate —
+  # an older parser that rejected it at startup/hooks-review would break turn
+  # delivery before check-inbox runs. So a second datum, posttooluse_min_cli,
+  # gates on the detected CLI version, FAIL-CLOSED: the entry is installed only
+  # when the CLI is confirmed at or above it. Older, or a version we cannot read,
+  # gets Stop only. (That older-parser concern was later measured — see the next
+  # paragraph — so this stays as defense-in-depth, not the sole protection.)
+  #
+  # What this gate does and does NOT do (#1003 review): it narrows the POPULATION
+  # of projects that get the entry WRITTEN to those where a supporting CLI was
+  # seen at install time. It does NOT by itself govern how an OLDER CLI handles a
+  # persisted entry later — hooks.json outlives this call, and a downgrade or a
+  # different codex binary can read the same file without the gate running again.
+  # That handling was measured separately: codex 0.116.0 (pre-PostToolUse) reads a
+  # PostToolUse-carrying hooks.json and silently ignores the unknown key, no
+  # startup/parse error, positive-control confirmed — the Hooks Review screen was
+  # not directly reached (inferred harmless). So the gate is defense-in-depth on
+  # top of that measurement, not the sole protection against an unknown.
+  local pt_output pt_min pt_cli pt_install=0
+  pt_output=$(agmsg_type_get "$type" posttooluse_output 2>/dev/null || true)
+  if [ -n "$pt_output" ]; then
+    pt_min=$(agmsg_type_get "$type" posttooluse_min_cli 2>/dev/null || true)
+    pt_cli=$(agmsg_type_get "$type" cli 2>/dev/null || true)
+    if [ -z "$pt_min" ]; then
+      pt_install=1                              # opted in with no version floor
+    elif _agmsg_cli_version_ge "$pt_cli" "$pt_min"; then
+      pt_install=1                              # CLI confirmed new enough
+    fi
+  fi
 
   # Work on a temp copy so a partially-modified file never replaces the
   # original until the whole chain succeeds.
@@ -130,6 +232,10 @@ agmsg_delivery_apply_default() {
   strip_agmsg_event_file "$tmp_state" "SessionStart"
   strip_agmsg_event_file "$tmp_state" "SessionEnd"
   strip_agmsg_event_file "$tmp_state" "Stop"
+  # Always strip PostToolUse too (#1003), so `off`/`monitor`/a mode change removes
+  # the mid-turn entry alongside Stop. Unconditional: a type that never installed
+  # one has nothing to remove.
+  strip_agmsg_event_file "$tmp_state" "PostToolUse"
 
   # 2) Re-add what this mode wants.
   #
@@ -151,6 +257,12 @@ agmsg_delivery_apply_default() {
     turn)
       local cmd="$(_agmsg_shq "$SKILL_DIR/scripts/check-inbox.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
       add_event_entry_file "$tmp_state" "Stop" "$cmd" "$ww"
+      # Same inbox check, fired after every tool call (#1003). The trailing event
+      # arg tells check-inbox.sh which wire shape to emit; matcher is empty (all
+      # tools) via add_event_entry_file. The 60s cooldown bounds the cost.
+      if [ "$pt_install" = 1 ]; then
+        add_event_entry_file "$tmp_state" "PostToolUse" "$cmd $(_agmsg_shq "PostToolUse")" "$ww"
+      fi
       ;;
     both)
       local ss="$(_agmsg_shq "$SKILL_DIR/scripts/session-start.sh") $(_agmsg_shq "$type") $(_agmsg_shq "$project")"
@@ -159,6 +271,9 @@ agmsg_delivery_apply_default() {
       add_event_entry_file "$tmp_state" "SessionStart" "$ss" "$ww"
       add_event_entry_file "$tmp_state" "SessionEnd"   "$se" "$ww"
       add_event_entry_file "$tmp_state" "Stop"         "$st" "$ww"
+      if [ "$pt_install" = 1 ]; then
+        add_event_entry_file "$tmp_state" "PostToolUse" "$st $(_agmsg_shq "PostToolUse")" "$ww"
+      fi
       ;;
     off)
       : # already stripped
@@ -170,9 +285,121 @@ agmsg_delivery_apply_default() {
       ;;
   esac
 
+  # Say when mid-turn delivery was WANTED here but not installed, so a silent
+  # absence is not mistaken for "it's on" (#1003; same "silent = can't tell
+  # waiting from broken" hazard #1001 names). Only meaningful for turn/both, and
+  # only when the type opted in (pt_output) but the version gate said no.
+  if [ -n "$pt_output" ] && [ "$pt_install" != 1 ]; then
+    case "$mode" in
+      turn|both)
+        echo "  ~ mid-turn delivery (PostToolUse) not installed: could not confirm the '$pt_cli' CLI is at or above ${pt_min:-?}. Stop-hook delivery is still active."
+        ;;
+    esac
+  fi
+
   prune_empty_hooks_file "$tmp_state"
 
-  mv "$tmp_state" "$hooks_file"
+  _agmsg_hooks_file_finish_write "$hooks_file" "$tmp_state" "$mode" "$type" "$project"
+}
+
+# Replaces <path> with <tmp>'s content, but only when <path> already exists
+# AND the content actually differs (#1429: a hooks_file that is git-tracked
+# and shared -- e.g. a team's own .codex/hooks.json -- must not get a
+# permanent diff, a lost chmod-a-w protection, and a changed hash from a
+# `set` call that changes nothing). <path> not existing yet is the plain
+# first-ever write, unchanged from before this existed: no content to
+# compare against and no existing format or permission mode to preserve.
+#
+# When <path> DOES exist: compared by JSON CONTENT, order-independent on
+# object keys (_agmsg_json_content_equal, hooks-json.sh -- sqlite's
+# json_tree(), not raw bytes and not plain json()). <path> may be
+# hand-formatted in a way this codebase never writes -- different
+# whitespace, a different indent, or its object keys in a different order
+# (e.g. run through `jq -S`) -- and still hold the exact same registration.
+# A byte comparison would call that "different" and trigger one spurious
+# rewrite even though nothing agmsg owns actually changed (review round 1
+# finding, on a version of this fix that reindented <tmp> to <path>'s
+# detected indentation and then compared bytes). Plain json() is not enough
+# either: it renders compactly but does NOT reorder object keys, so
+# `json('{"a":1,"b":2}')` and `json('{"b":2,"a":1}')` still compare unequal
+# (review round 2 finding). _agmsg_json_content_equal's own header explains
+# why json_tree's fullkey ordering fixes this while still treating array
+# element order as significant.
+#
+# <tmp> is reformatted to match <path>'s own detected indentation
+# (_agmsg_json_detect_indent / _agmsg_json_reindent -- a no-op when no
+# indent is detected, e.g. <path> is itself already compact) ONLY once a
+# real content change is confirmed -- formatting an unwritable, unchanged
+# <tmp> just to throw it away is wasted work.
+#
+# A genuine content change on a <path> with no owner write bit -- OR one
+# whose current permission mode this process cannot even read -- refuses
+# loudly (same #1392 recovery message a failed mkdir/mv already uses)
+# rather than silently overwriting a file a human protected on purpose, or
+# writing through it and only THEN discovering the original mode can't be
+# restored (review round 2 finding: reading the mode was "best effort," so a
+# failed read silently produced a written file at the wrong -- mktemp's --
+# mode). On a real, permitted replace, <path>'s own permission mode is
+# restored afterward; if that chmod itself fails, this reports it loudly and
+# fails rather than leaving the file at the wrong mode with exit 0 (same
+# review finding: `chmod ... || true` used to swallow this outright).
+_agmsg_hooks_file_finish_write() {
+  local path="$1" tmp="$2" mode="$3" type="$4" project="$5"
+  # Same reasoning as the mkdir -p guard above (#1392): a refused rename is
+  # the more common failure shape in practice (the directory usually already
+  # exists; it is the file WITHIN it a sandbox keeps read-only). Named
+  # explicitly rather than left to `set -e` alone, and the temp file is
+  # cleaned up on this path too -- a caller retrying after fixing
+  # permissions must not trip over a stale mktemp file accumulating in
+  # $TMPDIR.
+  if [ ! -f "$path" ]; then
+    if ! mv "$tmp" "$path"; then
+      rm -f "$tmp"
+      echo "agmsg: could not write $path — delivery for $type was NOT set up." >&2
+      _agmsg_print_delivery_recovery "$mode" "$type" "$project"
+      return 1
+    fi
+    return 0
+  fi
+
+  if _agmsg_json_content_equal "$path" "$tmp"; then
+    rm -f "$tmp"
+    return 0
+  fi
+
+  local indent
+  if indent="$(_agmsg_json_detect_indent "$path")"; then
+    _agmsg_json_reindent "$tmp" "$indent"
+  fi
+
+  if [ ! -w "$path" ]; then
+    rm -f "$tmp"
+    echo "agmsg: $path needs to change for delivery mode '$mode' but is not writable — leaving it untouched rather than overwrite a file that looks intentionally protected (e.g. chmod a-w)." >&2
+    _agmsg_print_delivery_recovery "$mode" "$type" "$project"
+    return 1
+  fi
+
+  local orig_mode
+  orig_mode="$(compat_file_mode "$path" 2>/dev/null)" || orig_mode=""
+  if [ -z "$orig_mode" ]; then
+    rm -f "$tmp"
+    echo "agmsg: could not read $path's current permission mode — leaving it untouched rather than replace it and risk losing that mode." >&2
+    _agmsg_print_delivery_recovery "$mode" "$type" "$project"
+    return 1
+  fi
+
+  if ! mv "$tmp" "$path"; then
+    rm -f "$tmp"
+    echo "agmsg: could not write $path — delivery for $type was NOT set up." >&2
+    _agmsg_print_delivery_recovery "$mode" "$type" "$project"
+    return 1
+  fi
+
+  if ! chmod "$orig_mode" "$path" 2>/dev/null; then
+    echo "agmsg: wrote $path for delivery mode '$mode', but could not restore its original permission mode ($orig_mode) — check its permissions." >&2
+    return 1
+  fi
+  return 0
 }
 
 # Default delivery entry points (Template Method). A type's plug
@@ -202,33 +429,86 @@ agmsg_delivery_status_default() {
   local type="$1" project="$2"
   local hf
   hf=$(resolve_hooks_file "$type" "$project")
-  local has_ss=0 has_st=0
+  local has_ss=0 has_st=0 hf_readable=0
   if [ -f "$hf" ]; then
     local sql_hf
-    sql_hf=$(sql_readfile_path "$hf")
-    has_ss=$(agmsg_sqlite_mem "
-      SELECT EXISTS(
-        SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.SessionStart')) AS s,
-          json_each(json_extract(s.value, '\$.hooks')) AS h
-        WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
-      );" 2>/dev/null || echo 0)
-    has_st=$(agmsg_sqlite_mem "
-      SELECT EXISTS(
-        SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.Stop')) AS s,
-          json_each(json_extract(s.value, '\$.hooks')) AS h
-        WHERE instr(json_extract(h.value, '\$.command'), '$SKILL_NAME') > 0
-      );" 2>/dev/null || echo 0)
+    sql_hf=$(agmsg_sql_readfile_path "$hf")
+    # Checked BEFORE trusting has_ss/has_st below: those two queries default
+    # to 0 on ANY failure (`2>/dev/null || echo 0`), not only "genuinely zero
+    # agmsg entries" -- malformed JSON, a readfile() that can't open the
+    # file, or json_extract() choking on the shape all collapse to the same
+    # 0 a real, deliberate off produces. Without this check a corrupt
+    # settings file would report bare "mode: off", the same silent-deliberate
+    # reading #687 is about, just from a different cause than a missing
+    # file (review).
+    local valid
+    valid=$(agmsg_sqlite_mem "SELECT json_valid(readfile('$sql_hf'));" 2>/dev/null || echo "")
+    if [ "$valid" = "1" ]; then
+      hf_readable=1
+      # #1038: ownership by the absolute install path, not a substring of the
+      # bare skill name — see strip_agmsg_event_file (hooks-json.sh) for why.
+      local skill_dir_sql
+      skill_dir_sql=$(printf '%s' "$SKILL_DIR" | sed "s/'/''/g")
+      has_ss=$(agmsg_sqlite_mem "
+        SELECT EXISTS(
+          SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.SessionStart')) AS s,
+            json_each(json_extract(s.value, '\$.hooks')) AS h
+          WHERE instr(json_extract(h.value, '\$.command'), '$skill_dir_sql') > 0
+        );" 2>/dev/null || echo 0)
+      has_st=$(agmsg_sqlite_mem "
+        SELECT EXISTS(
+          SELECT 1 FROM json_each(json_extract(readfile('$sql_hf'), '\$.hooks.Stop')) AS s,
+            json_each(json_extract(s.value, '\$.hooks')) AS h
+          WHERE instr(json_extract(h.value, '\$.command'), '$skill_dir_sql') > 0
+        );" 2>/dev/null || echo 0)
+    fi
   fi
-  local mode="off"
+  # "off" never claims deliberateness (review, 3rd round): apply_default's
+  # off path only strips agmsg's own hook entries -- it writes no marker
+  # recording that `set off` ran. So a settings file with zero agmsg entries
+  # is byte-for-byte identical whether someone ran `set off` or the project
+  # simply never had agmsg configured. The CLI cannot tell those apart, so
+  # the wording says only what it can observe: hooks are absent, not that
+  # absence was chosen. Same reasoning is why `actas`/`drop` must not treat
+  # this as safe-to-stay-silent either -- see template.md.
+  local mode="off (no agmsg delivery hooks installed for this project)"
   if [ "$has_ss" = "1" ] && [ "$has_st" = "1" ]; then mode="both"
   elif [ "$has_ss" = "1" ]; then mode="monitor"
   elif [ "$has_st" = "1" ]; then mode="turn"
+  elif [ ! -f "$hf" ] || [ "$hf_readable" != "1" ]; then
+    # A settings file that does not exist and one that could not be read or
+    # parsed as JSON both fall through to here with has_ss=has_st=0, but
+    # neither means delivery.sh actually confirmed this project's state:
+    # missing, most often because the caller passed the wrong path; or
+    # unreadable/malformed, a corrupt or hand-edited settings file (#687
+    # review round 1). These used to print the bare word "off" -- same as a
+    # genuinely no-hooks-installed project -- so a reader (or `actas`,
+    # whose own rule is "off means don't start delivery") could not tell
+    # "I don't know" from "there's nothing to start". This is what deceived
+    # a seat during #684 recovery: `mode: off` and `mode: monitor` were both
+    # true, for the same project, because one reader's path resolved and the
+    # other's did not. Distinguishing here, in the FIRST line rather than a
+    # secondary one, is what #687 asks for -- a reader (or a caller only
+    # capturing the first line) sees the difference without reading further.
+    # No consumer matches "mode: off" exactly (re-checked for this string,
+    # review round 3): the only exact-match consumers key on
+    # "monitor"/"both"/"turn", so this string never being exactly "off" is
+    # safe.
+    if [ ! -f "$hf" ]; then
+      if [ -n "$hf" ]; then
+        mode="off (unrecognized: no settings file found at $hf -- this project may not be registered)"
+      else
+        mode="off (unrecognized: could not resolve a settings file for this project/type)"
+      fi
+    else
+      mode="off (unrecognized: settings file at $hf could not be read as valid JSON)"
+    fi
   fi
   echo "mode: $mode"
 
   if [ -f "$hf" ]; then
     local sql_hf count
-    sql_hf=$(sql_readfile_path "$hf")
+    sql_hf=$(agmsg_sql_readfile_path "$hf")
     # readfile() rather than interpolating the file contents into argv —
     # for large settings (#95) the latter hits MAX_ARG_STRLEN on Linux.
     count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hf'), '\$.hooks.SessionStart'));" 2>/dev/null || echo 0)
@@ -241,6 +521,11 @@ agmsg_delivery_status_default() {
     count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hf'), '\$.hooks.Stop'));" 2>/dev/null || echo 0)
     case "$count" in ''|*[!0-9]*) count=0 ;; esac
     echo "  Stop entries:         $count"
+    # The mid-turn PostToolUse entry (#1003) sits next to Stop in turn/both for
+    # types whose manifest opts in; show its count so an operator can see it.
+    count=$(agmsg_sqlite_mem "SELECT json_array_length(json_extract(readfile('$sql_hf'), '\$.hooks.PostToolUse'));" 2>/dev/null || echo 0)
+    case "$count" in ''|*[!0-9]*) count=0 ;; esac
+    echo "  PostToolUse entries:  $count"
   fi
 }
 agmsg_delivery_status() { agmsg_delivery_status_default "$@"; }
@@ -431,14 +716,48 @@ EOF
   # (#188).
   local watch_command
   watch_command="$(printf '%q %q %q %q' "$watch" "$session_id" "$project" "$type")"
+  # AGMSG_CC_MONITOR_KEEP_ALIVE, default OFF: timeout_ms: 1800000 always
+  # stays (the Monitor tool caps every watch there regardless). What differs
+  # is whether re-arming on expiry is UNCONDITIONAL or read off the expiry
+  # notification itself. Claude Code counts the events on its own side and
+  # names that count in the notification -- agmsg never counts it -- so the
+  # default case below is worded as a plain word match on that notification
+  # ("no events" present or not), never as reading a number: the exact
+  # phrasing may drift, and a seat that has to parse a count is a seat this
+  # can break by rewording the notification later.
+  local rearm_note
+  if [ -n "${AGMSG_CC_MONITOR_KEEP_ALIVE:-}" ]; then
+    rearm_note=" This watch expires after at most 30 minutes; when the expiry
+notice arrives, immediately re-arm it by invoking Monitor again with this
+exact command and description — delivery depends on it, since nothing else
+keeps the stream running. Re-arm it silently: no message to the user, no
+\"re-armed\", no acknowledgement, no summary — just invoke Monitor again and
+continue, since announcing it every 30 minutes wastes tokens for no benefit."
+  else
+    rearm_note=" This watch expires after at most 30 minutes.
+If the expiry notification says it delivered no events, do not re-arm it.
+Otherwise (it says it delivered something), re-arm it by invoking Monitor again with this exact command and description.
+Re-arm it silently, when you do: no message to the user, no \"re-armed\", no
+acknowledgement, no summary — just invoke Monitor again and continue, since
+announcing it every 30 minutes wastes tokens for no benefit."
+  fi
   cat <<EOF
 
 AGMSG-DIRECTIVE: For this running session, invoke the Monitor tool now with:
   command: $watch_command
   description: agmsg inbox stream
   persistent: true
+  timeout_ms: 1800000
 
 Pass the command above verbatim — the session_id is already filled in.
+Use Claude Code's generic Monitor tool only. Do not start this command with
+Bash/background/nohup or a shell task. Success is a TaskList entry whose
+description begins with "agmsg inbox stream" (after actas it reads
+"agmsg inbox stream (acting as <name>)") and, once messages arrive, a
+transcript event named to match. The background-task footer is not a
+reliable check either way; use TaskList. If ToolSearch cannot find the
+generic Monitor tool, use turn/manual inbox as a fallback; that is not
+real-time monitor delivery.${rearm_note}
 EOF
 }
 
@@ -479,28 +798,55 @@ $pairs
 EOF
   fi
 
-  # Tear down the project's shared app-server too. It is keyed per project
-  # (codex-app-server.<hash>.{pid,port,version}); turning delivery off means no
-  # bridge needs it, and leaving it running keeps a stale port the next launch
-  # would have to recreate anyway. Only kill the recorded pid when its cmdline
-  # confirms it is our app-server (a recycled pid could be unrelated); drop the
-  # record either way.
-  local project_hash server_pidfile server_pid server_cmd
+  # #1254: tear down every LIVE seat-keyed app-server this project has
+  # recorded (design review point: delivery mode/settings stay per-project;
+  # only this runtime-record cleanup enumerates seats). Uses the same
+  # re-validate-then-stop check codex-bridge-launcher.sh uses when a seat's
+  # own TUI exits -- pid, witness and cmdline are all re-confirmed
+  # immediately before anything is signaled; an indeterminate check leaves
+  # that seat's server running and reports why, it never guesses.
+  local project_hash rec
   project_hash="$(printf '%s' "$project" | agmsg_sha1 2>/dev/null || true)"
   if [ -n "$project_hash" ]; then
-    server_pidfile="$RUN_DIR/codex-app-server.$project_hash.pid"
-    if [ -f "$server_pidfile" ]; then
-      server_pid="$(cat "$server_pidfile" 2>/dev/null || true)"
-      if [ -n "$server_pid" ] && _agmsg_pid_alive_local "$server_pid"; then
-        server_cmd="$(compat_get_cmdline "$server_pid" 2>/dev/null || true)"
-        case "$server_cmd" in
-          *codex*app-server*) kill "$server_pid" 2>/dev/null || true ;;
-        esac
+    if ! command -v _agmsg_codex_seat_record_read >/dev/null 2>&1; then
+      # shellcheck disable=SC1091
+      . "$SCRIPT_DIR/drivers/types/codex/_seat-key.sh"
+    fi
+    for rec in "$RUN_DIR"/codex-app-server.*.record; do
+      [ -f "$rec" ] || continue
+      _agmsg_codex_seat_record_read "$rec" || continue
+      [ "$SEAT_REC_PROJECT" = "$project_hash" ] || continue
+      local rec_seat_key
+      rec_seat_key="${rec#"$RUN_DIR"/codex-app-server.}"
+      rec_seat_key="${rec_seat_key%.record}"
+      ( set +e; _agmsg_codex_seat_record_stop "$RUN_DIR" "$rec_seat_key" ) || true
+    done
+
+    # Legacy project-keyed servers, from an install upgraded across #1254:
+    # NEVER touch a live one -- its seat keeps using it until it exits on its
+    # own (scope point 4). Only remove the record files once the recorded
+    # pid is confirmed dead. An unreadable or malformed pidfile is NOT proof
+    # of that: a failed `cat` must not fold into "empty" and read as dead --
+    # that would strip a LIVE legacy server's records out from under an
+    # install mid-upgrade, exactly the case this is supposed to leave alone.
+    # "Cannot tell" leaves the records in place and says so, same as every
+    # other indeterminate observation in this file.
+    local legacy_pidfile legacy_pid legacy_rc
+    legacy_pidfile="$RUN_DIR/codex-app-server.$project_hash.pid"
+    if [ -f "$legacy_pidfile" ]; then
+      legacy_rc=0
+      legacy_pid="$(cat "$legacy_pidfile" 2>/dev/null)" || legacy_rc=$?
+      case "$legacy_pid" in
+        ''|*[!0-9]*) legacy_rc=1 ;;
+      esac
+      if [ "$legacy_rc" -ne 0 ]; then
+        echo "codex: this project's legacy app-server pidfile could not be read or is malformed -- leaving its records" >&2
+      elif ! _agmsg_pid_alive_local "$legacy_pid"; then
+        rm -f "$RUN_DIR/codex-app-server.$project_hash.pid" \
+              "$RUN_DIR/codex-app-server.$project_hash.port" \
+              "$RUN_DIR/codex-app-server.$project_hash.version" \
+              "$RUN_DIR/codex-app-server.$project_hash.log"
       fi
-      rm -f "$RUN_DIR/codex-app-server.$project_hash.pid" \
-            "$RUN_DIR/codex-app-server.$project_hash.port" \
-            "$RUN_DIR/codex-app-server.$project_hash.version" \
-            "$RUN_DIR/codex-app-server.$project_hash.log"
     fi
   fi
 
@@ -677,13 +1023,63 @@ do_set() {
   esac
 }
 
+# Report which terminal this session resolves to, as three distinguishable
+# answers rather than one hopeful line:
+#
+#   terminal: herdr (pane w1:p1)              resolved, and nameable/peekable
+#   terminal: herdr (cannot identify ...)     under it, but this pane is unknown
+#   terminal: unknown                         the resolver answered for nothing
+#
+# The middle one is the one worth printing separately: it is the state where
+# `name` and `peek` will fail while everything else looks fine, and a status
+# that folded it into either neighbour would be the reason nobody could tell.
+#
+# The session id is optional because delivery.sh is type-generic and each CLI
+# names its own session differently. Without one, PLACEMENT still answers
+# ("which terminal am I under") — that needs no self-id — and the pane is
+# reported as not asked for, not as absent.
+print_terminal_status() {
+  local sid="${1:-}" line name id errf reason
+
+  if [ -z "$sid" ]; then
+    if name="$(agmsg_terminal_resolve_placement "" 2>/dev/null)"; then
+      echo "terminal: $name (pane not resolved — no session id given)"
+    else
+      echo "terminal: unknown"
+    fi
+    return 0
+  fi
+
+  errf="$(mktemp "${TMPDIR:-/tmp}/agmsg-status.XXXXXX")" || errf=/dev/null
+  # resolve_name is fail-closed: present-but-unidentifiable is a non-zero with
+  # the driver's reason on stderr. Keep that reason — it is the whole content
+  # of the middle state.
+  line="$(agmsg_terminal_resolve_name "$sid" 2>"$errf")" || line=""
+  if [ -n "$line" ]; then
+    name="${line%%	*}"
+    id="${line#*	}"
+    echo "terminal: $name (pane $id)"
+  else
+    reason=""
+    if [ "$errf" != /dev/null ] && [ -f "$errf" ]; then
+      reason="$(cat "$errf" 2>/dev/null || true)"
+    fi
+    if name="$(agmsg_terminal_resolve_placement "$sid" 2>/dev/null)"; then
+      echo "terminal: $name (${reason:-cannot identify this pane})"
+    else
+      echo "terminal: unknown${reason:+ ($reason)}"
+    fi
+  fi
+  [ "$errf" = /dev/null ] || rm -f "$errf"
+}
+
 do_status() {
   local TYPE="${1:-}"
   local PROJECT="${2:-}"
-  # Optional: narrows the default runtime status's per-identity watcher
-  # lines to one team (doctor.sh's --team). Empty means unfiltered, same as
-  # every caller before this argument existed.
-  local TEAM="${3:-}"
+  local SESSION_ID="${3:-}"
+  # Optional fourth argument narrows the default runtime status's per-identity
+  # watcher lines to one team (doctor.sh's --team). Empty means unfiltered.
+  local TEAM="${4:-}"
 
   # Mode is derived from the project's settings.local.json — there's no
   # global mode value. When called without <type> <project>, we can't infer
@@ -694,9 +1090,24 @@ do_status() {
   if [ -n "$TYPE" ] && [ -n "$PROJECT" ]; then
     agmsg_delivery_load_plug "$TYPE"
     agmsg_delivery_status "$TYPE" "$PROJECT"
+    case "$TYPE" in
+      claude-code)
+        cat <<'EOF'
+note: status reports configured hooks only. For real-time delivery, Claude Code
+must also have a generic Monitor task running in the current session whose
+description begins with "agmsg inbox stream" (after actas: "agmsg inbox
+stream (acting as <name>)"). Verify with TaskList, not the background-task
+footer — the footer is not a reliable signal either way. A watch.sh started
+as a shell/background/nohup task instead of through the Monitor tool is not
+real-time delivery even while its process stays alive.
+EOF
+        ;;
+    esac
   fi
 
   agmsg_delivery_runtime_status "$TYPE" "$PROJECT" "$TEAM"
+
+  print_terminal_status "$SESSION_ID"
 }
 
 kill_all_watchers() {
@@ -726,20 +1137,18 @@ kill_all_watchers() {
         # our watch.sh. Defends against pid recycling — a stale pidfile
         # could point at an unrelated process that reused the pid.
         cmd=$(compat_get_cmdline "$pid" 2>/dev/null || true)
-        case "$cmd" in
-          *"$SKILL_DIR/scripts/watch.sh"*)
-            # When scoped, skip (and preserve the pidfile of) watchers that don't
-            # match this (project, type) — i.e. other projects, and other types
-            # in the same project.
-            if [ -n "$needle" ]; then
-              case " $cmd " in
-                *"$needle"*) ;;
-                *) continue ;;
-              esac
-            fi
-            kill "$pid" 2>/dev/null && killed=$((killed + 1)) ;;
-          *) ;;  # not our watcher; leave it
-        esac
+        if agmsg_cmdline_names_path "$cmd" "$SKILL_DIR/scripts/watch.sh"; then
+          # When scoped, skip (and preserve the pidfile of) watchers that don't
+          # match this (project, type) — i.e. other projects, and other types
+          # in the same project.
+          if [ -n "$needle" ]; then
+            case " $cmd " in
+              *"$needle"*) ;;
+              *) continue ;;
+            esac
+          fi
+          kill "$pid" 2>/dev/null && killed=$((killed + 1))
+        fi   # otherwise it is not our watcher; leave it
       fi
       rm -f "$f"
     done

@@ -3,7 +3,7 @@
 *[日本語](driver-interface.ja.md)*
 
 **Status:** draft (epic [#51](https://github.com/fujibee/agmsg/issues/51))
-**Scope:** axis A — storage. The common protocol sections also apply to axes B (agent) and C (delivery) but their axis-specific functions are out of scope here.
+**Scope:** axis A — storage, plus the terminal axis (§6). The common protocol sections also apply to axes B (agent) and C (delivery) but their axis-specific functions are out of scope here.
 
 This document defines the contract between agmsg core and a storage driver. It is the authoritative source for what any new driver must implement.
 
@@ -69,63 +69,317 @@ Directives are advisory: the host agent decides whether to surface them to the u
 
 ## 2. Storage driver
 
+The storage axis is **messages only**: the durable message log and its read /
+replay state. The team registry (`teams/<team>/config.json`) and run-state
+(pidfiles, actas locks, ready sentinels) are
+**not** part of this contract — they stay file-based and form a separate axis
+(see [ADR 0003](../adr/0003-storage-axis-driver-abi-and-scope.md)). A storage driver
+must implement the *entire* contract below: "this driver does only messages,
+that one also does teams" is disallowed, because a partial implementation breaks
+the swap-ability the axis exists for.
+
 ### 2.1 Required functions
 
 ```
 storage_check
 storage_describe
 storage_init
-storage_insert_message <team> <from> <to> <body>
-storage_unread <team> <agent> [--limit N]
-storage_mark_read <id>
-storage_mark_read_batch <id> [<id> ...]
-storage_history <team> <agent> [--limit N]
-storage_teams
-storage_team_members <team>
+storage_store_exists
+storage_send <team> <from> <to> <body>
+storage_list_unread <team> <agent> [--limit N]
+storage_mark_read_batch <team> <agent> <id> [<id> ...]
+storage_read_cursor_get <team> <agent>
+storage_read_cursor_consume <team> <agent> <delivery-cursor> [<id> ...]
+storage_watch_tip <team:agent> [<team:agent> ...]
+storage_watch_after <cursor> <team:agent> [<team:agent> ...]
+storage_history <team> [agent] [--limit N]
 storage_export <file>
 storage_import <file>
+storage_compact                # internal; see §2.7
 ```
 
-All functions write structured output (JSONL) to stdout when returning records and follow §1.4 for status. Records always include `id` (UUIDv7 for new writes, opaque string for legacy IDs) and `at` (ISO-8601 UTC).
+Every record carries `id` (UUIDv7 for new writes, an opaque string for legacy
+ids) and `at` (ISO-8601 UTC). `storage_send` prints the new message's `id` on a
+single line. The `watch_*` pair is defined in §2.2.
 
-### 2.2 Event log schema
+`storage_store_exists` answers — by exit code, 0 if a store is already present and
+non-trivially initialized, non-zero otherwise — **without creating one**. A read
+call-site (inbox / history) uses it to say "no messages yet" in a project that has
+never used agmsg, rather than lazily materializing an empty store on a mere read.
+It is the driver, not a fixed `messages.db` file check, that knows where its store
+lives (sqlite's db file, jsonl's `events.jsonl`, a Redis key, …).
 
-Bundled drivers represent state as an append-only event log. Each event is one record with a `type` discriminator:
+`storage_history`'s `<agent>` is optional: given, it returns only messages where
+that agent is the sender or the recipient; omitted (or empty), it returns the
+whole team's messages. Both forms are JSONL `message_sent` records. `--limit N`
+selects the **most recent N** of the matching set; the output is always in
+**time order, oldest→newest** (so a limited query returns the tail of the history,
+still chronological — never newest-first). A driver must honour both this
+selection (recency) and this ordering so the result is identical across backends.
+Read-state is deliberately **not** carried on a history record — it is
+recipient-scoped (§2.3), so a consumer that wants a read/unread marker derives it
+by cross-referencing `storage_list_unread` for the relevant recipient rather than
+from the history record itself.
+
+**stdout framing.** The **control ops** — `storage_check`, `storage_init`,
+`storage_mark_read_batch`, `storage_read_cursor_consume`, `storage_compact` —
+**must** use the §1.4 convention:
+a status name (`ok` / `missing_deps` / `runtime_error` / …) on the last stdout
+line, with the matching exit code. The **record-returning ops** —
+`storage_send`, `storage_list_unread`, `storage_read_cursor_get`,
+`storage_history`, `storage_watch_tip`, `storage_watch_after` — write **data
+only** to stdout (JSONL records, or a bare
+id / cursor token; one record per line) and signal outcome with the **exit code**
+alone: `0` on success, non-zero with a message on **stderr** on failure. They
+never emit a §1.4 status name to stdout, so a status word can never be misread as
+a record. The trailing `cursor` record of `storage_watch_after` is part of that
+data stream (a designated final line), not a status.
+
+`storage_describe` is a **metadata op**, not a control op: it always exits 0 and
+writes only its `key=value` registry metadata to stdout — never a §1.4 status
+name, which a metadata consumer would otherwise misread.
+
+### 2.2 Delivery cursor (watch / replay)
+
+Live delivery (`watch.sh`, `check-inbox.sh`, and `inbox.sh`) resumes from the
+store-owned read frontier instead of re-reading the whole log. Its local
+component is an **opaque, driver-issued cursor** in the driver's global message
+order, persisted per `(team, agent)`. Core reads it with
+`storage_read_cursor_get`, passes it unchanged to `storage_watch_after`, and
+commits a successfully displayed scan with `storage_read_cursor_consume`.
+**Core never parses, compares, or orders cursors.** This lets one contract serve
+sqlite integer positions, Redis stream IDs, and JSONL logical ordinals.
+
+The cursor is opaque to core but constrained for transport: it must be a
+**single-line, whitespace-free, printable token** that survives being written to
+a run-dir file and passed back as one `argv` argument to the sourced driver.
+Native positions that already satisfy this (a sqlite integer `seq`, a Redis
+stream id) are used as-is; a driver whose native position carries unsafe
+characters (e.g. a JSONL byte offset bundled with metadata) must encode it
+(base64url or similar) into a single safe token.
+
+- `storage_watch_tip <pairs...>` — print the cursor for "now" (the current tip of
+  the global order) as a single bare line.
+- `storage_watch_after <cursor> <pairs...>` — print, as JSONL and in delivery
+  order, every `message_sent` after `<cursor>` addressed to one of the
+  subscription pairs; then print a final cursor record
+  `{"type":"cursor","cursor":"<opaque>"}` as the last line. That trailing cursor
+  is the **global tip the driver can safely resume from at call time** (the same
+  notion as `storage_watch_tip`) — *not* the cursor of the last matching message.
+  It is always emitted, and advances even when zero subscription messages fell in
+  the range, so a watcher behind heavy off-subscription traffic does not re-scan
+  the same span on every poll. Poll-once: it returns what is currently available
+  and exits — core loops on its own interval; a streaming backend may implement
+  it as one non-blocking drain.
+
+- `storage_read_cursor_get <team> <agent>` — print the local-position component
+  for the pair, defaulting to the driver's zero cursor.
+- `storage_read_cursor_consume <team> <agent> <cursor> [ids...]` — atomically
+  record the exact displayed IDs, then max-merge the pair's local frontier only
+  through the contiguous covered prefix ending no later than `<cursor>`. A
+  missing unread message is a hard gap: a later exact read is retained as an
+  exception and MUST NOT move the frontier across that gap.
+
+The same pair cursor is shared by inbox and monitor delivery and survives
+session termination. A successful empty scan may advance across
+off-subscription traffic. A crash before consume re-delivers; a crash after the
+atomic consume does not. A one-time driver migration treats pre-cursor backlog
+as consumed to avoid a full-history monitor storm; new stores start at zero.
+
+Each `<pair>` is `<team>:<agent>`. Team and agent names cannot contain `:` (the
+name rules enforce this); a driver may additionally reject a pair it cannot split
+unambiguously.
+
+### 2.3 Event log schema
+
+The bundled drivers represent state as an append-only event log. Each event is
+one record with a `type` discriminator — and only these two types live in the
+storage axis (team membership does not; see the §2 intro):
 
 ```jsonl
-{"type":"message_sent","id":"0192...","team":"agsuite","from":"aggie-cc","to":"aggie-co","body":"...","at":"2026-05-30T19:00:00Z"}
-{"type":"message_read","id":"0192...","msg_id":"0192...","agent":"aggie-co","at":"2026-05-30T19:05:00Z"}
-{"type":"team_joined","id":"0192...","team":"agsuite","agent":"alice","agent_type":"claude-code","project":"/path","at":"..."}
-{"type":"team_left","id":"0192...","team":"agsuite","agent":"alice","at":"..."}
+{"type":"message_sent","id":"0192...","team":"agsuite","from":"alice","to":"bob","body":"...","at":"2026-05-30T19:00:00Z"}
+{"type":"message_read","id":"0192...","msg_id":"0192...","team":"agsuite","agent":"bob","at":"2026-05-30T19:05:00Z"}
 ```
 
-Drivers project these events to answer queries. `storage_unread` returns `message_sent` events whose `id` has no corresponding `message_read` for the requesting agent.
+`storage_list_unread <team> <agent>` returns the `message_sent` events addressed
+to `<agent>` in `<team>` that are not covered by the pair's contiguous read
+frontier or an exact `message_read` exception. Read-marking is
+**recipient-scoped**: a `message_read` names the `(team, agent)` that read the
+message, so marking one recipient's copy never affects another's, and re-marking
+an already-read id is **idempotent**. The legacy mutable `messages.read_at`
+field is compatibility/audit input only; new read progress never mutates it.
 
-### 2.3 Legacy compatibility (sqlite only)
+**Schema version.** This is **event-log schema v1**. The two event types above
+and their fields are the v1 contract. Forward compatibility is a hard rule, not a
+courtesy: a projection **must ignore event `type`s it does not recognize and
+object fields it does not recognize**. That is the only "version marker" v1 needs
+— a later revision may add new optional fields or new event types without a
+breaking bump, and a v1 reader stays correct (it skips what it cannot interpret
+rather than failing). `export` emits the raw event stream in `seq` order; a v1
+`import` accepts the record types it knows and is free to drop ones it does not.
+A change that removes or repurposes an existing field is the only thing that
+requires a new major schema version.
 
-The bundled sqlite driver reads two sources for `storage_unread` and `storage_history`:
+### 2.4 Legacy compatibility (sqlite only)
 
-1. The legacy `messages` table (rows where `read=0`) for installations that predate the event log refactor
-2. The new event log tables for everything written after the refactor
+The bundled sqlite driver reads two sources for `storage_list_unread` and
+`storage_history`:
 
-Writes only target the event log. There is no automated migration; legacy rows stay where they are and remain queryable indefinitely.
+1. the legacy `messages` table (rows where `read_at IS NULL`) for installs that
+   predate the event log, and
+2. the event-log tables for everything written after.
 
-### 2.4 Identifiers
+Writes target the event log. There is no automated migration; legacy rows stay
+queryable indefinitely. Legacy integer ids are passed through as decimal strings
+(opaque, per §2.5).
 
-All IDs generated by drivers must be **UUIDv7** strings. The interface treats IDs as opaque, so drivers reading legacy data (integer autoincrement IDs in sqlite) may pass them through as decimal strings.
+**Known gap — consumers still coupled to the sqlite driver's own schema.**
+`rename.sh`/`rename-team.sh` (rewriting a renamed identity across historical
+messages) and `api.sh`'s `get teams <team> messages` (which needs
+`--before-id` pagination the contract does not expose) currently read/write
+the sqlite driver's `messages`/`events` tables directly rather than through a
+`storage_*` function, so they only work correctly when sqlite is the active
+driver. See [ADR 0003](../adr/0003-storage-axis-driver-abi-and-scope.md)'s
+consequences for the tracked follow-up (a rename-across-history op, and a
+paginated history op).
 
-UUIDv7 is generated within the driver (e.g. via `python -c "..."`, `uuidgen` on platforms that support v7, or a shell implementation). Drivers must not depend on a counter file.
+### 2.5 Identifiers
 
-### 2.5 Concurrency
+IDs that drivers generate for new writes are **UUIDv7** strings. The interface
+treats every id as opaque, so a driver reading legacy data (sqlite autoincrement
+ints) passes them through as decimal strings. UUIDv7 is generated inside the
+driver (`python -c "..."`, a `uuidgen` that supports v7, or a shell
+implementation); drivers must not depend on a counter file. The delivery cursor
+(§2.2) is a **separate** opaque token from message ids — a driver may build it
+from ids, byte offsets, or stream positions.
 
-Drivers are responsible for the concurrency model of their backing store:
+### 2.6 Concurrency
 
-- The sqlite driver relies on SQLite's WAL mode.
-- The `jsonl-duckdb` driver must use a lockfile around mark-read sequences and around `convert`/`export`/`import`. Single-message appends may rely on POSIX append atomicity for writes ≤ `PIPE_BUF` bytes.
+Drivers own the concurrency model of their backing store:
 
-### 2.6 Compaction
+- the sqlite driver relies on SQLite's WAL mode;
+- a `jsonl` / `duckdb` driver uses a lockfile around mark-read sequences and
+  around `compact` / `export` / `import`; single appends may rely on POSIX append
+  atomicity for writes ≤ `PIPE_BUF` bytes.
 
-The event log grows unbounded. Drivers must implement an internal `storage_compact` function that collapses redundant events (e.g. coalescing `message_read` markers, dropping events for deleted teams). v1 exposes this only as an internal command; a user-facing CLI may follow.
+### 2.7 Compaction
+
+The event log grows unbounded (append-only), so every record-replaying driver —
+and especially a `jsonl` driver that re-reads the whole file per query — needs a
+way to bound it. Drivers implement an internal `storage_compact` that collapses
+redundant events. v1 exposes this only internally; a user-facing CLI may follow.
+
+`storage_compact` is the load-bearing primitive that keeps a log-based backend in
+its fast band, so its behaviour is **contractual**, not best-effort. A conforming
+`storage_compact` must satisfy all of:
+
+1. **Idempotent** — `compact` then `compact` again leaves the store identical to a
+   single `compact`. Running it repeatedly is always safe.
+2. **State-preserving (observable equivalence)** — every contract read
+   (`storage_list_unread`, `storage_history`, and the projected state an `export`
+   re-imports to) returns the **same result** before and after a `compact`. Only
+   the physical footprint (event count / bytes) shrinks; no visible message,
+   read-state, or ordering changes.
+3. **Read-coalescing** — redundant `message_read` markers for the same
+   `(team, agent, msg_id)` collapse to one. This is the primary size win and the
+   minimum a driver must do. (`storage_mark_read_batch` is itself write-idempotent,
+   so such duplicates do not arise in single-writer use; they come from a racing
+   writer or a merged `import`, and compaction is the backstop that cleans them up.)
+4. **Monotonic** — `compact` never increases the stored event count.
+5. **Cursor-safe (never skip)** — `compact` must **not invalidate a delivery
+   cursor (§2.2) already handed out**. A cursor issued before a `compact` must,
+   when replayed after it, still deliver every `message_sent` that falls after it
+   — none may be skipped. A driver whose physical cursor would be broken by
+   compaction (e.g. a `jsonl` byte offset invalidated by a log rewrite) must use a
+   **logical, compaction-stable cursor** so that, in the worst case, a stale
+   cursor **degrades to at-least-once re-delivery and never to a dropped
+   message**. The bundled sqlite driver gets this for free: it never deletes or
+   renumbers `message_sent` rows, and it issues cursors from a monotonic
+   high-water (`sqlite_sequence`) that a `DELETE`-based compaction cannot move
+   backwards.
+
+Compaction must never touch `message_sent` records; it operates only on the
+redundant read-state markers layered over them.
+
+### 2.8 Optional Stage-1 remote synchronization extension
+
+A driver that can make remote reconciliation atomic with its local message log
+may advertise `capabilities=stage1-sync` from `storage_describe` and implement:
+
+```text
+storage_sync_prepare_push <local-team> <server-instance-id> <remote-team-id> <protocol-version> <limit>
+storage_sync_reconcile_push <local-team> <server-instance-id> <remote-team-id> <protocol-version>
+storage_sync_apply_pull <local-team> <server-instance-id> <remote-team-id> <protocol-version>
+storage_sync_reprocess <local-team> <server-instance-id> <remote-team-id> <protocol-version> <limit> [<page-after>] [<scope>]
+```
+
+The extension is optional: a driver without it remains a conforming local-only
+storage driver. Bulk input and output are UTF-8 JSONL on stdin/stdout; only the
+non-secret binding identifiers and limits above may use argv. The binding key
+is `(server_instance_id, remote_team_id, protocol_version)`, and every local
+position is additionally paired with the driver's persistent generation.
+The bundled SQLite and JSONL drivers advertise this capability. JSONL uses a
+locked snapshot through EOF plus one fsynced append record per transition; its
+sync local position is a byte offset paired with the file generation, not its
+separate ordinal delivery cursor.
+
+Prepare publishes a wire ID and complete canonical envelope together in one
+durable transaction before emitting it and is re-entrant by local position.
+Private randomized sealing attempts that fail before publication are abandoned;
+recovery never re-encrypts a published wire ID. Reconcile atomically records complete
+server acknowledgements and advances only an acknowledged contiguous local
+prefix. Apply-pull atomically quarantines unchanged envelopes, reconciles mapped
+echoes or imports unmapped wire IDs once, and advances the transport cursor only
+after durable local outcomes. Transport, decrypt/import, and read progress are
+independent. Reprocess emits blocking quarantine records for explicit policy/key
+reevaluation without rewinding transport. `<scope>` narrows which quarantine
+statuses are eligible; omitted or empty, it is every status a caller may
+recover with new key material (unchanged since before this argument existed).
+`malformed` narrows it to rows a receiver failed to parse, not a cipher or
+policy outcome -- the set a newer parser alone can revisit. A driver refuses
+an unrecognized scope value rather than treating it as the default. It uses
+the Stage-1 specification's stable
+`(server_seq,wire_id)` keyset page and mandatory `sync_reprocess_page` trailer,
+so one explicit engine invocation reaches every candidate without an early
+permanent failure starving later records. The complete framing, record schemas,
+crash boundaries, and future reserved operation names are defined by
+[Stage-1 synchronization specification](ref/stage-1-remote-sync.md).
+
+A driver may additionally advertise `stage1-resync` and implement the explicit
+operator recovery contract from the
+[retention-gap resynchronization specification](ref/retention-gap-resynchronization.md):
+
+```text
+storage_sync_resync_status <local-team> <server-instance-id> <remote-team-id> <protocol-version> <accepted-floor>
+storage_sync_resync <local-team> <server-instance-id> <remote-team-id> <protocol-version>
+```
+
+Status is a strictly read-only cursor/audit lookup; it cannot reserve or seal a
+message. Resync atomically records an authenticated, operator-accepted retention
+gap and advances only the transport cursor. Together they make result-loss
+retry idempotent without exposing driver storage internals. They never make
+HTTP 410 an automatic polling recovery and never delete local messages or
+independent state layers. The retention-gap specification pins their exact strict JSONL status, input,
+audit, and result objects, including canonical sequence arithmetic and
+duplicate/unknown-field rejection.
+
+The independent Stage-2 extension from the
+[read-state synchronization specification](ref/read-state-synchronization.md) is advertised as
+`capabilities=stage1-sync,stage2-read-state` and adds:
+
+```text
+storage_sync_prepare_read_state <local-team> <server-instance-id> <remote-team-id> <protocol-version>
+storage_sync_apply_read_state <local-team> <server-instance-id> <remote-team-id> <protocol-version>
+```
+
+Prepare exports a safe
+contiguous remote `server_seq` frontier plus out-of-order exact `wire_id` reads;
+apply max-merges the frontier and set-unions exact reads. Local-only exact reads
+are promoted from stable local ID to wire ID in the same transaction that
+publishes or reconciles the mapping. Neither operation may change transport or
+decrypt/import progress. Exact remote state is bounded and paginated, and may
+be garbage-collected only after a durable mapping proves that its own sequence
+is covered by the merged remote frontier.
 
 ## 3. CLI mapping
 
@@ -158,3 +412,161 @@ Active driver per axis is recorded in `~/.agents/agmsg/config.json`:
 - **Per-project active driver override** — v1 is machine-wide; future enhancement.
 - **Subcommand + JSONL-pipe driver protocol** (language-independent drivers) — deferred until a non-bash driver is actually wanted.
 - **Cross-machine storage drivers** (postgres, s3-jsonl) — not blocked by this spec; can be added under the same protocol when needed.
+
+## 6. Terminal driver
+
+The terminal axis abstracts the pane, window, or process a team member's
+host-agent CLI runs under — the placement that lets another member, or a
+person, find it, read its visible output, or type into it. It is orthogonal
+to storage/agent/delivery: terminal identifies *where* a member's process
+lives, not how its messages are stored, how its runtime differs, or how it
+is notified of new mail. See [`ARCHITECTURE.md`](../../ARCHITECTURE.md) for
+how the axis fits alongside the other three.
+
+### 6.1 Driver location and manifest
+
+Bundled terminal drivers live at `scripts/drivers/terminals/<name>/`,
+mirroring the `types` (agent) axis layout: `terminal.conf` (read-only
+key=value manifest, never sourced) plus `ops.sh` (sourced bash exposing
+`terminal_*` functions — the axis prefix from §1.2). Shipped drivers:
+`herdr`, `tmux`, `plain`, `orca`.
+
+`terminal.conf` fields:
+
+| Field | Meaning |
+|---|---|
+| `name` | Driver name |
+| `priority` | Lower numeric value is tried first during self-detection (§6.3) |
+| `backend` | One-line human description of what is being addressed |
+| `capabilities` | Space-separated list of operations this driver advertises as functional |
+
+Example (`tmux/terminal.conf`):
+
+```
+name=tmux
+priority=20
+backend=tmux pane/window
+capabilities=spawn despawn peek poke where arrange name
+```
+
+### 6.2 Required and optional functions
+
+Beyond the common `<axis>_check` / `<axis>_describe` pair (§1.3, spelled
+`terminal_check` / `terminal_describe` here), every terminal driver's
+`ops.sh` implements:
+
+| Function | Purpose |
+|---|---|
+| `terminal_detect <session_id>` | record op: prints this session's own terminal id and exits 0 **iff** the caller is running under this terminal right now; exits non-zero (no stdout) otherwise |
+| `terminal_spawn <name> <project> <target> <boot...>` | record op: creates a pane/window, launches `boot`, prints the new addressable id |
+| `terminal_despawn <id>` | control op: closes the pane/window named by `id` |
+| `terminal_peek <id> [--lines N]` | record op: prints the pane's visible text verbatim (never parsed) |
+| `terminal_poke <id> <text>` | control op: types `text` into the pane and submits it |
+| `terminal_pane_state <id>` | read op: `gone` / `present` / `unknown` for `id` |
+| `terminal_where <id>` | read op: the id's container (e.g. a tmux window, a herdr tab) |
+| `terminal_arrange <source-id> <intent> <target-id>` | control op: place `source` below/right of `target`, or swap them |
+| `terminal_name <id> <team> <name> [mode]` | control op: label the pane and set the key the terminal itself uses to address the member; idempotent |
+
+Beyond those, the registry (`_AGMSG_TERMINAL_OPTIONAL` in
+`scripts/lib/terminal-registry.sh`) recognizes fifteen further, optional
+functions. A driver may implement any subset; an unimplemented one is
+simply absent from that driver's `ops.sh`.
+
+| Function | Purpose |
+|---|---|
+| `terminal_capability <capability> [id]` | narrow the manifest's advertised `capabilities` to what this one `id` can actually do: `0` supported / `1` unsupported / `2` unknown — never wider than the manifest |
+| `terminal_team_observe <id>` | read back the activity/label/key/title facts one pane carries; `self-write.sh` uses it to verify or repair its own naming, `team-status.sh` uses it read-only for display, and `spawn.sh` uses it to read back the key it just wrote rather than trusting the write's own exit status |
+| `terminal_team_input_ready <id> <expected>` | confirm the pane's foreground process is actually `<expected>` (not, say, a bare shell prompt); `self-write.sh`'s self-repair gates a rename attempt on this before typing into the pane |
+| `terminal_find_by_label <label>` | search every reachable pane for the one(s) carrying agmsg label `<label>`, printing their ids |
+| `terminal_label_of <id>` | read back the agmsg label carried by one specific pane — used both as `find_by_label`'s confirming re-check through a second, narrower query, and independently by `self-name.sh`'s fast path to corroborate that the pane the environment resolved still carries this seat's own label before trusting it |
+| `terminal_id_ok <id>` | validate that a string has the *shape* of an id this driver could have produced, without asking whether a pane with it still exists |
+| `terminal_pane_process_observe <id>` | print candidate pids for the process(es) running in the pane — tmux prints the single `pane_pid`; herdr prints a deduplicated set (shell pid, foreground process-group id, and each foreground process), since more than one can be live at once — for `self-proof.sh` to cross-check against the owner process's own ancestry walk |
+| `terminal_enumerate_panes` | list every pane this driver can see across every reachable server/session, one line per pane, naming (not dropping) any server it could not read |
+| `terminal_fence <id> [<seat-pid>]` | print an (instance, reuse-sensitive anchor) pair a caller can compare across two reads to tell whether `id` still names the same underlying session — herdr: socket + herdr's own `terminal_id`; tmux: socket + `pane_pid`; plain: emulator + tty/pid/start-time (needs the caller-supplied `<seat-pid>`) — `self-write.sh`'s own verification is the shipped caller |
+| `terminal_pane_focused <id>` | prints `yes`/`no` for whether `id` currently holds real OS-level input focus, or fails (nothing printed) when the driver cannot decide — herdr only (#1384); `scripts/lib/safe-poke.sh`'s abandoned-draft recovery uses it to tell "someone is typing right now" apart from "a draft was left behind and nobody is watching" |
+| `terminal_input_clear <id>` | best-effort empties `id`'s input box without submitting anything — herdr only (#1384); `safe-poke.sh` calls it only after confirming `id` is unfocused, right before typing past an abandoned draft |
+| `terminal_input_type <id> <text>` | types `text` into `id`'s input box WITHOUT submitting (unlike `terminal_poke`) — herdr only (#1384); `safe-poke.sh` uses it both to retype a saved draft after clearing and to put a draft back unchanged when a recovery attempt must abort |
+| `terminal_expected_label <team> <agent>` | reports the terminal identity value `terminal_name` writes for this registration, or a named `n/a:` / `unknown:` result when it has no such value or cannot derive it |
+| `terminal_instance_for_ref <ref>` | resolves a canonical ref to `<instance><TAB><normalized-pane>`, `n/a:bare`, or `unknown:<reason>` without guessing an instance outside the driver's own rules |
+| `terminal_id_split <id>` | splits a driver id into `<instance><TAB><pane>`; used by locator composition/parsing and collision detection so each driver owns its id grammar |
+
+`plain` implements `terminal_capability`; `tmux` and `herdr` do not (their
+manifest ceiling holds uniformly for every instance of theirs). `plain`'s
+manifest lists `peek poke` because *some* plain placements can reach them
+(through a recognized terminal emulator's own adapter — the shipped
+implementation calls out to `osascript` on macOS), but a placement with no
+known emulator/tty narrows both to `unsupported` for that one instance
+before either operation is attempted, and each operation's own
+`terminal_peek` / `terminal_poke` consults it internally.
+
+`terminal_id_split <id>` is a structural optional op implemented by all four
+shipped drivers. It splits a placement id into its structural parts (e.g.
+tmux's server socket and its bare pane/window id) — each driver holds its own
+id grammar once, here. The registry calls it through its own wrapper
+(`_agmsg_terminal_id_split <kind> <id>`, loading the named kind's driver in
+a subshell when it is not the one already loaded) wherever code outside the
+driver — collision detection (`placement-collisions.sh`, telling two
+different-looking ids that actually name the same pane apart from two that
+genuinely differ) and locator compose/parse — needs the same split without
+hard-coding any one driver's grammar.
+
+### 6.3 Identification and placement
+
+A terminal id is driver-specific; the placement reference every caller
+outside the driver actually uses is `<terminal-name>:<id>` (e.g.
+`tmux:/path/to/socket:%3`, `herdr:<socket>:<pane>`, `plain:<emulator>:<tty>`,
+`orca:<handle>`, or the unaddressable `plain:-`). A locator may additionally
+qualify an id with the driver's instance (e.g. `orca:local:<handle>`); Orca
+has one local runtime, so its bare and `local:` forms identify the same handle.
+
+Which driver a session is running under is not configured, it is detected.
+Every candidate's `ops.sh` is sourced in its own subshell for the probe, so
+one candidate's `terminal_*` definitions never leak into the next attempt,
+and only the eventually-chosen driver is sourced into the caller. There are
+**two different resolvers, for two different questions**, both in
+`scripts/lib/terminal-registry.sh`, and they do not use the same rule:
+
+- **`agmsg_terminal_resolve_placement`** (`spawn.sh`: which terminal should
+  a brand-new pane be created under?) needs only *presence*, not an id — the
+  pane it will address is the one `terminal_spawn` is about to create, not
+  the caller's own. Candidates are tried in ascending `priority` order
+  (lower first); the **first** one whose `terminal_detect` exits 0 at all
+  wins, whether or not it produced an id.
+- **`agmsg_terminal_resolve_name`** (`terminal_name`, and so `SessionStart`
+  / `join.sh` / actas: which terminal, and which id, names *this session's
+  own* pane?) tries **every** candidate, not just the first present one,
+  because a candidate can be present without being able to produce a
+  nameable id: herdr's presence is `HERDR_ENV=1` alone, and it produces an
+  id straight from the environment when `HERDR_PANE_ID` is set and
+  well-formed — but if `HERDR_PANE_ID` is absent or malformed *and* the
+  session-id fallback (a live `agent list` lookup) cannot resolve this
+  session either, herdr is present-but-unresolved rather than absent, and a
+  genuinely-live tmux underneath still gets to win. A candidate that
+  **produces an id** wins immediately, even if a
+  higher-priority candidate was present earlier but produced none. A
+  candidate that is present but produces no id is remembered and the search
+  continues. Once every candidate has been tried: if *any* non-`plain`
+  candidate was present-but-unresolved, resolution **fails loudly** with
+  every such reason (never silently falls back to `plain` and masks a
+  broken herdr/tmux); only when nothing was present-but-unresolved does a
+  matched `plain` (the addressless `-` sentinel) win.
+
+`plain` (`priority=100`) is the lowest-priority, last-tried candidate in
+both resolvers, and the only one guaranteed to match when nothing else does
+— an OS terminal window opened without any addressable multiplexer.
+
+### 6.4 CLI mapping
+
+| User command | Driver function(s) |
+|---|---|
+| `spawn.sh` | `terminal_spawn`, then `terminal_name` |
+| `despawn.sh` | `terminal_despawn` |
+| `peek.sh` | `terminal_peek` |
+| `poke.sh` | `terminal_peek` (pre-check for a live draft, when the target agent type declares an input-box marker and the terminal is not `plain`), then `terminal_poke` |
+| `where.sh` | `agmsg_terminal_resolve_name` (§6.3); reports the winning driver's `capabilities` |
+| `arrange.sh` | `terminal_arrange` |
+| `join.sh`, `session-start.sh`, `watch.sh`, actas flows | `terminal_name`, keeping the pane's label and key current on every action |
+
+Driver discovery and trust (bundled drivers are always trusted; externally
+supplied ones opt in) are shared with every other axis — see
+[ADR 0002](../adr/0002-driver-discovery-and-plugin-opt-in.md).
