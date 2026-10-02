@@ -970,8 +970,12 @@ PS1
   # covered in test_watch.bats and #124).
   wait_for_pid_exit "$first"
 
-  kill "$second" 2>/dev/null || true
-  wait 2>/dev/null || true
+  # Do not use an unbounded `wait` after TERM: the pidfile is published just
+  # before the watcher's signal trap is installed, so this test can signal it
+  # during startup. The helper escalates to KILL and confirms process exit.
+  _agmsg_kill_confirmed "$second"
+  wait "$second" 2>/dev/null || true
+  wait "$first" 2>/dev/null || true
 }
 
 # --- Pipe-stdin guard: simulate a curl|bash entry path (#98) ---
