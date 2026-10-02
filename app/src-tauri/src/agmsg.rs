@@ -256,39 +256,66 @@ fn direct_store_path(team: &str) -> Option<PathBuf> {
 
 /// New messages, from the event log and the legacy table together.
 ///
-/// The read rule mirrors `storage_history()` in
-/// `scripts/drivers/storage/sqlite.sh`. `src` breaks ties between a legacy
-/// row and an event-log row carrying the same timestamp, so the two spaces
-/// interleave in one stable order — legacy first, matching the facade.
+/// The read rule mirrors `storage_list_unread()` in
+/// `scripts/drivers/storage/sqlite.sh` (and `storage_history()` for the
+/// ordering). `src` breaks ties between a legacy row and an event-log row
+/// carrying the same timestamp, so the two spaces interleave in one stable
+/// order -- legacy first, matching the facade.
+///
+/// The core writes every message to BOTH tables, the event carrying the
+/// legacy rowid in `events.legacy_id` (#689). A union of the two therefore
+/// lists each message twice, so the legacy half marks a row `linked` when its
+/// event is in the live space and the reader below leaves it out: the event
+/// copy is the one that is emitted. Live space only (`seq > 0`), exactly as in
+/// the core: a legacy row projected for push has an event too, but at a
+/// negative `seq` below every cursor, which the event half can never return --
+/// skipping the legacy row on its account would lose the message.
+///
+/// A linked row is still FETCHED, and both cursors advance past it. Dropping
+/// it in SQL instead would leave `legacy_id` behind it for good, and every
+/// later poll would fetch and discard the same rows again.
 ///
 /// NOT enforced: nothing checks that this stays in step with the shell. The
 /// tests below assert what this returns, not that the facade agrees, so a
-/// change to `storage_history()` will not turn anything red here. Keeping
-/// the two aligned is currently a matter of someone remembering.
+/// change to the core's read will not turn anything red here. Keeping the two
+/// aligned is currently a matter of someone remembering.
 ///
 /// Two cursors because there are two id spaces: `events.seq` and the legacy
 /// `messages.id` autoincrement. They are unrelated counters, both starting
 /// at 1, so a single high-water mark would skip rows in whichever table was
 /// behind.
-const MESSAGES_SINCE_SQL: &str = "\
-    SELECT id, team, from_agent, to_agent, body, at, src, ord FROM (
+///
+/// `linked` is spliced in because the column it reads, `events.legacy_id`, only
+/// exists from core 1.2.0: against an older store naming it fails the whole
+/// statement. See [`read_new_messages`] for what happens then.
+fn messages_since_sql(linked: &str) -> String {
+    format!(
+        "\
+    SELECT id, team, from_agent, to_agent, body, at, src, ord, linked FROM (
       SELECT id AS id, team, from_agent, to_agent, body, at AS at,
-             1 AS src, seq AS ord
+             1 AS src, seq AS ord, 0 AS linked
         FROM events
        WHERE type='message_sent' AND seq > ?1
       UNION ALL
       SELECT CAST(id AS TEXT) AS id, team, from_agent, to_agent, body,
-             created_at AS at, 0 AS src, id AS ord
+             created_at AS at, 0 AS src, id AS ord, {linked} AS linked
         FROM messages
        WHERE id > ?2
     )
-    ORDER BY at ASC, src ASC, ord ASC";
+    ORDER BY at ASC, src ASC, ord ASC"
+    )
+}
+
+/// The `linked` test for a store whose `events` has `legacy_id`.
+const LINKED_TO_A_LIVE_EVENT: &str = "\
+    EXISTS (SELECT 1 FROM events e2
+             WHERE e2.legacy_id = messages.id AND e2.seq > 0)";
 
 /// The same read against a store built before the event log, where `events`
 /// does not exist and the whole query above fails to prepare.
 const MESSAGES_SINCE_LEGACY_ONLY_SQL: &str = "\
     SELECT CAST(id AS TEXT) AS id, team, from_agent, to_agent, body,
-           created_at AS at, 0 AS src, id AS ord
+           created_at AS at, 0 AS src, id AS ord, 0 AS linked
       FROM messages
      WHERE id > ?2
      ORDER BY at ASC, ord ASC";
@@ -302,18 +329,27 @@ struct Cursors {
     legacy_id: i64,
 }
 
-/// Reads rows newer than `cursors` and advances it past them.
+/// Reads rows newer than `cursors`, advances both past them, and returns the
+/// messages among them -- a legacy copy of a message whose event is also
+/// there is advanced past but not returned (see [`messages_since_sql`]).
 ///
-/// A store that predates the event log has no `events` table, and one built
-/// by a current `storage_init` always has both — so the query is attempted
-/// whole and, if `events` is missing, retried against the legacy table
-/// alone. That is the released layout today: this machine's own store has
-/// `messages` with 6,285 rows and no `events` table at all.
+/// The statement is attempted at three levels, each for an older store than
+/// the last:
+///
+/// 1. both tables, with the legacy copies of live events recognised --
+///    needs `events.legacy_id` (core 1.2.0 and later);
+/// 2. both tables with no copy recognised -- a store whose `events` predates
+///    `legacy_id`, which is the layout of the cores that wrote each message
+///    to only one table, so there is nothing to double-count;
+/// 3. the legacy table alone -- a store that predates the event log, with no
+///    `events` table at all. That is the released layout today: this
+///    machine's own store has `messages` with 6,285 rows and no `events`
+///    table at all.
 fn read_new_messages(
     conn: &rusqlite::Connection,
     cursors: &mut Cursors,
 ) -> Result<Vec<Message>, rusqlite::Error> {
-    let run = |sql: &str| -> Result<Vec<(Message, i64, i64)>, rusqlite::Error> {
+    let run = |sql: &str| -> Result<Vec<(Message, i64, i64, bool)>, rusqlite::Error> {
         let mut stmt = conn.prepare(sql)?;
         let rows = stmt.query_map(rusqlite::params![cursors.seq, cursors.legacy_id], |r| {
             Ok((
@@ -327,24 +363,30 @@ fn read_new_messages(
                 },
                 r.get::<_, i64>(6)?,
                 r.get::<_, i64>(7)?,
+                r.get::<_, i64>(8)? != 0,
             ))
         })?;
         rows.collect()
     };
 
-    let rows = match run(MESSAGES_SINCE_SQL) {
+    let rows = match run(&messages_since_sql(LINKED_TO_A_LIVE_EVENT)) {
         Ok(rows) => rows,
-        Err(_) => run(MESSAGES_SINCE_LEGACY_ONLY_SQL)?,
+        Err(_) => match run(&messages_since_sql("0")) {
+            Ok(rows) => rows,
+            Err(_) => run(MESSAGES_SINCE_LEGACY_ONLY_SQL)?,
+        },
     };
 
     let mut out = Vec::with_capacity(rows.len());
-    for (msg, src, ord) in rows {
+    for (msg, src, ord, linked) in rows {
         if src == 1 {
             cursors.seq = cursors.seq.max(ord);
         } else {
             cursors.legacy_id = cursors.legacy_id.max(ord);
         }
-        out.push(msg);
+        if !linked {
+            out.push(msg);
+        }
     }
     Ok(out)
 }
@@ -474,6 +516,18 @@ pub struct AgentType {
     /// position `agmsg spawn` uses, so a pane spawned from the app gets the
     /// same extra flags a CLI-driven spawn would.
     pub options: Vec<String>,
+    /// This type's actas-prompt prefix (manifest `cmd_prefix=`), e.g. "$" for
+    /// opencode/codex/gemini/antigravity. None when the manifest omits it,
+    /// which means "/" — the same default scripts/lib/boot-command.sh's
+    /// agmsg_actas_prompt applies (#1007/#346: the frontend used to hardcode
+    /// "/" for every type instead of reading this).
+    pub cmd_prefix: Option<String>,
+    /// A flag whose VALUE must carry the actas prompt, for a CLI that
+    /// rejects it as a bare positional (manifest `prompt_arg=`), e.g.
+    /// opencode's `--prompt` or copilot's `--interactive`. None when the
+    /// prompt is passed positionally (claude-code). Mirrors the prompt half
+    /// of scripts/lib/boot-command.sh's agmsg_role_cli_args.
+    pub prompt_arg: Option<String>,
 }
 
 /// Read one key from a type.conf manifest (read-only key=value data, never
@@ -573,7 +627,9 @@ pub fn agmsg_spawnable_types() -> Result<Vec<AgentType>, String> {
             .unwrap_or_default();
         if !name.is_empty() {
             let options = spawn_options_tokens(&name);
-            types.push(AgentType { name, cli, options });
+            let cmd_prefix = manifest_get(&conf, "cmd_prefix");
+            let prompt_arg = manifest_get(&conf, "prompt_arg");
+            types.push(AgentType { name, cli, options, cmd_prefix, prompt_arg });
         }
     }
     types.sort_by(|a, b| a.name.cmp(&b.name));
@@ -698,6 +754,27 @@ pub struct CoreVersionStatus {
     outdated: bool,
 }
 
+/// The installed agmsg's own VERSION file, trimmed — None if it can't be
+/// read (not installed yet, or the file is empty). Shared by
+/// `agmsg_core_version_status` and `running_core_version` below so there is
+/// exactly one place that reads it.
+fn read_installed_core_version() -> Option<String> {
+    std::fs::read_to_string(agmsg_base().join("VERSION"))
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// The core this app is actually driving right now (installed at
+/// `agmsg_base()`), for display -- as opposed to `pinned_core_version`, the
+/// ref this build happened to bundle at compile time. Falls back to the
+/// pinned version when the installed one can't be read, so the About line
+/// (see `make_menu` in lib.rs) always has something reasonable to show
+/// rather than going blank (#976).
+pub(crate) fn running_core_version() -> String {
+    read_installed_core_version().unwrap_or_else(pinned_core_version)
+}
+
 /// Compares the installed agmsg's VERSION file against the version bundled
 /// into this app build. An existing install doesn't go through agmsg_install
 /// (that only fires when nothing is installed at all), so an installed
@@ -708,10 +785,7 @@ pub struct CoreVersionStatus {
 #[tauri::command]
 pub fn agmsg_core_version_status() -> CoreVersionStatus {
     let pinned = pinned_core_version();
-    let installed = std::fs::read_to_string(agmsg_base().join("VERSION"))
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+    let installed = read_installed_core_version();
 
     let outdated = match (&installed, parse_semver(&pinned)) {
         (Some(v), Some(pinned_v)) => match parse_semver(v) {
@@ -903,6 +977,45 @@ pub fn agmsg_leave(team: String, name: String) -> Result<(), String> {
     run_script("leave.sh", &[&team, &name]).map(|_| ())
 }
 
+/// Rename a whole team (rename-team.sh; repoints messages, cursors and sync
+/// state at the new name).
+#[tauri::command]
+pub fn agmsg_rename_team(old_team: String, new_team: String) -> Result<(), String> {
+    run_script("rename-team.sh", &[&old_team, &new_team]).map(|_| ())
+}
+
+/// Delete a team (team.sh --delete --yes, #1475). Confirmation happens in the
+/// UI before this is called. Refuses (with the reason on stderr, surfaced as
+/// Err by run_script) when members remain, a remote binding is active, or the
+/// team uses the jsonl storage driver.
+#[tauri::command]
+pub fn agmsg_delete_team(team: String) -> Result<(), String> {
+    run_script("team.sh", &[&team, "--delete", "--yes"]).map(|_| ())
+}
+
+/// Delete a team's message history only, keeping the team and its members
+/// (team.sh --purge-messages --yes, #1475). Same refusal/error surfacing as
+/// agmsg_delete_team.
+#[tauri::command]
+pub fn agmsg_purge_team_messages(team: String) -> Result<(), String> {
+    run_script("team.sh", &[&team, "--purge-messages", "--yes"]).map(|_| ())
+}
+
+/// Delete a team even though members remain, removing them all first
+/// (team.sh --delete --force --yes, #1493; --purge-messages stays an
+/// independent flag). Confirmed core CLI shape as of this writing (branch
+/// fix-1493-delete-force, not yet merged pending final review). Only
+/// reachable in the UI after a plain agmsg_delete_team has already failed
+/// with the members-remain refusal.
+#[tauri::command]
+pub fn agmsg_delete_team_force(team: String, purge_messages: bool) -> Result<(), String> {
+    let mut args = vec![team.as_str(), "--delete", "--force", "--yes"];
+    if purge_messages {
+        args.push("--purge-messages");
+    }
+    run_script("team.sh", &args).map(|_| ())
+}
+
 /// The actual delivery mode for (agent_type, project): "monitor", "turn",
 /// "both", or "off". Shells out to `delivery.sh status` — agmsg's own
 /// source of truth (it derives the mode from the project's hooks file,
@@ -1003,7 +1116,10 @@ pub fn start_watcher(app: AppHandle) {
 
 #[cfg(test)]
 mod tests {
-    use super::{agmsg_base, msys_to_native, parse_semver, run_script, to_bash_slashes};
+    use super::{
+        agmsg_base, msys_to_native, parse_semver, pinned_core_version, run_script,
+        running_core_version, to_bash_slashes,
+    };
     use serial_test::serial;
     use std::io::Write;
 
@@ -1183,6 +1299,25 @@ mod tests {
 
     #[test]
     #[serial]
+    fn running_core_version_reads_installed_or_falls_back_to_pinned() {
+        // Before #976, the About line always read the bundled AGMSG_CORE_REF
+        // (pinned_core_version) — the version this build happened to bundle,
+        // not the one actually driving every agmsg operation.
+        let dir = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set("AGMSG_APP_BASE", &dir.path().to_string_lossy());
+
+        // No VERSION file yet: falls back to the bundled ref rather than
+        // going blank.
+        assert_eq!(running_core_version(), pinned_core_version());
+
+        // An installed VERSION file wins over the bundled ref — the number a
+        // user would actually act on.
+        std::fs::write(dir.path().join("VERSION"), "9.9.9\n").unwrap();
+        assert_eq!(running_core_version(), "9.9.9");
+    }
+
+    #[test]
+    #[serial]
     #[cfg(not(target_os = "windows"))]
     fn run_script_returns_stdout_on_success() {
         let _base = fake_base(&[("ok.sh", "echo hello-from-fake")]);
@@ -1279,7 +1414,8 @@ mod tests {
             "CREATE TABLE events (
                seq INTEGER PRIMARY KEY AUTOINCREMENT, type TEXT NOT NULL,
                id TEXT NOT NULL, team TEXT, from_agent TEXT, to_agent TEXT,
-               body TEXT, msg_id TEXT, agent TEXT, at TEXT NOT NULL);
+               body TEXT, msg_id TEXT, agent TEXT, at TEXT NOT NULL,
+               legacy_id INTEGER);
              CREATE TABLE messages (
                id INTEGER PRIMARY KEY AUTOINCREMENT, team TEXT NOT NULL,
                from_agent TEXT NOT NULL, to_agent TEXT NOT NULL, body TEXT NOT NULL,
@@ -1304,6 +1440,30 @@ mod tests {
         }
     }
 
+    /// Writes a message the way the core's `_sqlite_message_sent_sql` does: a
+    /// legacy row, then an event row carrying that rowid in `legacy_id`, in one
+    /// transaction. `event_seq` of `None` is an ordinary live event; `Some(n)`
+    /// places the event at an explicit `seq`, which is how a legacy row
+    /// projected for push looks (a negative one, below every read cursor).
+    fn add_linked(base: &std::path::Path, event_id: &str, at: &str, event_seq: Option<i64>) {
+        let conn = rusqlite::Connection::open(base.join("db/messages.db")).unwrap();
+        conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+        conn.execute(
+            "INSERT INTO messages(team,from_agent,to_agent,body,created_at) \
+             VALUES ('t','leader','worker','written to both tables',?1)",
+            rusqlite::params![at],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events(seq,type,id,team,from_agent,to_agent,body,at,legacy_id) \
+             VALUES (?1,'message_sent',?2,'t','leader','worker','written to both tables',?3, \
+                     last_insert_rowid())",
+            rusqlite::params![event_seq, event_id, at],
+        )
+        .unwrap();
+        conn.execute_batch("COMMIT").unwrap();
+    }
+
     /// Goes red if either read-rule failure comes back. Both were silent:
     /// the query ran, the parse "succeeded" by discarding rows, and the app
     /// showed nothing while reporting no error at all.
@@ -1311,6 +1471,15 @@ mod tests {
     /// - **legacy table only** — the UUID-keyed row is missing.
     /// - **id treated as a number** — the UUID row is the one that
     ///   disappears, because it is the only id that is not numeric.
+    ///
+    /// - **a message in both tables** — the core writes every message to the
+    ///   event log AND the legacy table, the event carrying the legacy rowid
+    ///   in `legacy_id` (#689). Read as two messages, each one showed twice in
+    ///   the room and was injected twice into its pane (#1511). It must come
+    ///   out once, as its event.
+    /// - **a legacy row projected for push** — its event sits at a negative
+    ///   `seq`, below every cursor, so the event can never be returned; the
+    ///   legacy row is then the only copy and must still arrive, once.
     ///
     /// The third failure — opening the wrong file — is a different axis and
     /// is covered by `the_store_path_comes_from_agmsg_not_from_a_guess`.
@@ -1326,6 +1495,10 @@ mod tests {
             &[("019faa2a-48ae-7067-bb7d-ace26fd8a6df", "2026-07-28T10:00:01Z")],
             &["2026-07-28T10:00:00Z"],
         );
+        // Legacy row 2, its event at seq -1: projected for push.
+        add_linked(dir.path(), "019faa2a-0000-7000-8000-00000000000a", "2026-07-28T10:00:02Z", Some(-1));
+        // Legacy row 3 and its live event (seq 2): an ordinary message.
+        add_linked(dir.path(), "019faa2a-0000-7000-8000-00000000000b", "2026-07-28T10:00:03Z", None);
 
         let conn = super::open_ro(&dir.path().join("db/messages.db"))
             .expect("the store must open");
@@ -1335,14 +1508,25 @@ mod tests {
         let ids: Vec<&str> = got.iter().map(|m| m.id.as_str()).collect();
         assert_eq!(
             ids,
-            vec!["1", "019faa2a-48ae-7067-bb7d-ace26fd8a6df"],
-            "both rows must arrive, oldest first — a UUID id means the event \
-             log is being read, and losing it is how this broke before"
+            vec![
+                "1",
+                "019faa2a-48ae-7067-bb7d-ace26fd8a6df",
+                "2",
+                "019faa2a-0000-7000-8000-00000000000b",
+            ],
+            "each message arrives once, oldest first — a UUID id means the event \
+             log is being read and losing it is how this broke before; the \
+             live pair is its event only (its legacy copy, row 3, is not a \
+             second message); the projected row 2 is its legacy copy, because \
+             its event can never be returned"
         );
         assert_eq!(got[1].body, "from the event log");
 
         // A second poll returns nothing: both cursors advanced, and a
-        // shared one would have skipped whichever table was behind.
+        // shared one would have skipped whichever table was behind. The
+        // legacy cursor moved past row 3 although that row was not emitted --
+        // were it left behind, every later poll would fetch it again.
+        assert_eq!((cursors.seq, cursors.legacy_id), (2, 3));
         let again = super::read_new_messages(&conn, &mut cursors).expect("read");
         assert!(again.is_empty(), "already-seen rows must not be re-emitted");
     }

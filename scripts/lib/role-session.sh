@@ -137,9 +137,10 @@ agmsg_role_session_load() {
 #                          from the type manifest. Empty when unknown.
 #   project=<project>      the resolved project root
 #   owner=<instance_id>    the actas owner token written by actas-claim
+#   codex_home=<path>      the effective absolute Codex profile directory
 #   updated_at=<iso8601>   best-effort timestamp (empty if date(1) unavailable)
 agmsg_role_session_record() {
-  local team="$1" agent="$2" bare_sid="$3" project="${4:-}" type="${5:-}" owner="${6:-}"
+  local team="$1" agent="$2" bare_sid="$3" project="${4:-}" type="${5:-}" owner="${6:-}" codex_home="${7:-}"
   [ -n "$team" ] && [ -n "$agent" ] && [ -n "$bare_sid" ] || return 0
   local path dir tmp ts named_ref="" named_epoch="" named_at=""
   _agmsg_role_session_path_into "$team" "$agent"
@@ -163,6 +164,7 @@ agmsg_role_session_record() {
     printf 'type=%s\n' "$type"
     printf 'project=%s\n' "$project"
     [ -z "$owner" ] || printf 'owner=%s\n' "$owner"
+    [ -z "$codex_home" ] || printf 'codex_home=%s\n' "$codex_home"
     printf 'updated_at=%s\n' "$ts"
     [ -z "$named_ref" ] || printf 'named_ref=%s\n' "$named_ref"
     [ -z "$named_ref" ] || printf 'named_epoch=%s\n' "$named_epoch"
@@ -221,6 +223,31 @@ agmsg_role_session_mark_named() {
     printf 'named_epoch=%s\n' "$epoch"
     printf 'named_at=%s\n' "$ts"
   } > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
+  mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null
+  return 0
+}
+
+# Drop the naming mark without touching any other field (#1485): a pane taken
+# over from a dead session's record must stop asserting that OLD (team, agent)
+# still holds it, while the role itself (every other line in the file) stays
+# registered exactly as it was. No-op, successfully, when there is no record or
+# no mark -- this is cleanup, never something a caller needs to react to.
+#
+# BY PATH, unlike every other public function here: the one caller (the
+# placement guard's dead-claimant takeover) finds the record from a spawn
+# record's file NAME, and #1114's own comment already covers why team/agent
+# cannot be decoded back out of that name ("__" is legal inside a name). This
+# takes the same role-session PATH the guard already computed by substituting
+# "spawn." for "role-session." in that file name, rather than asking every
+# caller to re-derive team/agent just to hand them back in for re-encoding.
+agmsg_role_session_clear_named_at() {   # <role-session-record-path>
+  local path="$1" dir tmp line
+  [ -n "$path" ] && [ -f "$path" ] || return 0
+  dir="$(_actas_lock_dir)"
+  tmp="$(mktemp "$dir/.role-session.XXXXXX" 2>/dev/null)" || return 0
+  while IFS= read -r line || [ -n "$line" ]; do
+    case "$line" in named_ref=*|named_epoch=*|named_at=*) ;; *) printf '%s\n' "$line" ;; esac
+  done < "$path" > "$tmp" 2>/dev/null || { rm -f "$tmp" 2>/dev/null; return 0; }
   mv -f "$tmp" "$path" 2>/dev/null || rm -f "$tmp" 2>/dev/null
   return 0
 }
