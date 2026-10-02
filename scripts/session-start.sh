@@ -62,7 +62,10 @@ PAIRS=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE" 2>/dev/null || true)
 # A project hook is shared by every Claude Code launch surface that reads the
 # project's settings. Allow a user to opt out of selected surfaces without
 # removing the hook for their other sessions. The list is a comma-separated
-# global config value; matching is exact and case-sensitive.
+# global config value; matching is exact and case-sensitive. Keep running the
+# hook cleanup and type-specific SessionStart behavior; suppress only the
+# Monitor directive below.
+SKIP_MONITOR_DIRECTIVE=0
 if [ "$TYPE" = "claude-code" ] && [ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ]; then
   _skip_entrypoints="$(bash "$SCRIPT_DIR/config.sh" get session_start.skip_entrypoints 2>/dev/null || true)"
   IFS=, read -r -a _skip_entrypoint_values <<< "$_skip_entrypoints"
@@ -70,7 +73,8 @@ if [ "$TYPE" = "claude-code" ] && [ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ]; then
     _skip_entrypoint="${_skip_entrypoint#"${_skip_entrypoint%%[![:space:]]*}"}"
     _skip_entrypoint="${_skip_entrypoint%"${_skip_entrypoint##*[![:space:]]}"}"
     if [ "$_skip_entrypoint" = "$CLAUDE_CODE_ENTRYPOINT" ]; then
-      exit 0
+      SKIP_MONITOR_DIRECTIVE=1
+      break
     fi
   done
 fi
@@ -243,6 +247,13 @@ done
 # above, since the liveness check enumerates the remaining cc-instance.*
 # files. See #62.
 actas_lock_gc_stale >/dev/null 2>&1 || true
+
+# Entry points opted out of Monitor still benefit from stale watcher, instance,
+# and actas-lock cleanup above. Stop before publishing new session state or
+# starting sync; only the Monitor directive is suppressed for this surface.
+if [ "$SKIP_MONITOR_DIRECTIVE" -eq 1 ]; then
+  exit 0
+fi
 
 # --- Record this session's real project root, keyed by the agent process. ---
 # Slash commands resolve the project from $(pwd), which breaks when the user
