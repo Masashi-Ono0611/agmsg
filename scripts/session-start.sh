@@ -248,13 +248,6 @@ done
 # files. See #62.
 actas_lock_gc_stale >/dev/null 2>&1 || true
 
-# Entry points opted out of Monitor still benefit from stale watcher, instance,
-# and actas-lock cleanup above. Stop before publishing new session state or
-# starting sync; only the Monitor directive is suppressed for this surface.
-if [ "$SKIP_MONITOR_DIRECTIVE" -eq 1 ]; then
-  exit 0
-fi
-
 # --- Record this session's real project root, keyed by the agent process. ---
 # Slash commands resolve the project from $(pwd), which breaks when the user
 # cd's into a subdir/worktree (see #92). Persist the authoritative project (our
@@ -281,30 +274,6 @@ for f in "$RUN_DIR"/ready.*; do
   fi
 done
 
-
-# --- Dedup against the previous watcher in this CC instance. ---
-if [ -n "$CC_PID" ]; then
-  STATE="$RUN_DIR/cc-instance.$CC_PID"
-  if [ -f "$STATE" ]; then
-    # Records the previous instance id this CC attached to. Comparing/killing
-    # by instance id (not bare session_id) keeps the prev_pidfile lookup aligned
-    # with watch.sh's pidfile key.
-    prev=$(cat "$STATE" 2>/dev/null || true)
-    if [ -n "$prev" ] && [ "$prev" != "$INSTANCE_ID" ]; then
-      prev_pidfile="$RUN_DIR/watch.$prev.pid"
-      if [ -f "$prev_pidfile" ]; then
-        prev_pid=$(cat "$prev_pidfile" 2>/dev/null || true)
-        if [ -n "$prev_pid" ] && _agmsg_pid_alive_local "$prev_pid"; then
-          kill "$prev_pid" 2>/dev/null || true
-        fi
-      fi
-    fi
-  fi
-  if ! agmsg_write_atomic "$STATE" "$INSTANCE_ID"; then
-    printf 'agmsg: could not publish the complete instance marker: %s\n' "$STATE" >&2
-    exit 1
-  fi
-fi
 
 # --- Start the engine for a connected team that has none (#761, #774). ---
 # A reboot leaves every sync engine dead and nothing restarts one: the five
@@ -351,6 +320,37 @@ if [ -x "$SKILL_DIR/scripts/remote.sh" ] && [ -r "$SKILL_DIR/scripts/lib/sync-au
     set -- $_connected_teams
     IFS="$_old_ifs"
     agmsg_sync_autostart "$SKILL_DIR/scripts/remote.sh" "$@" || true
+  fi
+fi
+
+# Entry points opted out of Monitor still run project-marker maintenance and
+# best-effort connected-team sync recovery above. Stop before watcher-specific
+# state is published or a Monitor directive can be emitted.
+if [ "$SKIP_MONITOR_DIRECTIVE" -eq 1 ]; then
+  exit 0
+fi
+
+# --- Dedup against the previous watcher in this CC instance. ---
+if [ -n "$CC_PID" ]; then
+  STATE="$RUN_DIR/cc-instance.$CC_PID"
+  if [ -f "$STATE" ]; then
+    # Records the previous instance id this CC attached to. Comparing/killing
+    # by instance id (not bare session_id) keeps the prev_pidfile lookup aligned
+    # with watch.sh's pidfile key.
+    prev=$(cat "$STATE" 2>/dev/null || true)
+    if [ -n "$prev" ] && [ "$prev" != "$INSTANCE_ID" ]; then
+      prev_pidfile="$RUN_DIR/watch.$prev.pid"
+      if [ -f "$prev_pidfile" ]; then
+        prev_pid=$(cat "$prev_pidfile" 2>/dev/null || true)
+        if [ -n "$prev_pid" ] && _agmsg_pid_alive_local "$prev_pid"; then
+          kill "$prev_pid" 2>/dev/null || true
+        fi
+      fi
+    fi
+  fi
+  if ! agmsg_write_atomic "$STATE" "$INSTANCE_ID"; then
+    printf 'agmsg: could not publish the complete instance marker: %s\n' "$STATE" >&2
+    exit 1
   fi
 fi
 
