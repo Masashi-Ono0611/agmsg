@@ -66,6 +66,26 @@ teardown() {
   [ "$count_after" -eq 1 ]
 }
 
+@test "ready: a late mark from one launch cannot overwrite another launch's readiness" {
+  # Model launch B marking ready before timed-out launch A reports completion.
+  # Each nonce must have an independent path; the late A mark cannot erase B.
+  bash "$SCRIPTS/ready.sh" mark team alice launch-B
+  bash "$SCRIPTS/ready.sh" mark team alice launch-A
+
+  run bash "$SCRIPTS/ready.sh" check team alice launch-B
+  [ "$status" -eq 0 ]
+  run bash "$SCRIPTS/ready.sh" check team alice launch-A
+  [ "$status" -eq 0 ]
+
+  bash "$SCRIPTS/ready.sh" clear team alice launch-A
+  run bash "$SCRIPTS/ready.sh" check team alice launch-B
+  [ "$status" -eq 0 ]
+
+  bash "$SCRIPTS/ready.sh" clear team alice launch-B
+  run bash "$SCRIPTS/ready.sh" check team alice launch-B
+  [ "$status" -ne 0 ]
+}
+
 @test "ready: rejects unknown actions and malformed argv" {
   run bash "$SCRIPTS/ready.sh" nope team alice
   [ "$status" -ne 0 ]

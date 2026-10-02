@@ -37,14 +37,15 @@ SKILL_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/actas-lock.sh"
 
-READY_PATH="$(agmsg_actas_ready_path "$TEAM" "$AGENT")"
+READY_PATH="$(agmsg_actas_ready_path "$TEAM" "$AGENT" "$NONCE")"
 
 case "$ACTION" in
   mark)
     mkdir -p "$(dirname "$READY_PATH")"
     # Write then rename in the same directory so check never observes a partial
-    # sentinel. Content is the caller-supplied nonce when given (diagnostic +
-    # generation match), else just this process's pid (diagnostic only).
+    # sentinel. Nonce-bearing launches get separate paths so a late completion
+    # from an older timed-out launch cannot overwrite a newer launch's mark.
+    # Without a nonce (manual actas), keep the shared per-role path.
     tmp="$(mktemp "$(dirname "$READY_PATH")/.actas-ready.XXXXXX")"
     trap 'rm -f "$tmp" 2>/dev/null || true' EXIT
     printf '%s\n' "${NONCE:-$$}" > "$tmp"

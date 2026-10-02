@@ -361,15 +361,19 @@ agmsg_ready_path() {
   esac
 }
 
-# One-shot actas-completion sentinel path for (team, agent). Unlike
+# One-shot actas-completion sentinel path for (team, agent[, launch nonce]). Unlike
 # agmsg_ready_path(), this does NOT represent a live watcher: ready.sh marks it
-# once after an agent finishes its actas bootstrap, and spawn consumes it. Keep
-# the prefix disjoint from ready.* so watcher GC never mistakes one protocol for
-# the other. See #338 Gap 2.
+# once after an agent finishes its actas bootstrap, and spawn consumes it. A
+# nonce scopes spawn marks to one launch so a timed-out older agent cannot
+# overwrite a newer launch's readiness. Keep the prefix disjoint from ready.* so
+# watcher GC never mistakes one protocol for the other. See #338 Gap 2.
 agmsg_actas_ready_path() {
-  local team="$1" agent="$2"
+  local team="$1" agent="$2" nonce="${3:-}" suffix=""
   local t a; t="$(_actas_lock_encode "$team")"; a="$(_actas_lock_encode "$agent")"
-  printf '%s/actas-ready.%s__%s' "$(_actas_lock_dir)" "$t" "$a"
+  if [ -n "$nonce" ]; then
+    suffix="__launch_$(_actas_lock_encode "$nonce")"
+  fi
+  printf '%s/actas-ready.%s__%s%s' "$(_actas_lock_dir)" "$t" "$a" "$suffix"
 }
 
 # Placement record path for a spawned (team, agent). `spawn` writes the

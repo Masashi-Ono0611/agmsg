@@ -349,7 +349,7 @@ seed_resumable() {
 }
 
 @test "spawn: grok-build launches the plain grok CLI with the actas prompt" {
-  # grok-build is spawnable and readiness_sentinel=no, so spawn skips the readiness wait.
+  # --no-wait makes this test independent of the project's delivery mode.
   # Delivery is a rule file (no hook), so no folder-trust flag is needed —
   # the launch is the bare `grok "/<cmd> actas <name>"`, like claude-code.
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
@@ -946,7 +946,12 @@ EOF
 @test "spawn: grok-build waits for and consumes the one-shot actas handshake" {
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
 
-  # Simulate the spawned actas template marking the exact exported team/nonce.
+  # Simulate the agent completing its actas template after launch: read the
+  # spawn-exported team/nonce back out of the generated boot script (the same
+  # thing the real template does via $AGMSG_SPAWN_TEAM/$AGMSG_SPAWN_NONCE),
+  # then mark with them — a bare mark without the nonce would no longer
+  # satisfy spawn's check (review finding, 2026-07-19). This uses ready.sh
+  # rather than watch.sh's distinct, long-lived ready.* sentinel.
   local mark_helper="$TEST_SKILL_DIR/mark-helper.sh"
   cat > "$mark_helper" <<EOF
 #!/usr/bin/env bash
@@ -969,7 +974,13 @@ EOF
 
 @test "spawn: a stale actas mark from an abandoned earlier launch does not satisfy a later spawn's wait" {
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
+
+  # An earlier, abandoned spawn attempt marks with SOME other nonce (as if a
+  # slow-booting agent from a previous, already-timed-out launch finally
+  # completed and called ready.sh mark late) — this must NOT satisfy a new
+  # spawn's wait (review finding, 2026-07-19: P2, converged Codex + Fugu).
   bash "$SCRIPTS/ready.sh" mark myteam alice "stale-nonce-from-abandoned-launch"
+
   printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/sleep"
   chmod +x "$STUB_BIN/sleep"
 
@@ -983,6 +994,9 @@ EOF
 @test "spawn: actas handshake clears stale state and enforces the 300s timeout floor" {
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
   bash "$SCRIPTS/ready.sh" mark myteam alice
+
+  # Avoid a real five-minute wait: each loop still increments one logical
+  # second, but this test-local sleep returns immediately.
   printf '#!/usr/bin/env bash\nexit 0\n' > "$STUB_BIN/sleep"
   chmod +x "$STUB_BIN/sleep"
 
@@ -997,7 +1011,10 @@ EOF
 
 @test "spawn: a no-monitor type without handshake key still returns immediately" {
   bash "$SCRIPTS/join.sh" myteam existing claude-code "$PROJ"
-  sed -i.bak '/^handshake=/d' "$TYPES/grok-build/type.conf"
+
+  # Model an older/external grok driver: no handshake key and monitor=no.
+  awk '!/^handshake=/' "$TYPES/grok-build/type.conf" > "$TYPES/grok-build/type.conf.tmp"
+  mv "$TYPES/grok-build/type.conf.tmp" "$TYPES/grok-build/type.conf"
 
   run env -u TMUX bash "$SCRIPTS/spawn.sh" grok-build alice --project "$PROJ" \
     --terminal "true # {cmd}"

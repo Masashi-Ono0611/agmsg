@@ -392,8 +392,10 @@ if [ -z "$TEAM" ]; then
   fi
 fi
 
-# actas-handshake nonce (#338 Gap 2): compute this after TEAM is final so it
-# can be exported into the boot script and echoed by the spawned template.
+# actas-handshake nonce (#338 Gap 2; review finding, 2026-07-19): computed here,
+# before the boot script is assembled below, so it can be exported into it.
+# Binds the mark this spawn waits for to THIS launch specifically — see the
+# "Readiness handshakes" section further down for the full rationale.
 HANDSHAKE="$(agmsg_type_get "$AGENT_TYPE" handshake)"
 ACTAS_NONCE=""
 if [ "$WAIT_READY" = "1" ] && [ "$HANDSHAKE" = "actas" ]; then
@@ -534,8 +536,11 @@ PLAIN_WITNESS="${BOOT}.plain-witness"
   # actas flow knows the session is already named <team>-<agent> (name_arg) and
   # suppresses the "rename this session" tip meant for hand-started sessions.
   echo 'export AGMSG_SPAWNED=1'
-  # Bind the actas readiness mark to this team and this launch. The boot prompt
-  # names only the agent, which may be registered under more than one team.
+  # actas-handshake types (review finding, 2026-07-19): the boot prompt only
+  # names the agent, not which team spawn resolved (identities.sh can return
+  # more than one team for that name) or which launch this is. Export both so
+  # the template can mark the exact (team, nonce) this spawn is waiting on
+  # instead of guessing.
   if [ -n "$ACTAS_NONCE" ]; then
     printf 'export AGMSG_SPAWN_TEAM=%q\n' "$TEAM"
     printf 'export AGMSG_SPAWN_NONCE=%q\n' "$ACTAS_NONCE"
@@ -948,55 +953,34 @@ place_and_launch() {
   _launch_os_terminal
 }
 
-# Readiness handshake (#108). The spawned agent's actas flow starts its watcher
-# in exclusive mode, which touches a ready sentinel once it's actually
-# receiving. Block until that appears so the leader doesn't send a job into the
-# cold-start window (before the watcher attaches) and lose it.
+# Readiness handshakes (#108 watcher, #338 Gap 2 actas).
 #
-# Types with `readiness_sentinel=no` do not produce a spawn-awaitable readiness
-# sentinel, so skip the wait. That covers types with no Monitor at all (codex)
-# AND types whose watcher attaches via the agent's own launch rather than a
-# spawn-time sentinel (grok-build, whose monitor mode is real but not awaitable
-# here) — receive there is poll-based or agent-launched anyway.
-#
-# NOT named `monitor=`: that name reads as a statement about delivery-mode
-# support and collided with `delivery_modes=monitor` in agents' own reports
-# (#1214) — a type can carry `delivery_modes=monitor` (a real, settable mode)
-# and `readiness_sentinel=no` (no spawn-time handshake to await) at once, and
-# `delivery_modes` alone answers "can this type be set to monitor mode".
-# Backward compat: an already-installed type.conf from before this rename
-# still carries only the bare `monitor=` key. readiness_sentinel
-# reading empty must not silently behave as "yes" (wait) for such a manifest
-# -- fall back to the legacy key so an old no-handshake manifest (codex)
-# still skips the wait instead of timing out. A manifest carrying BOTH (the
-# migration window) prefers the new key.
+# handshake=actas is an explicit driver opt-in; all other types retain the
+# current readiness_sentinel and legacy monitor compatibility behavior.
+HANDSHAKE="$(agmsg_type_get "$AGENT_TYPE" handshake 2>/dev/null || true)"
 READINESS_SENTINEL="$(agmsg_type_get "$AGENT_TYPE" readiness_sentinel 2>/dev/null || true)"
 [ -n "$READINESS_SENTINEL" ] || READINESS_SENTINEL="$(agmsg_type_get "$AGENT_TYPE" monitor 2>/dev/null || true)"
-
+# HANDSHAKE/ACTAS_NONCE are computed before the boot script is assembled.
+READY_KIND=""
+READY_PATH=""
 SKIPPED_READINESS_BY_TYPE=0
 SKIPPED_READINESS_BY_MODE=0
 DELIVERY_MODE=""
-READY_KIND=""
-READY_PATH=""
 if [ "$WAIT_READY" = "1" ]; then
   if [ "$HANDSHAKE" = "actas" ]; then
-    READY_KIND=actas
+    READY_KIND="actas"
     if [ "$READY_TIMEOUT" -lt 300 ]; then
       echo "spawn: '$AGENT_TYPE' actas handshake uses a 300s minimum readiness timeout (requested ${READY_TIMEOUT}s)" >&2
       READY_TIMEOUT=300
     fi
+  elif [ "$READINESS_SENTINEL" = "no" ]; then
+    WAIT_READY=0
+    SKIPPED_READINESS_BY_TYPE=1
+    echo "spawn: '$AGENT_TYPE' has no spawn readiness handshake — skipping readiness wait (--no-wait implied)" >&2
   else
-    READY_KIND=watcher
-    # #1023 review: fail explicitly when both an id-keyed and a legacy ready
-    # sentinel exist. An empty path would make the wait loop time out forever.
+    READY_KIND="watcher"
     READY_PATH="$(agmsg_ready_path "$TEAM" "$NAME")" \
       || die "'$NAME' in team '$TEAM': readiness sentinel path is ambiguous (both an id-keyed and a legacy sentinel exist); not spawning until the stale one is removed"
-    if [ "$READINESS_SENTINEL" = "no" ]; then
-      WAIT_READY=0
-      READY_KIND=""
-      SKIPPED_READINESS_BY_TYPE=1
-      echo "spawn: '$AGENT_TYPE' has no spawn readiness handshake — skipping readiness wait (--no-wait implied)" >&2
-    fi
   fi
 fi
 
@@ -1006,7 +990,7 @@ fi
 # the per-project mode and skip the impossible wait, preserving the distinction
 # from a type that has no handshake at all. If status cannot be read or its output
 # is not recognized, keep waiting: unreadable state is not evidence of mode=off.
-if [ "$WAIT_READY" = "1" ] && [ "$SKIPPED_READINESS_BY_TYPE" = "0" ] && [ "$HANDSHAKE" != "actas" ]; then
+if [ "$WAIT_READY" = "1" ] && [ "$SKIPPED_READINESS_BY_TYPE" = "0" ] && [ "$READY_KIND" = "watcher" ]; then
   _delivery_mode_line=""
   _delivery_status=0
   if ! _delivery_mode_line="$("$SCRIPT_DIR/delivery.sh" status "$AGENT_TYPE" "$PROJECT" 2>/dev/null)"; then
@@ -1040,10 +1024,11 @@ if [ "$WAIT_READY" = "1" ] && [ "$SKIPPED_READINESS_BY_TYPE" = "0" ] && [ "$HAND
 fi
 
 # Clear any stale sentinel before launching so we only observe THIS spawn's
-# watcher attaching.
+# bootstrap. Actas readiness is cleared through its public command; watcher
+# readiness retains its existing direct-path protocol.
 if [ "$WAIT_READY" = "1" ]; then
   if [ "$READY_KIND" = "actas" ]; then
-    "$SCRIPT_DIR/ready.sh" clear "$TEAM" "$NAME"
+    "$SCRIPT_DIR/ready.sh" clear "$TEAM" "$NAME" "$ACTAS_NONCE"
   else
     rm -f "$READY_PATH" 2>/dev/null || true
   fi
@@ -1103,11 +1088,8 @@ if [ "$WAIT_READY" = "1" ]; then
     sleep 1
     waited=$((waited + 1))
   done
-  # Actas completion is an edge, not liveness. Consume it immediately so a
-  # later spawn cannot mistake this bootstrap for its own.
-  [ "$READY_KIND" = "actas" ] && "$SCRIPT_DIR/ready.sh" clear "$TEAM" "$NAME"
-  # Ready confirmed. Now report the naming result — the two are independent, so a
-  # seat that IS receiving but could not be named reports spawned-but-unnamed, not ready.
+  # Ready confirmed. Consume the one-shot actas edge, then report naming.
+  [ "$READY_KIND" = "actas" ] && "$SCRIPT_DIR/ready.sh" clear "$TEAM" "$NAME" "$ACTAS_NONCE"
   [ "$SPAWN_UNNAMED" = "1" ] && _emit_spawned_but_unnamed "after=${waited}s"
   echo "status=ready name=${NAME} team=${TEAM} after=${waited}s"
 elif [ "$SKIPPED_READINESS_BY_MODE" = "1" ]; then
