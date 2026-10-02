@@ -3649,7 +3649,8 @@ JSON
   # shellcheck disable=SC2064
   trap "kill $wpid 2>/dev/null || true" EXIT
 
-  local ready="$TEST_SKILL_DIR/run/ready.team__alice" i
+  local ready i
+  ready="$(_ready_path team alice)"
   for i in $(seq 1 40); do
     [ -f "$ready" ] && break
     sleep 0.25
@@ -3681,7 +3682,7 @@ JSON
   # shellcheck disable=SC2064
   trap "kill $agent_pid 2>/dev/null || true" EXIT
   local token="sess-agent-only.${agent_pid}"
-  printf '%s\n' "$token" > "$TEST_SKILL_DIR/run/ready.team__alice"
+  printf '%s\n' "$token" > "$(_ready_path team alice)"
   # Intentionally no watch.<token>.pid — old bug treated agent_pid as watcher.
 
   run bash "$SCRIPTS/delivery.sh" status grok-build "$TEST_PROJECT"
@@ -3722,7 +3723,7 @@ JSON
   kill -0 "$broad_pid" 2>/dev/null
 
   # No ready.team__bob
-  [ ! -f "$TEST_SKILL_DIR/run/ready.team__bob" ]
+  [ ! -f "$(_ready_path team bob)" ]
 
   run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
@@ -3765,7 +3766,8 @@ JSON
   # shellcheck disable=SC2064
   trap "kill $wpid 2>/dev/null || true" EXIT
 
-  local ready="$TEST_SKILL_DIR/run/ready.team__alice" i
+  local ready i
+  ready="$(_ready_path team alice)"
   for i in $(seq 1 40); do
     [ -f "$ready" ] && break
     sleep 0.25
@@ -3791,7 +3793,7 @@ JSON
   local agent_pid=$!
   # shellcheck disable=SC2064
   trap "kill $agent_pid 2>/dev/null || true" EXIT
-  printf 'sess-only.%s\n' "$agent_pid" > "$TEST_SKILL_DIR/run/ready.team__alice"
+  printf 'sess-only.%s\n' "$agent_pid" > "$(_ready_path team alice)"
 
   run bash "$SCRIPTS/receiver-live.sh" team alice
   [ "$status" -ne 0 ]
@@ -3822,7 +3824,8 @@ JSON
   # shellcheck disable=SC2064
   trap "kill $wpid 2>/dev/null || true" EXIT
 
-  local ready="$TEST_SKILL_DIR/run/ready.team__alice" i
+  local ready i
+  ready="$(_ready_path team alice)"
   for i in $(seq 1 40); do
     [ -f "$ready" ] && break
     sleep 0.25
@@ -3832,7 +3835,7 @@ JSON
   # bob has NO ready file and no watcher of his own — a plain substring match
   # on "project type" would find alice's exclusive process (same project/type,
   # trailing "alice") and misreport it as broad coverage for bob (P1, 2026-07-19).
-  [ ! -f "$TEST_SKILL_DIR/run/ready.team__bob" ]
+  [ ! -f "$(_ready_path team bob)" ]
 
   run bash "$SCRIPTS/delivery.sh" status claude-code "$TEST_PROJECT"
   [ "$status" -eq 0 ]
@@ -3869,7 +3872,8 @@ EOF
   # shellcheck disable=SC2064
   trap "kill $wpid 2>/dev/null || true" EXIT
 
-  local ready="$TEST_SKILL_DIR/run/ready.team__alice" i
+  local ready i
+  ready="$(_ready_path team alice)"
   for i in $(seq 1 40); do
     [ -f "$ready" ] && break
     sleep 0.25
