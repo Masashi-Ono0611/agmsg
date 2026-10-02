@@ -34,6 +34,37 @@ AGENTS_DIR="$HOME/.agents"
 agmsg_load_renderable_skill_types
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/scripts/lib/skill-render.sh"
+# agmsg_codex_config_paths — the Codex config.toml paths this install writes
+# writable_roots entries to. Shared with uninstall.sh's own cleanup (#1469)
+# so the two cannot silently disagree about which files exist again.
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/scripts/lib/codex-config.sh"
+
+# Types that already get their OWN dedicated skill file, written elsewhere in
+# this script -- always in that type's own format, unconditionally, gated
+# only on whether that CLI's own directory exists, never on --agent-type:
+#   claude-code  -> ~/.claude/commands/<cmd>.md
+#   copilot      -> ~/.copilot/skills/<cmd>/SKILL.md
+#   opencode     -> $OPENCODE_SKILL_DIR/SKILL.md
+#   hermes       -> $HERMES_SKILL_DIR/SKILL.md
+#   grok-build   -> $GROK_SKILL_DIR/SKILL.md
+#   antigravity  -> ~/.gemini/config/skills/<cmd>/SKILL.md (install_antigravity_skill)
+#
+# The shared ~/.agents/skills/<cmd>/SKILL.md can hold only ONE type's
+# instructions at a time, and it is what any type NOT in this list reads as
+# its ONLY instructions (today: codex, gemini, cursor, devin -- Codex in
+# particular has no dedicated file of its own). So --agent-type may retype
+# the shared file ONLY for a type not in this list; for a type that IS in
+# this list, the shared file must stay at whatever it already is, since that
+# type gets its own correctly-typed file regardless of what the shared file
+# says (#1449 -- an --agent-type other than codex used to silently retype
+# the shared file too, breaking Codex specifically, since Codex has no file
+# of its own to fall back to).
+#
+# Adding a new type's OWN dedicated file at a new site below means adding
+# that type here too, or it will keep silently retyping the shared file the
+# way #1449 describes.
+AGMSG_TYPES_WITH_OWN_SKILL_FILE="claude-code copilot opencode hermes grok-build antigravity"
 
 # Resolve a provenance version for the source being installed, so an installed
 # copy is uniquely identifiable even between tagged releases (the canonical
@@ -324,24 +355,27 @@ configure_codex_sandbox() {
   # (codex-app) uses the plain ~/.codex default regardless of a shell's
   # CODEX_HOME. Writing to only one when they differ silently breaks
   # whichever surface wasn't written, so when CODEX_HOME is set and does not
-  # already point at ~/.codex, this configures BOTH.
-  local default_config="$HOME/.codex/config.toml"
-  local codex_configs=("$default_config")
-  if [ -n "${CODEX_HOME:-}" ] && [ "$CODEX_HOME/config.toml" != "$default_config" ]; then
-    codex_configs+=("$CODEX_HOME/config.toml")
-  fi
+  # already point at ~/.codex, this configures BOTH -- via
+  # agmsg_codex_config_paths (scripts/lib/codex-config.sh), the one place
+  # this list is computed, shared with uninstall.sh's own cleanup (#1469: the
+  # two used to compute it separately, and drifted apart when only this
+  # function's copy was updated).
+  local codex_configs=()
+  local _cfg
+  while IFS= read -r _cfg; do
+    codex_configs+=("$_cfg")
+  done < <(agmsg_codex_config_paths)
+  unset _cfg
 
-  local writable_paths=("$SKILL_DIR/db" "$SKILL_DIR/teams" "$SKILL_DIR/run" "$SKILL_DIR/ext-tools")
-  # On Windows (MSYS2/Git Bash), $SKILL_DIR is in MSYS form (/c/Users/...).
-  # Codex is a native Windows binary whose Rust path resolution cannot parse
-  # MSYS paths — /c/Users/... is resolved to C:\c\Users\... (a phantom path).
-  # Convert to the mixed C:/Users/... form that both the shell and Codex accept.
-  if command -v cygpath >/dev/null 2>&1; then
-    local i
-    for i in "${!writable_paths[@]}"; do
-      writable_paths[$i]="$(cygpath -m "${writable_paths[$i]}" 2>/dev/null || printf '%s' "${writable_paths[$i]}")"
-    done
-  fi
+  # agmsg_codex_writable_paths (scripts/lib/codex-config.sh) computes the
+  # list, including the Windows cygpath conversion, so this can never
+  # disagree with what the session-start notice checks for (#1483 review).
+  local writable_paths=()
+  local _wp
+  while IFS= read -r _wp; do
+    writable_paths+=("$_wp")
+  done < <(agmsg_codex_writable_paths "$SKILL_DIR")
+  unset _wp
 
   local cfg
   for cfg in "${codex_configs[@]}"; do
@@ -448,8 +482,11 @@ while [[ $# -gt 0 ]]; do
       echo "  --cmd <name>      Command & skill folder name (default: agmsg)"
       echo "                    Claude Code: /<cmd>, Codex/Gemini/Antigravity: \$<cmd>"
       echo "  --agent-type <t>  Agent type: claude-code, codex, gemini, antigravity, opencode, hermes, cursor, grok-build, devin"
-      echo "                    Selects which template becomes SKILL.md (matches the"
-      echo "                    <type> arg passed to join.sh / whoami.sh)"
+      echo "                    codex, gemini, cursor, devin: selects the template the"
+      echo "                    shared SKILL.md is rendered from. Other types leave the"
+      echo "                    shared SKILL.md's type unchanged (codex on a fresh install);"
+      echo "                    they have their own skill file."
+      echo "                    (<t> matches the type arg passed to join.sh / whoami.sh)"
       echo "  --update          Update skill scripts only (preserve DB and teams)"
       echo ""
       echo "After install, join a team per-project:"
@@ -570,28 +607,48 @@ $_agmsg_running_team"
     done < <("$SKILL_DIR/scripts/remote.sh" status --json 2>/dev/null || true)
   fi
   unset _agmsg_status_line _agmsg_running_team
-  if [ -z "$AGENT_TYPE" ]; then
-    # Re-detect the type this install's shared SKILL.md was last rendered for,
-    # from the whoami.sh line its own template prints (#846) -- every
-    # renderable type's line is unambiguous against every other's; see the
-    # cross-grep this list is built from, noted alongside
-    # AGMSG_RENDERABLE_SKILL_TYPES above. codex remains the fallback when an
-    # older or hand-written SKILL.md has no recognizable whoami line.
-    AGENT_TYPE="codex"
-    for _agmsg_t in $AGMSG_RENDERABLE_SKILL_TYPES; do
-      if grep -q "whoami.sh.*$_agmsg_t" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
-        AGENT_TYPE="$_agmsg_t"
-        break
-      fi
-    done
-    unset _agmsg_t
-  fi
-  # The shared SKILL.md is rendered for the detected type; codex is the safe
-  # default for an older install that cannot be identified.
-  TPL_TYPE="codex"
-  case " $AGMSG_RENDERABLE_SKILL_TYPES " in
-    *" $AGENT_TYPE "*) TPL_TYPE="$AGENT_TYPE" ;;
+  # Captured before the auto-detect below can fill AGENT_TYPE in for other
+  # reasons: an EXPLICIT --agent-type is what #1449's rule below cares about,
+  # not whatever AGENT_TYPE ends up holding once auto-detected too.
+  _agmsg_explicit_agent_type="$AGENT_TYPE"
+  # Re-detect the type this install's shared SKILL.md is CURRENTLY rendered
+  # for, from the whoami.sh line its own template prints (#846) -- every
+  # renderable type's line is unambiguous against every other's; see the
+  # cross-grep this list is built from, noted alongside
+  # AGMSG_RENDERABLE_SKILL_TYPES above. codex remains the fallback when an
+  # older or hand-written SKILL.md has no recognizable whoami line.
+  #
+  # Always run, even when --agent-type was given explicitly: #1449's rule
+  # below needs this as the shared file's fallback type precisely when an
+  # explicit --agent-type asks for a type that must not retype it.
+  _agmsg_detected_type="codex"
+  for _agmsg_t in $AGMSG_RENDERABLE_SKILL_TYPES; do
+    if grep -q "whoami.sh.*$_agmsg_t" "$SKILL_DIR/SKILL.md" 2>/dev/null; then
+      _agmsg_detected_type="$_agmsg_t"
+      break
+    fi
+  done
+  unset _agmsg_t
+  [ -z "$AGENT_TYPE" ] && AGENT_TYPE="$_agmsg_detected_type"
+  # The shared SKILL.md can hold only ONE type's instructions at a time (see
+  # AGMSG_TYPES_WITH_OWN_SKILL_FILE near the top). An EXPLICIT --agent-type
+  # for a type that already gets its own dedicated file elsewhere in this
+  # script must not retype the shared file too -- it stays at the type just
+  # detected above instead. An --agent-type for a type with no file of its
+  # own (today: codex, gemini, cursor, devin) still renders the shared file
+  # as that type, same as before #1449.
+  TPL_TYPE="$_agmsg_detected_type"
+  case " $AGMSG_TYPES_WITH_OWN_SKILL_FILE " in
+    *" $_agmsg_explicit_agent_type "*)
+      echo "  shared SKILL.md stays $_agmsg_detected_type: $_agmsg_explicit_agent_type has its own skill file"
+      ;;
+    *)
+      case " $AGMSG_RENDERABLE_SKILL_TYPES " in
+        *" $AGENT_TYPE "*) TPL_TYPE="$AGENT_TYPE" ;;
+      esac
+      ;;
   esac
+  unset _agmsg_explicit_agent_type _agmsg_detected_type
   agmsg_render_skill "$TPL_TYPE" "$SKILL_NAME" "$SKILL_DIR/SKILL.md"
   TRASH_DIR="$SKILL_DIR/.trash"
   AGMSG_TRASH_COUNT=0
@@ -839,9 +896,24 @@ mkdir -p "$SKILL_DIR"/{scripts,types,db,agents}
 
 # SKILL.md is composed from the shared root and the agent-specific overlay
 # resolved from the type manifest (scripts/drivers/types/<type>/template.md).
+#
+# The shared SKILL.md can hold only ONE type's instructions at a time (see
+# AGMSG_TYPES_WITH_OWN_SKILL_FILE near the top). --agent-type for a type
+# that already gets its own dedicated file elsewhere in this script must not
+# retype the shared file too -- a fresh install has no existing file to fall
+# back to, so it stays at the plain codex default. --agent-type for a type
+# with no file of its own (today: codex, gemini, cursor, devin) still
+# renders the shared file as that type, same as before #1449.
 TPL_TYPE="codex"
-case " $AGMSG_RENDERABLE_SKILL_TYPES " in
-  *" $AGENT_TYPE "*) TPL_TYPE="$AGENT_TYPE" ;;
+case " $AGMSG_TYPES_WITH_OWN_SKILL_FILE " in
+  *" $AGENT_TYPE "*)
+    echo "  shared SKILL.md stays codex: $AGENT_TYPE has its own skill file"
+    ;;
+  *)
+    case " $AGMSG_RENDERABLE_SKILL_TYPES " in
+      *" $AGENT_TYPE "*) TPL_TYPE="$AGENT_TYPE" ;;
+    esac
+    ;;
 esac
 agmsg_render_skill "$TPL_TYPE" "$CMD_NAME" "$SKILL_DIR/SKILL.md"
 TRASH_DIR="$SKILL_DIR/.trash"
@@ -962,8 +1034,10 @@ fi
 # Grok Build reads skills from ~/.grok/skills/<name>/SKILL.md (it also accepts
 # the cross-vendor ~/.agents/skills/ fallback, but the shared SKILL.md is
 # Codex-typed and would mis-identify a Grok session — keep the Grok copy
-# separate, same pattern as Copilot). Delivery (turn) registers a Stop hook under
-# ~/.grok/hooks/ via `delivery.sh set` per project.
+# separate, same pattern as Copilot). Delivery (turn/monitor) writes a
+# project-relative rule file, <project>/.grok/rules/agmsg.md, via
+# `delivery.sh set` per project (scripts/drivers/types/grok-build/type.conf's
+# hooks_file; see grok-build/_delivery.sh).
 GROK_SKILL_DIR="$HOME/.grok/skills/$CMD_NAME"
 if [ -d "$HOME/.grok" ]; then
   mkdir -p "$GROK_SKILL_DIR"

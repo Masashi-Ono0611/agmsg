@@ -228,6 +228,27 @@ _herdr_pane_for_session() {
   return 2   # no candidate array path (unknown schema) -> could not answer
 }
 
+# terminal_session_live <sid> -- is <sid> among the LIVE agents right now, and
+# where (#1485)? Unlike terminal_detect, this never reads this process's OWN
+# environment: a caller asking about an ARBITRARY session (a stale placement
+# record's claimant, not itself) must not get this process's own pane back
+# just because it happens to be running under herdr too. It is the direct,
+# unconditional round trip _herdr_pane_for_session already makes; terminal_detect
+# only reaches that round trip when the environment has no pane id of its own.
+#
+# Prints "live\t<bare-pane-id>" (rc 0) when <sid> is a live agent right now,
+# "dead" (rc 0) when herdr answered and <sid> is not among them, or "unknown"
+# (rc 1) when it could not be asked at all (no sid, herdr absent/errored) --
+# the caller's existing fail-closed answer for everything it cannot decide.
+terminal_session_live() {   # <sid>
+  local sid="$1" pane hrc=0
+  [ -n "$sid" ] || { echo unknown; return 1; }
+  pane="$(_herdr_pane_for_session "$sid")" || hrc=$?
+  [ "$hrc" -eq 0 ] || { echo unknown; return 1; }
+  if [ -n "$pane" ]; then printf 'live\t%s\n' "$pane"; else echo dead; fi
+  return 0
+}
+
 # record op: we are under herdr iff HERDR_ENV=1. Resolve THIS pane from the
 # environment first: herdr sets HERDR_PANE_ID in every pane's process tree, and
 # it is the pane the process is actually in -- MEASURED 2026-09-08 on the live
@@ -279,6 +300,47 @@ terminal_detect() {
   fi
   printf '%s:%s\n' "$socket" "$pane"
   return 0
+}
+
+# Optional environment-only self identity. HERDR_ENV is the presence marker;
+# socket and pane fields without it are not trusted as a herdr placement.
+terminal_self_env() {
+  local sock id
+  if [ -z "${HERDR_ENV:-}" ] && [ -z "${HERDR_PANE_ID:-}" ] \
+    && [ -z "${HERDR_SOCKET_PATH:-}" ]; then
+    printf 'n/a:not_in_terminal\n'
+    return 0
+  fi
+  [ "${HERDR_ENV:-}" = 1 ] || {
+    printf 'unknown:herdr_presence_marker_invalid\n'
+    return 0
+  }
+  sock="$(_herdr_env_socket 2>/dev/null)" || {
+    printf 'unknown:herdr_socket_unavailable\n'
+    return 0
+  }
+  [ -n "${HERDR_PANE_ID:-}" ] || {
+    printf 'unknown:herdr_pane_id_unset\n'
+    return 0
+  }
+  id="$sock:$HERDR_PANE_ID"
+  if ! terminal_id_ok "$id"; then
+    printf 'unknown:herdr_pane_id_malformed\n'
+    return 0
+  fi
+  printf '%s\n' "$id"
+}
+
+# Socket inode/ctime distinguishes a restarted herdr server for naming marks.
+terminal_epoch() {
+  local s=""
+  [ "${HERDR_ENV:-}" = 1 ] || { printf 'n/a:not_in_terminal\n'; return 0; }
+  [ -n "${HERDR_SOCKET_PATH:-}" ] || { printf 'unknown:herdr_socket_path_unset\n'; return 0; }
+  s="$(stat -f '%i:%c' "$HERDR_SOCKET_PATH" 2>/dev/null)" \
+    || s="$(stat -c '%i:%Z' "$HERDR_SOCKET_PATH" 2>/dev/null)" \
+    || s=""
+  [ -n "$s" ] || { printf 'unknown:herdr_socket_stat_failed\n'; return 0; }
+  printf 'sock=%s\n' "$s"
 }
 
 # Read the new pane id from a herdr JSON result at one of the known paths.
@@ -366,6 +428,22 @@ terminal_id_split() {   # <id>
   sock="$(_herdr_sock_of "$1")"
   [ -n "$sock" ] || return 1
   printf '%s\t%s\n' "$sock" "$(_herdr_bare_of "$1")"
+}
+
+# Resolve the socket and pane from a canonical ref, using the ambient socket
+# only for a bare pane id as the legacy self-fix/self-rename paths did.
+terminal_instance_for_ref() {   # <canonical-ref>
+  local ref="$1" halves instance pane
+  _agmsg_terminal_ref_parse "$ref" || { printf 'unknown:invalid_locator\n'; return 0; }
+  [ "$_AGMSG_REF_TERM" = herdr ] || { printf 'unknown:wrong_terminal\n'; return 0; }
+  if halves="$(terminal_id_split "$_AGMSG_REF_ID")"; then
+    instance="${halves%%$'\t'*}"; pane="${halves#*$'\t'}"
+  else
+    instance="${HERDR_SOCKET_PATH:-}"; pane="$_AGMSG_REF_ID"
+  fi
+  [ -n "$instance" ] || { printf 'n/a:bare\n'; return 0; }
+  _agmsg_locator_instance_ok "$instance" || { printf 'unknown:instance_malformed\n'; return 0; }
+  printf '%s\t%s\n' "$instance" "$pane"
 }
 # Run one herdr CLI call ABOUT <id>: a qualified id reaches its own instance
 # through HERDR_SOCKET_PATH; a bare id keeps the ambient one. The bare pane id
@@ -1326,6 +1404,11 @@ terminal_name() {
   fi
   echo ok
   return 0
+}
+
+# The value terminal_name stores as herdr's internal agent key.
+terminal_expected_label() {   # <team> <agent>
+  _herdr_internal_key "$1" "$2"
 }
 
 # OPTIONAL OP. Observe ONE candidate pane's process facts, as a strict record.

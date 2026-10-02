@@ -214,10 +214,21 @@ teardown() {
   # literal substring of "agmsg-second", and "$SK" (no trailing slash) is a
   # literal prefix of "$SK-second". Uninstalling the shorter one must not
   # touch the longer one's own registrations.
-  mkdir -p "$FAKE_HOME/.claude" "$FAKE_HOME/.codex"
+  #
+  # #1469: also covers what install.sh writes but uninstall.sh used to leave
+  # behind -- the CODEX_HOME-side Codex config (a second, DIFFERENT throwaway
+  # config dir here, standing in for a real Codex profile), and the OpenCode/
+  # Hermes/Grok Build dedicated skill files. install.sh only ever writes to a
+  # Codex config.toml that already exists (never creates one), so both are
+  # pre-seeded just like the default one already was above.
+  mkdir -p "$FAKE_HOME/.claude" "$FAKE_HOME/.codex" \
+    "$FAKE_HOME/.config/opencode" "$FAKE_HOME/.hermes" "$FAKE_HOME/.grok"
   printf 'model = "gpt-test"\n' > "$FAKE_HOME/.codex/config.toml"
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
-  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg-second
+  local codex_home2="$FAKE_HOME/.codex-profile2"
+  mkdir -p "$codex_home2"
+  printf 'model = "gpt-test"\n' > "$codex_home2/config.toml"
+  HOME="$FAKE_HOME" CODEX_HOME="$codex_home2" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  HOME="$FAKE_HOME" CODEX_HOME="$codex_home2" bash "$REPO_ROOT/install.sh" --cmd agmsg-second
   local sk_second="$FAKE_HOME/.agents/skills/agmsg-second"
 
   local project="$FAKE_HOME/project"
@@ -236,12 +247,34 @@ teardown() {
   printf 'Run `%s/scripts/whoami.sh`.\n' "$SK" > "$project/.claude/commands/agmsg-project.md"
   printf 'Run `%s/scripts/whoami.sh`.\n' "$sk_second" > "$project/.claude/commands/agmsg-second-project.md"
 
+  # Grok Build's own hooks_file (.grok/rules/agmsg.md) is project-relative
+  # and NOT templated on the skill name (scripts/drivers/types/grok-build/
+  # type.conf) -- two installs registering it for the SAME project would
+  # overwrite each other's rule file, a pre-existing limitation outside this
+  # fix's scope. Two separate projects sidesteps it and still proves the
+  # per-install boundary.
+  local grok_project="$FAKE_HOME/grok-project"
+  local grok_project_second="$FAKE_HOME/grok-project-second"
+  mkdir -p "$grok_project" "$grok_project_second"
+  bash "$SK/scripts/join.sh" grokteam grokalice grok-build "$grok_project" >/dev/null
+  bash "$sk_second/scripts/join.sh" grokteam grokbob grok-build "$grok_project_second" >/dev/null
+  HOME="$FAKE_HOME" bash "$SK/scripts/delivery.sh" set turn grok-build "$grok_project" >/dev/null
+  HOME="$FAKE_HOME" bash "$sk_second/scripts/delivery.sh" set turn grok-build "$grok_project_second" >/dev/null
+
   local cmd_first="$FAKE_HOME/.claude/commands/agmsg.md"
   local cmd_second="$FAKE_HOME/.claude/commands/agmsg-second.md"
   local proj_cmd_first="$project/.claude/commands/agmsg-project.md"
   local proj_cmd_second="$project/.claude/commands/agmsg-second-project.md"
   local settings="$project/.claude/settings.local.json"
   local shim="$FAKE_HOME/.agents/bin/agy-tui"
+  local opencode_first="$FAKE_HOME/.config/opencode/skills/agmsg/SKILL.md"
+  local opencode_second="$FAKE_HOME/.config/opencode/skills/agmsg-second/SKILL.md"
+  local hermes_first="$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
+  local hermes_second="$FAKE_HOME/.hermes/skills/agmsg-second/SKILL.md"
+  local grok_first="$FAKE_HOME/.grok/skills/agmsg/SKILL.md"
+  local grok_second="$FAKE_HOME/.grok/skills/agmsg-second/SKILL.md"
+  local grok_rule_first="$grok_project/.grok/rules/agmsg.md"
+  local grok_rule_second="$grok_project_second/.grok/rules/agmsg.md"
   [ -f "$cmd_first" ]
   [ -f "$cmd_second" ]
   [ -f "$proj_cmd_first" ]
@@ -250,25 +283,46 @@ teardown() {
   grep -qF "$sk_second/" "$settings"
   grep -qF "$SK/" "$FAKE_HOME/.codex/config.toml"
   grep -qF "$sk_second/" "$FAKE_HOME/.codex/config.toml"
+  grep -qF "$SK/" "$codex_home2/config.toml"
+  grep -qF "$sk_second/" "$codex_home2/config.toml"
+  [ -f "$opencode_first" ]
+  [ -f "$opencode_second" ]
+  [ -f "$hermes_first" ]
+  [ -f "$hermes_second" ]
+  [ -f "$grok_first" ]
+  [ -f "$grok_second" ]
+  grep -qF "$SK/" "$grok_rule_first"
+  grep -qF "$sk_second/" "$grok_rule_second"
   [ -f "$shim" ]
 
   # Run the COPY inside the "agmsg" install itself (the normal way a real
   # user uninstalls one) -- $0's own directory is what identifies which one
   # install this run is about (#1400).
-  HOME="$FAKE_HOME" bash "$SK/uninstall.sh" --yes
+  HOME="$FAKE_HOME" CODEX_HOME="$codex_home2" bash "$SK/uninstall.sh" --yes
 
   [ ! -e "$SK" ]
   [ ! -f "$cmd_first" ]
   [ ! -f "$proj_cmd_first" ]
   refute grep -qF "$SK/" "$settings"
   refute grep -qF "$SK/" "$FAKE_HOME/.codex/config.toml"
+  refute grep -qF "$SK/" "$codex_home2/config.toml"
+  [ ! -e "$opencode_first" ]
+  [ ! -e "$hermes_first" ]
+  [ ! -e "$grok_first" ]
+  [ ! -f "$grok_rule_first" ]
   # The untouched install: global command, project hook and command file,
-  # writable_roots entry, and the machine-wide shim it still needs.
+  # writable_roots entry in BOTH Codex configs, its three dedicated skill
+  # files, its Grok rule, and the machine-wide shim it still needs.
   [ -d "$sk_second" ]
   [ -f "$cmd_second" ]
   [ -f "$proj_cmd_second" ]
   grep -qF "$sk_second/" "$settings"
   grep -qF "$sk_second/" "$FAKE_HOME/.codex/config.toml"
+  grep -qF "$sk_second/" "$codex_home2/config.toml"
+  [ -f "$opencode_second" ]
+  [ -f "$hermes_second" ]
+  [ -f "$grok_second" ]
+  grep -qF "$sk_second/" "$grok_rule_second"
   [ -f "$shim" ]
 
   # (review, round 2) The target install has NO writable_roots entry of
@@ -794,21 +848,34 @@ PS1
 @test "plugin SKILL.md bootstrap: a fresh plugin install path can bootstrap ~/.agents/skills/agmsg" {
   # Simulate the post-plugin-install state: no ~/.agents/skills/agmsg yet, but
   # the plugin marketplace flow has populated the cache dir with a copy of the
-  # repo. Then run the Step 0 bootstrap snippet from SKILL.md and assert the
-  # canonical install location exists.
-  local plugin_dir="$FAKE_HOME/.claude/plugins/cache/fujibee-agmsg/agmsg/1.0.0"
-  mkdir -p "$plugin_dir"
+  # repo. Then run the Step 0 bootstrap snippet FROM the repo-root SKILL.md and
+  # assert the canonical install location exists.
+  # Two cached versions, as after an upgrade: the real repo copy is the NEWER
+  # one (1.10.0 -- a plain string sort would rank 1.9.0 above it), and the older
+  # one holds an installer that must never run. The older folder is touched last,
+  # so picking by modification time would choose it too.
+  local cache="$FAKE_HOME/.claude/plugins/cache/fujibee-agmsg/agmsg"
+  local plugin_dir="$cache/1.10.0"
+  mkdir -p "$plugin_dir" "$cache/1.9.0"
   cp -R "$REPO_ROOT/." "$plugin_dir/"
+  printf '#!/usr/bin/env bash\ntouch "%s/older-installer-ran"\nexit 1\n' "$FAKE_HOME" > "$cache/1.9.0/install.sh"
+  touch "$cache/1.9.0/install.sh"
   [ ! -d "$SK" ]  # canonical agmsg location absent
 
-  # Run the same shell snippet our SKILL.md prescribes as Step 0.
-  HOME="$FAKE_HOME" bash -c '
-    if [ ! -d ~/.agents/skills/agmsg ]; then
-      installer=$(ls ~/.claude/plugins/cache/fujibee-agmsg/agmsg/*/install.sh 2>/dev/null | head -1)
-      [ -n "$installer" ] && bash "$installer" --cmd agmsg
-    fi
-  '
+  # The snippet is read out of the shipped file, not retyped here: a copy kept
+  # in the test stayed green after the real step was deleted from SKILL.md
+  # (#1286), which is what let a plugin install ship without any bootstrap.
+  local snippet
+  snippet="$(awk '/^## Step 0/ { in_step = 1; next }
+                  in_step && /^## / { exit }
+                  in_step && /^```bash$/ { in_fence = 1; next }
+                  in_fence && /^```$/ { exit }
+                  in_fence { print }' "$REPO_ROOT/SKILL.md")"
+  [ -n "$snippet" ]
 
+  HOME="$FAKE_HOME" bash -c "$snippet"
+
+  [ ! -e "$FAKE_HOME/older-installer-ran" ]
   [ -d "$SK" ]
   [ -f "$SK/db/messages.db" ]
   [ -f "$SK/scripts/whoami.sh" ]
@@ -817,9 +884,29 @@ PS1
   ! grep -q "__SKILL_NAME__" "$SK/SKILL.md"
 }
 
-# The root file is now a source template, so placeholders are expected there.
-# The renderer is the boundary that must remove them from every generated
-# artifact.
+# The template is scripts/skill-base.md, so placeholders are expected there. The
+# renderer is the boundary that must remove them from every generated artifact
+# -- and the repo-root SKILL.md is one of those artifacts: the plugin marketplace
+# copies the repo tree verbatim and never runs the renderer (#1286), so the file
+# has to be committed already rendered. Testing the renderer's temp output alone
+# is what let an unrendered root file ship in 1.3.0.
+@test "plugin SKILL.md: the repo-root file is rendered and matches a fresh render" {
+  # No template placeholder or slot marker may survive in the shipped file...
+  run grep -nE '__SKILL_NAME__|__AGENT_TYPE__|__CMD_PREFIX__|<!-- /?agmsg:slot' "$REPO_ROOT/SKILL.md"
+  [ "$status" -eq 1 ]
+
+  # ...and it must be exactly what the generator produces from the current
+  # base + claude-code overlay, so editing either without regenerating fails.
+  local fresh="$FAKE_HOME/plugin-SKILL.md"
+  run bash "$REPO_ROOT/scripts/release/render-plugin-skill.sh" "$fresh"
+  [ "$status" -eq 0 ]
+  if ! diff -u "$REPO_ROOT/SKILL.md" "$fresh" >&2; then
+    echo "The repo-root SKILL.md is stale (the Claude Code plugin ships it as-is)." >&2
+    echo "Regenerate and commit it:  bash scripts/release/render-plugin-skill.sh" >&2
+    return 1
+  fi
+}
+
 @test "skill renderer substitutes every install-time placeholder" {
   local rendered="$FAKE_HOME/rendered-codex.md"
   run bash -c 'source "$1/scripts/lib/type-registry.sh"; source "$1/scripts/lib/skill-render.sh"; SCRIPT_DIR="$1" agmsg_render_skill codex agmsg "$2"' _ "$REPO_ROOT" "$rendered"
@@ -1214,12 +1301,28 @@ EOF
   ! grep -q "__SKILL_NAME__" "$hermes_skill"
 }
 
-@test "install: --agent-type hermes makes shared SKILL.md Hermes-typed" {
+@test "install: --agent-type hermes gets its own dedicated file, shared SKILL.md stays codex (#1449)" {
+  mkdir -p "$FAKE_HOME/.hermes"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type hermes
-  grep -q "whoami.sh \"\$(pwd)\" hermes" "$SK/SKILL.md"
-  refute grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
-  refute grep -q "whoami.sh \"\$(pwd)\" gemini" "$SK/SKILL.md"
-  ! grep -q "whoami.sh \"\$(pwd)\" antigravity" "$SK/SKILL.md"
+  # Hermes has its own dedicated file (HERMES_SKILL_DIR) -- that one gets
+  # the hermes overlay regardless of --agent-type, same as always.
+  local hermes_skill="$FAKE_HOME/.hermes/skills/agmsg/SKILL.md"
+  [ -f "$hermes_skill" ]
+  grep -q "whoami.sh \"\$(pwd)\" hermes" "$hermes_skill"
+  # The SHARED SKILL.md -- the file Codex itself reads, with no dedicated
+  # file of its own -- must NOT be retyped away from codex just because
+  # --agent-type asked for a type that already gets its own file elsewhere.
+  # Before #1449's fix, this call retyped the shared file to hermes too,
+  # which would have broken a Codex session reading the same shared file
+  # under this install.
+  grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
+  refute grep -q "whoami.sh \"\$(pwd)\" hermes" "$SK/SKILL.md"
+
+  # A type with no dedicated file of its own (e.g. gemini) still retypes the
+  # shared SKILL.md as before -- unaffected by the rule above, since the
+  # shared file IS that type's only instructions.
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd geminicmd --agent-type gemini
+  grep -q "whoami.sh \"\$(pwd)\" gemini" "$FAKE_HOME/.agents/skills/geminicmd/SKILL.md"
 }
 
 @test "install: --agent-type cursor makes shared SKILL.md Cursor-typed (#131)" {
@@ -1624,10 +1727,18 @@ EOF
   [ ! -e "$FAKE_HOME/.gemini/config/skills/agmsg" ]
 }
 
-@test "install: --agent-type grok-build makes shared SKILL.md Grok-typed" {
+@test "install: --agent-type grok-build gets its own dedicated file, shared SKILL.md stays codex (#1449)" {
+  mkdir -p "$FAKE_HOME/.grok"
   HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg --agent-type grok-build
-  grep -q "whoami.sh \"\$(pwd)\" grok-build" "$SK/SKILL.md"
-  ! grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
+  # grok-build has its own dedicated file (GROK_SKILL_DIR) -- that one gets
+  # the grok-build overlay regardless of --agent-type, same as always.
+  local grok_skill="$FAKE_HOME/.grok/skills/agmsg/SKILL.md"
+  [ -f "$grok_skill" ]
+  grep -q "whoami.sh \"\$(pwd)\" grok-build" "$grok_skill"
+  # The shared SKILL.md must not be retyped away from codex for a type that
+  # already gets its own file elsewhere (#1449).
+  grep -q "whoami.sh \"\$(pwd)\" codex" "$SK/SKILL.md"
+  ! grep -q "whoami.sh \"\$(pwd)\" grok-build" "$SK/SKILL.md"
 }
 
 # Positive control for #846 (A), covering every type the installer can render a
@@ -1639,16 +1750,29 @@ EOF
 # codex template, i.e. the installer clobbering what it had itself just
 # written. codex itself is included as the baseline case (it was never
 # grepped for and was never broken -- it IS the fallback).
-@test "install: bare --update preserves every renderable type's SKILL.md flavor (#846)" {
-  local t
+#
+# #1449 split what "the type" means here for this file specifically: a type
+# with its OWN dedicated file (claude-code, copilot, opencode, hermes,
+# grok-build, antigravity -- AGMSG_TYPES_WITH_OWN_SKILL_FILE in install.sh,
+# kept in sync with the list below) never retypes the SHARED SKILL.md away
+# from codex in the first place, so the expectation for those is codex, not
+# $t. Staying codex across the bare --update is still exactly what #846
+# guards for them too: the shared file must not drift to something else on a
+# later run either.
+@test "install: bare --update preserves every renderable type's SKILL.md flavor (#846, #1449)" {
+  local t dedicated expect
+  dedicated=" claude-code copilot opencode hermes grok-build antigravity "
   while IFS= read -r t; do
     local cmd="agmsg-$t"
+    expect="$t"
+    case "$dedicated" in *" $t "*) expect="codex" ;; esac
+
     HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd "$cmd" --agent-type "$t"
     local skill_md="$FAKE_HOME/.agents/skills/$cmd/SKILL.md"
-    grep -q "whoami.sh \"\$(pwd)\" $t" "$skill_md"
+    grep -q "whoami.sh \"\$(pwd)\" $expect" "$skill_md"
 
     HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --update --cmd "$cmd"
-    grep -q "whoami.sh \"\$(pwd)\" $t" "$skill_md"
+    grep -q "whoami.sh \"\$(pwd)\" $expect" "$skill_md"
   done < <(agmsg_renderable_types "$REPO_ROOT")
 }
 

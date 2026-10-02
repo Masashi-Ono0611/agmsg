@@ -4,6 +4,72 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.2] - 2026-10-02
+
+### Added
+- Report run/ records of a team that no longer exists; remove them with --fix (#1532)
+
+### Fixed
+- The Claude Code watcher renews or stops by itself shortly before the Monitor 30-minute cap (#1553)
+- Record the Codex profile (CODEX_HOME) of a seat as optional metadata without changing delivery (#1549)
+- Pass the launcher flag to the app-server so SessionStart sees it (#1524)
+- Pass the seat key to app-server tool commands under a restricted shell environment policy (#1541)
+- Reclaim a role held by the same live process after /clear (#1540)
+- Restart the sync engine when set-endpoint is refused by the adopt check (#1539)
+- Normalize the project path before hashing the Windows bridge lease (#1522)
+- Start Codex with --no-daemon when a plain launch runs in an elevated Windows shell (#1534)
+- Ship a rendered repo-root SKILL.md with a first-run bootstrap (#1286) (#1516)
+
+### Documentation
+- State the privacy policy as principles that match current behavior (#1546)
+
+[1.5.2]: https://github.com/fujibee/agmsg/compare/v1.5.1...v1.5.2
+
+## [1.5.1] - 2026-09-28
+
+### Added
+- Add --delete and --purge-messages to team.sh (#1475) (#1482)
+- Add --force to team.sh --delete for teams with members (#1493) (#1494)
+- Report when a Codex config is missing this install's writable_roots, with the command that fixes it (#1477) (#1483)
+
+### Fixed
+- Let a live seat take a pane a dead session's record still claims (#1485) (#1486)
+- Name a missing age binary, and surface the last fatal on status (#1487) (#1488)
+
+### Documentation
+- Update the RFC to the approved design and add the architecture design (#1492)
+
+[1.5.1]: https://github.com/fujibee/agmsg/compare/v1.5.0...v1.5.1
+
+## [1.5.0] - 2026-09-25
+
+### Added
+- Orca terminal driver (1.5.0) (#1453)
+
+### Fixed
+- Re-bind a codex seat stranded on its pre-/clear thread (#1470)
+- Clean the CODEX_HOME Codex config and the OpenCode/Hermes/Grok files (#1471)
+- Don't retype the shared SKILL.md for a type with its own file (#1464)
+- Find a seat's actas lock from its registration, and name a sandbox refusal (#1461)
+
+[1.5.0]: https://github.com/fujibee/agmsg/compare/v1.4.2...v1.5.0
+
+## [1.4.2] - 2026-09-24
+
+### Added
+- One line per question in a batch, tolerate a malformed row, name max_tokens_exceeded (#1454)
+
+### Fixed
+- Recognize OpenRouter's wrapped max_tokens_exceeded 400 (#1460)
+- Stage the holder before rmdir so a release cannot delete the next owner's (#1445)
+- Skip a no-op hooks_file rewrite, preserve format and mode (#1442)
+- Remove only the install being uninstalled, add --all for every install (#1438)
+- Read the session name from session_index.jsonl (#1437)
+- Restore <team> <name> in the actas record step, and say so when they are missing (#1398)
+- Detect a type's agent process from its manifest, not a fixed list (#631)
+
+[1.4.2]: https://github.com/fujibee/agmsg/compare/v1.4.1...v1.4.2
+
 ## [1.4.1] - 2026-09-23
 
 ### Added

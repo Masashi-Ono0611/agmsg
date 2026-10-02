@@ -59,27 +59,14 @@ source "$SCRIPT_DIR/lib/terminal-context-line.sh"
 PAIRS=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE" 2>/dev/null || true)
 [ -n "$PAIRS" ] || exit 0
 
-# Type-specific SessionStart behaviour (Template Method). A type may ship
-# scripts/drivers/types/<type>/_session-start.sh defining agmsg_session_start to override the
-# default no-op — codex uses it to hand the session off to the bridge. The plug
-# is sourced in this script's context so it sees PROJECT / RUN_DIR / SKILL_DIR /
-# PAIRS and the helpers sourced above; it may exit 0 (codex does, having no
-# Monitor tool) to skip the Monitor-directive path below.
-agmsg_session_start_default() { :; }
-
-_tdir="$(agmsg_type_dir "$TYPE" 2>/dev/null || true)"
-if [ -n "$_tdir" ] && [ -f "$_tdir/_session-start.sh" ]; then
-  # shellcheck disable=SC1090
-  . "$_tdir/_session-start.sh"
-  agmsg_session_start
-else
-  agmsg_session_start_default
-fi
-
-# Read hook input JSON from stdin. The session id field name differs by vendor:
-# Claude Code emits snake_case "session_id"; Grok Build (and Cursor) emit
-# camelCase "sessionId". Try snake first (claude-code unaffected), then camel,
-# then the GROK_SESSION_ID env Grok injects into every hook.
+# Read hook input JSON from stdin BEFORE the type plug below runs (#1468):
+# stdin can only be read once, and a plug that needs a hook input field (e.g.
+# codex reading `source` to tell startup/resume/clear apart) has to see it
+# while it is still there. No plug reads it yet, so this move is order-only —
+# nothing downstream changes behavior. The session id field name differs by
+# vendor: Claude Code emits snake_case "session_id"; Grok Build (and Cursor)
+# emit camelCase "sessionId". Try snake first (claude-code unaffected), then
+# camel, then the GROK_SESSION_ID env Grok injects into every hook.
 INPUT=$(cat 2>/dev/null || true)
 SESSION_ID=""
 if [ -n "$INPUT" ]; then
@@ -93,6 +80,23 @@ fi
 [ -z "$SESSION_ID" ] && SESSION_ID="${GROK_SESSION_ID:-}"
 # Fallback so the instruction is still actionable even outside a hook flow.
 [ -z "$SESSION_ID" ] && SESSION_ID="unknown-$$"
+
+# Type-specific SessionStart behaviour (Template Method). A type may ship
+# scripts/drivers/types/<type>/_session-start.sh defining agmsg_session_start to override the
+# default no-op — codex uses it to hand the session off to the bridge. The plug
+# is sourced in this script's context so it sees PROJECT / RUN_DIR / SKILL_DIR /
+# PAIRS / INPUT / SESSION_ID and the helpers sourced above; it may exit 0
+# (codex does, having no Monitor tool) to skip the Monitor-directive path below.
+agmsg_session_start_default() { :; }
+
+_tdir="$(agmsg_type_dir "$TYPE" 2>/dev/null || true)"
+if [ -n "$_tdir" ] && [ -f "$_tdir/_session-start.sh" ]; then
+  # shellcheck disable=SC1090
+  . "$_tdir/_session-start.sh"
+  agmsg_session_start
+else
+  agmsg_session_start_default
+fi
 
 # One where.sh call, rendered once, reused by every text-emitting exit below —
 # so a session always learns its own terminal driver and capabilities as the
@@ -436,42 +440,25 @@ if [ -n "$ROLE_NAME" ] && [ -n "$ROLE_TEAM" ]; then
 fi
 
 WATCH="$SKILL_DIR/scripts/watch.sh"
-# AGMSG_CC_MONITOR_KEEP_ALIVE, default OFF: timeout_ms: 1800000 always stays
-# in both directives below (the Monitor tool caps every watch there
-# regardless). What differs is whether re-arming on expiry is UNCONDITIONAL
-# or read off the expiry notification itself. Claude Code counts the events
-# on its own side and names that count in the notification -- agmsg never
-# counts it -- so the default case below is worded as a plain word match on
-# that notification ("no events" present or not), never as reading a
-# number: the exact phrasing may drift, and a seat that has to parse a
-# count is a seat this can break by rewording the notification later. Kept
-# word-for-word identical to scripts/delivery.sh's emit_monitor_directive
-# and scripts/drivers/types/claude-code/template.md's actas overlay -- the
-# three surfaces must never disagree with each other.
-REARM_NOTE=""
-if [ -n "${AGMSG_CC_MONITOR_KEEP_ALIVE:-}" ]; then
-  REARM_NOTE="
-This watch expires after at most 30 minutes; when the expiry notice arrives,
-immediately re-arm it by invoking Monitor again with this exact command and
-description — delivery depends on it, since nothing else keeps the stream
-running. Re-arm it silently: no message to the user, no \"re-armed\", no
-acknowledgement, no summary — just invoke Monitor again and continue,
-since announcing it every 30 minutes wastes tokens for no benefit."
-else
-  REARM_NOTE="
-This watch expires after at most 30 minutes.
-If the expiry notification says it delivered no events, do not re-arm it.
-Otherwise (it says it delivered something), re-arm it by invoking Monitor again with this exact command and description.
-Re-arm it silently, when you do: no message to the user, no \"re-armed\", no
-acknowledgement, no summary — just invoke Monitor again and continue, since
-announcing it every 30 minutes wastes tokens for no benefit."
-fi
+# The watch renews itself (scripts/watch.sh, _watch_renew_or_stop): when it was
+# launched with --max-seconds it prints one "re-arm" or "stopping" line
+# a little before Claude Code's 30-minute Monitor cap and exits, so the decision
+# is made by the watcher, not by the model reading an expiry notification later.
+# timeout_ms: 1800000 always stays in both directives below (the Monitor tool
+# caps every watch there regardless); AGMSG_CC_MONITOR_KEEP_ALIVE is read by the
+# watcher itself. Kept word-for-word identical to scripts/delivery.sh's
+# emit_monitor_directive and scripts/drivers/types/claude-code/template.md's
+# overlays -- the surfaces must never disagree with each other.
+REARM_NOTE="
+This watch renews itself. A little before the 30-minute cap it prints one line on its own and exits: on \`agmsg watch: re-arm - ...\`, invoke Monitor again with exactly the command and description that line names (persistent: true, timeout_ms: 1800000), silently — no message to the user, no \"re-armed\", no acknowledgement, no summary, since announcing it every 30 minutes wastes tokens for no benefit; on \`agmsg watch: stopping - ...\`, do not re-arm it. If the watch is instead killed at the cap and no such line arrived (an agmsg install from before this), re-arm it only when the expiry notification says it delivered something."
+# The launch commands below end with the option that turns self-management on.
+WATCH_MAX_ARG="--max-seconds=1790"
 # Shell-quote each argv so the host can paste the command into Monitor and run
 # it verbatim. A plain '...' wrap breaks on paths with an apostrophe
 # (/Users/o'brien/...); printf %q escapes spaces, quotes and other metacharacters
 # safely for shell re-execution (#188). A resumed role adds the 4th <agent> arg.
 if [ -n "$ROLE_NAME" ]; then
-  WATCH_COMMAND="$(printf '%q %q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE" "$ROLE_NAME")"
+  WATCH_COMMAND="$(printf '%q %q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE" "$ROLE_NAME") $WATCH_MAX_ARG"
   # State the seat's basis honestly: the reader launches a watcher on the strength
   # of this sentence, so a recorded seat and an inferred one must not read alike
   # (#982/#993). The record path has an explicit role-session record; the narrowing
@@ -539,7 +526,7 @@ fi
 # explicitly — which re-fires this hook down the role-filtered path above.
 _pair_count="$(printf '%s\n' "$PAIRS" | grep -c '.' || true)"
 if [ "${_pair_count:-0}" -le 1 ]; then
-  WATCH_COMMAND="$(printf '%q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE")"
+  WATCH_COMMAND="$(printf '%q %q %q %q' "$WATCH" "$INSTANCE_ID" "$PROJECT" "$TYPE") $WATCH_MAX_ARG"
   cat <<EOF
 $TERMINAL_LINE
 $TEAM_LINE
