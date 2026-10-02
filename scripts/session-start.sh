@@ -59,6 +59,22 @@ source "$SCRIPT_DIR/lib/terminal-context-line.sh"
 PAIRS=$("$SCRIPT_DIR/identities.sh" "$PROJECT" "$TYPE" 2>/dev/null || true)
 [ -n "$PAIRS" ] || exit 0
 
+# A project hook is shared by every Claude Code launch surface that reads the
+# project's settings. Allow a user to opt out of selected surfaces without
+# removing the hook for their other sessions. The list is a comma-separated
+# global config value; matching is exact and case-sensitive.
+if [ "$TYPE" = "claude-code" ] && [ -n "${CLAUDE_CODE_ENTRYPOINT:-}" ]; then
+  _skip_entrypoints="$(bash "$SCRIPT_DIR/config.sh" get session_start.skip_entrypoints 2>/dev/null || true)"
+  IFS=, read -r -a _skip_entrypoint_values <<< "$_skip_entrypoints"
+  for _skip_entrypoint in "${_skip_entrypoint_values[@]}"; do
+    _skip_entrypoint="${_skip_entrypoint#"${_skip_entrypoint%%[![:space:]]*}"}"
+    _skip_entrypoint="${_skip_entrypoint%"${_skip_entrypoint##*[![:space:]]}"}"
+    if [ "$_skip_entrypoint" = "$CLAUDE_CODE_ENTRYPOINT" ]; then
+      exit 0
+    fi
+  done
+fi
+
 # Read hook input JSON from stdin BEFORE the type plug below runs (#1468):
 # stdin can only be read once, and a plug that needs a hook input field (e.g.
 # codex reading `source` to tell startup/resume/clear apart) has to see it
