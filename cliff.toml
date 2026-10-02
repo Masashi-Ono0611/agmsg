@@ -59,6 +59,21 @@ commit_parsers = [
   { message = "^Merge", skip = true },
   { message = "^release", skip = true },
   { message = "^(chore|ci|build|test|style)", skip = true },
+  # App-only changes after 1.5.0 ship in the desktop app release (app 0.5.0),
+  # not in the npm package. Named one by one: older app-scoped entries already
+  # in the changelog must keep appearing if the file is ever regenerated.
+  { message = "^fix\\(app\\): bound the sidebar's team list so it scrolls", skip = true },
+  { message = "^feat\\(app\\): allow Option-drag native text selection", skip = true },
+  { message = "^fix\\(app\\): About shows the core actually running", skip = true },
+  { message = "^fix\\(app\\): build the spawn prompt from each type's own", skip = true },
+  { message = "^fix\\(app\\): open a clicked agent in the tab being viewed", skip = true },
+  { message = "^fix\\(app\\): keep a renamed team's open tabs", skip = true },
+  # After 1.5.1: app and site changes ship outside the npm package (the next
+  # app release and the project site), not in the CLI.
+  { message = "^fix\\(app\\): bundle SKILL.md and the other files the installer reads", skip = true },
+  { message = "^fix\\(app\\): keep the sidebar user block and settings gear", skip = true },
+  { message = "^fix\\(app\\): emit each message once when events and legacy rows", skip = true },
+  { message = "^fix\\(site\\): bump Astro for GHSA-26w7-cxv4-gfx2", skip = true },
   { message = "^feat", group = "<!-- 0 -->Added" },
   { message = "^fix", group = "<!-- 1 -->Fixed" },
   { message = "^perf", group = "<!-- 2 -->Performance" },
@@ -92,6 +107,7 @@ commit_parsers = [
   { message = "^jev, ext-tool README", group = "<!-- 4 -->Documentation" },
   # Everything else (merges, initial commit, misc) is intentionally dropped.
   { message = "^codex: read the session name from session_index.jsonl", group = "<!-- 1 -->Fixed" },
+  { message = "^codex: report when a Codex config is missing this install's writable_roots", group = "<!-- 0 -->Added" },
   { message = ".*", skip = true },
 ]
 protect_breaking_commits = true
