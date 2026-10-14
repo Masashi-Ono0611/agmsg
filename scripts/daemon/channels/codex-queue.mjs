@@ -3,8 +3,8 @@
 
 import { createHash } from "node:crypto";
 import { homedir, hostname } from "node:os";
-import { isAbsolute, join, resolve, sep } from "node:path";
-import { lstatSync, readFileSync, readdirSync } from "node:fs";
+import { delimiter, dirname, isAbsolute, join, resolve, sep } from "node:path";
+import { accessSync, constants, lstatSync, readFileSync, readdirSync, statSync } from "node:fs";
 import { logLine } from "../log.mjs";
 import { withImmediateTransaction } from "../db.mjs";
 import {
@@ -134,13 +134,14 @@ function recordChildResult(db, id, result) {
     if (!row) return;
     let children;
     try { children = JSON.parse(row.children); } catch { children = { state: "unreadable", reason: "child_group_record_malformed" }; }
-    if (children.state === "incomplete" && result.kind === "failed" && result.reason?.startsWith("spawn_failed:")) {
-      children = { state: "absent", kind: result.kind };
+    const failedBeforeStart = result.kind === "failed" && result.started === false;
+    if (failedBeforeStart) {
+      children = { state: "absent", result: result.kind, reason: result.reason };
     } else {
       children.result = result.kind;
     }
-    db.prepare("UPDATE beta_codex_queue SET children = ? WHERE id = ? AND state = 'pending'")
-      .run(JSON.stringify(children), id);
+    db.prepare("UPDATE beta_codex_queue SET children = ?, state = ? WHERE id = ? AND state = 'pending'")
+      .run(JSON.stringify(children), failedBeforeStart ? "expired" : "pending", id);
   });
 }
 
@@ -266,7 +267,7 @@ export function createCodexQueueChannel({
   installRoot,
   expectedOpGen,
   env = process.env,
-  executable = "codex",
+  executable,
   timeoutMs = QUEUE_TIMEOUT_MS,
   now = Date.now,
   log = (message) => logLine(installRoot, message),
@@ -301,7 +302,7 @@ export function createCodexQueueChannel({
         return;
       }
       if (hostPlatform === "win32") {
-        const gate = windowsGate({ executable, env });
+        const gate = windowsGate({ executable: executable ?? db.prepare('SELECT codex_path FROM meta').get()?.codex_path, env });
         if (gate.state !== "ok") {
           if (observation.state === "confirmed") setQueueState(db, pending.id, "confirmed");
           else if (observation.state === "expired") setQueueState(db, pending.id, "expired");
@@ -354,14 +355,24 @@ export function createCodexQueueChannel({
       saveSeat(db, { seat, thread: record.thread, codexHome: record.codex_home, state: "blocked", reason: "role_session_type_mismatch" }, now);
       return;
     }
-    let queueExecutable = executable;
+    const runtime = db.prepare('SELECT codex_path, node_path FROM meta').get();
+    let queueExecutable = executable ?? runtime?.codex_path;
+    const queueEnv = { ...env, PATH: [runtime?.node_path ? dirname(runtime.node_path) : '', queueExecutable && isAbsolute(queueExecutable) ? dirname(queueExecutable) : '', env.PATH ?? ''].filter(Boolean).join(delimiter) };
     if (hostPlatform === "win32") {
-      const gate = windowsGate({ executable, env });
+      const gate = windowsGate({ executable: queueExecutable, env: queueEnv });
       if (gate.state !== "ok") {
         saveSeat(db, { seat, thread: record.thread, codexHome: record.codex_home, state: "blocked", reason: gate.reason }, now);
         return;
       }
       queueExecutable = gate.executable;
+    }
+    try {
+      if (!isAbsolute(queueExecutable ?? '')) throw new Error('not_absolute');
+      if (!statSync(queueExecutable).isFile()) throw new Error('not_file');
+      accessSync(queueExecutable, constants.X_OK);
+    } catch {
+      saveSeat(db, { seat, thread: record.thread, codexHome: record.codex_home, state: 'blocked', reason: 'codex_executable_unavailable:run_agmsg_daemon_enable' }, now);
+      return;
     }
     let driver;
     try {
@@ -437,6 +448,7 @@ export function createCodexQueueChannel({
     try {
       result = await queue({
         executable: queueExecutable,
+        env: queueEnv,
         codexHome: record.codex_home,
         thread: record.thread,
         message: inboxNudge(nonce),
@@ -448,6 +460,10 @@ export function createCodexQueueChannel({
       activeController = null;
     }
     recordChildResult(db, id, result);
+    if (result.kind === "failed" && result.started === false) {
+      saveSeat(db, { seat, thread: record.thread, codexHome: record.codex_home, state: "addressable", reason: result.reason }, now);
+      return;
+    }
     if (result.kind === "archived" || result.kind === "no_rollout") {
       setQueueState(db, id, "expired");
       const reason = result.kind === "archived" ? "thread_archived" : "codex_home_mismatch";

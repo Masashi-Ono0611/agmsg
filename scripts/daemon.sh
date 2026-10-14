@@ -121,6 +121,22 @@ _with_op_lock() {
     return 1
   fi
   if [ -n "$statements" ]; then
+    # Upgrade rc.1 inside this connection's operation lock and transaction.
+    local has_codex_path
+    printf '%s\n' "SELECT count(*) FROM pragma_table_info('meta', 'installdb') WHERE name='codex_path';" >&8
+    IFS= read -r -t 10 has_codex_path <&9 || has_codex_path=""
+    if [ "$has_codex_path" = 0 ]; then
+      printf '%s\n' 'ALTER TABLE installdb.meta ADD COLUMN codex_path TEXT;' >&8
+    elif [ "$has_codex_path" != 1 ]; then
+      printf 'ROLLBACK;\n.quit\n' >&8 2>/dev/null || true
+      exec 8>&-
+      exec 9<&-
+      wait "$lock_pid" 2>/dev/null || true
+      rm -f "$lock_dir/in" "$lock_dir/out"
+      rmdir "$lock_dir"
+      echo 'agmsg daemon: could not inspect the Codex executable column' >&2
+      return 1
+    fi
     printf '%s\n.print APPLIED\n' "$statements" >&8
     if ! IFS= read -r -t 10 applied <&9 || [ "$applied" != "APPLIED" ]; then
       printf 'ROLLBACK;\n.quit\n' >&8 2>/dev/null || true
@@ -379,6 +395,35 @@ _resolve_node() {
   printf '%s' "$resolved"
 }
 
+_resolve_codex() {
+  local candidate dir rest="${PATH:-}:" override="${AGMSG_REAL_CODEX:-}"
+  while :; do
+    if [ -n "$override" ]; then
+      candidate="$override"
+      override=""
+    elif [ -n "$rest" ]; then
+      dir="${rest%%:*}"
+      rest="${rest#*:}"
+      [ -n "$dir" ] || dir=.
+      candidate="$dir/codex"
+    else
+      return 1
+    fi
+    case "$candidate" in *[[:cntrl:]]*) continue ;; esac
+    [ -f "$candidate" ] && [ -x "$candidate" ] || continue
+    if head -c 4096 "$candidate" 2>/dev/null | grep -q 'Optional Codex entrypoint shim for agmsg monitor mode'; then
+      continue
+    fi
+    dir="$(cd "$(dirname "$candidate")" && pwd -P)" || continue
+    candidate="$dir/$(basename "$candidate")"
+    if command -v cygpath >/dev/null 2>&1; then
+      candidate="$(cygpath -m "$candidate")" || continue
+    fi
+    printf '%s\n' "$candidate"
+    return 0
+  done
+}
+
 _wait_for_ready() {
   local target_op_gen="$1" waited=0
   while [ "$waited" -lt 100 ]; do
@@ -519,8 +564,13 @@ cmd_enable() {
   }
   local node_version
   node_version="$("$node_path" -e 'console.log(process.versions.node)')"
+  local codex_path
+  codex_path="$(_resolve_codex 2>/dev/null || true)"
+  if [ -z "$codex_path" ]; then
+    echo 'agmsg daemon enable: no usable Codex executable found; Codex seats stay blocked until enabled again with Codex available.' >&2
+  fi
   _with_op_lock "
-    UPDATE meta SET node_path = '$(printf '%s' "$node_path" | sed "s/'/''/g")', node_version = '$node_version';
+    UPDATE meta SET node_path = '$(printf '%s' "$node_path" | sed "s/'/''/g")', node_version = '$node_version', codex_path = '$(printf '%s' "$codex_path" | sed "s/'/''/g")';
     UPDATE daemon_intent SET desired = 'on';
   " _register "$node_path" || {
     if ! _with_op_lock "" _unregister; then

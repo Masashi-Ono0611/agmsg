@@ -19,12 +19,16 @@ test("openInstallDb applies the schema idempotently; readOnly never migrates or 
       0,
       "daemon_start_attempts is append-only history with no seed row",
     );
+    // Simulate rc.1 without the additive Codex executable column.
+    db.exec("ALTER TABLE meta DROP COLUMN codex_path; UPDATE meta SET node_path='/saved/node'");
     db.close();
 
     // Re-opening (a second component, or a restart) must not add rows or
     // fail on the already-existing schema.
     const db2 = openInstallDb(path);
     assert.equal(db2.prepare("SELECT count(*) AS n FROM daemon_owner").get().n, 1);
+    assert.equal(db2.prepare("SELECT node_path, codex_path FROM meta").get().node_path, '/saved/node');
+    assert.equal(db2.prepare("SELECT codex_path FROM meta").get().codex_path, null);
     db2.close();
 
     // A readOnly open of a DB that was never created must not create it

@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { EventEmitter } from 'node:events';
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, mkdtempSync, mkdirSync, readFileSync, rmSync, unlinkSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { PassThrough } from 'node:stream';
@@ -51,6 +51,7 @@ function fakeChild({ stdout, stderr = '', code = 0, autoClose = true }) {
   child.kill = () => true;
   if (autoClose) {
     setImmediate(() => {
+      child.emit('spawn');
       child.stdout.end(stdout);
       child.stderr.end(stderr);
       child.emit('close', code, null);
@@ -58,6 +59,78 @@ function fakeChild({ stdout, stderr = '', code = 0, autoClose = true }) {
   }
   return child;
 }
+
+function executableFixture(t) {
+  const root = temporaryDirectory(t);
+  mkdirSync(path.join(root, 'run'));
+  const home = path.join(root, 'profile');
+  mkdirSync(path.join(home, 'sessions'), { recursive: true });
+  writeFileSync(path.join(home, 'sessions', `rollout-test-${thread}.jsonl`), [
+    JSON.stringify({ type: 'session_meta', payload: { id: thread } }),
+    JSON.stringify({ type: 'event_msg', payload: { type: 'user_message', message: 'earlier prompt' } }), '',
+  ].join('\n'));
+  const db = openInstallDb(path.join(root, 'run', 'install.db'));
+  ensureCodexChannelSchema(db);
+  db.exec("UPDATE daemon_intent SET desired='on', op_gen=1");
+  t.after(() => db.close());
+  const options = {
+    db, installRoot: root, expectedOpGen: 1,
+    env: { PATH: '/usr/bin:/bin:/usr/sbin:/sbin', AGMSG_STORAGE_PATH: root },
+    listSeats: () => ({ state: 'ok', seats: [{ team: 'test', agent: 'alice', teamConfig: { agents: { alice: { registrations: [{ type: 'codex', project: root }] } } } }] }),
+    readSession: () => ({ state: 'present', record: { team: 'test', agent: 'alice', type: 'codex', project: root, thread, codex_home: home } }),
+    readDriver: () => ({ state: 'ok', driver: 'sqlite' }),
+    openStore: () => ({ close() {} }),
+    readSnapshot: () => ({ state: 'ok', unread: true, upTo: '{}' }),
+    captureGroup: () => ({ state: 'absent' }),
+  };
+  return { root, db, options };
+}
+
+test('recorded absolute Codex runs with an env-node shebang under a minimal service PATH', async (t) => {
+  if (process.platform === 'win32') return t.skip('POSIX env-node launcher');
+  const { root, db, options } = executableFixture(t);
+  const binary = path.join(root, 'custom codex');
+  writeFileSync(binary, `#!/usr/bin/env node\nconsole.log('Queued message ${itemId} for thread ${thread}.');\n`);
+  chmodSync(binary, 0o755);
+  const channel = createCodexQueueChannel(options);
+  await channel.pollOnce();
+  assert.equal(db.prepare('SELECT state FROM beta_codex_seat').get().state, 'blocked');
+  assert.match(db.prepare('SELECT reason FROM beta_codex_seat').get().reason, /codex_executable_unavailable/);
+  db.prepare('UPDATE meta SET codex_path=?, node_path=?').run(binary, process.execPath);
+  await channel.pollOnce();
+  const row = db.prepare('SELECT state, queue_item_id FROM beta_codex_queue').get();
+  assert.equal(row.queue_item_id, itemId);
+  assert.equal(row.state, 'pending', 'a receipt alone is not delivery confirmation');
+  await channel.stop();
+});
+
+test('a pre-spawn failure expires its reservation and allows the next poll to retry', async (t) => {
+  const { db, options } = executableFixture(t);
+  db.prepare('UPDATE meta SET codex_path=?, node_path=?').run(process.execPath, process.execPath);
+  let attempts = 0;
+  let witnesses = 0;
+  const channel = createCodexQueueChannel({ ...options, captureGroup: () => {
+    witnesses += 1;
+    return { state: 'unreadable' };
+  }, queue: (request) => {
+    attempts += 1;
+    // Model a recorded executable disappearing between validation and spawn.
+    return runCodexQueue({ ...request, executable: path.join(options.installRoot, 'missing-codex') });
+  } });
+  await channel.pollOnce();
+  let rows = db.prepare('SELECT state, queue_item_id, children FROM beta_codex_queue').all();
+  assert.equal(rows[0].state, 'expired');
+  assert.equal(rows[0].queue_item_id, null);
+  const children = JSON.parse(rows[0].children);
+  assert.equal(children.state, 'absent');
+  assert.match(children.reason, /spawn_failed:ENOENT/);
+  await channel.pollOnce();
+  rows = db.prepare('SELECT state FROM beta_codex_queue').all();
+  assert.equal(attempts, 2);
+  assert.equal(witnesses, 0, 'a failed spawn must never request a process witness');
+  assert.deepEqual(rows.map(row => row.state), ['expired', 'expired']);
+  await channel.stop();
+});
 
 test('queue invocation is shell-free, pins CODEX_HOME, and parses only a successful matching receipt', async () => {
   const calls = [];
@@ -349,6 +422,7 @@ test('Codex channel queues one unread snapshot and confirms it before advancing 
   queueDb.close();
 
   const installDb = openInstallDb(path.join(runDir, 'install.db'));
+  installDb.prepare('UPDATE meta SET codex_path=?, node_path=?').run(process.execPath, process.execPath);
   ensureCodexChannelSchema(installDb);
   installDb.exec("UPDATE daemon_intent SET desired='on', op_gen=4");
   const queued = [];
@@ -429,6 +503,8 @@ test('Codex channel queues one unread snapshot and confirms it before advancing 
   nextMessageDb.close();
   const nativeExe = path.join(root, 'codex.exe');
   writeFileSync(nativeExe, 'native fixture, never executed');
+  chmodSync(nativeExe, 0o755);
+  installDb.prepare('UPDATE meta SET codex_path=?').run(nativeExe);
   let windowsQueues = 0;
   let windowsChildState = 'present';
   const verifiedWindowsChannel = createCodexQueueChannel({

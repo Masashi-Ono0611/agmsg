@@ -14,13 +14,14 @@
 -- (written by install.sh, PR 2); run/install-manifest.json carries only a
 -- COPY of it, and the entrypoint's startup verification confirms the two
 -- still agree. schema_version is written by
--- install/agmsgd; node_path and node_version are written ONLY by the
+-- install/agmsgd; node_path, node_version and codex_path are written ONLY by the
 -- enable/disable CLI (never by agmsgd itself).
 CREATE TABLE IF NOT EXISTS meta (
   schema_version INTEGER NOT NULL,
   install_id TEXT,
   node_path TEXT,
-  node_version TEXT
+  node_version TEXT,
+  codex_path TEXT
 );
 INSERT INTO meta (schema_version, install_id, node_path, node_version)
   SELECT 1, NULL, NULL, NULL WHERE NOT EXISTS (SELECT 1 FROM meta);

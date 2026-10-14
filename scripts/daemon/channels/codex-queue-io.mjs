@@ -55,6 +55,7 @@ export async function runCodexQueue({
   timeoutMs,
   signal,
   onChildStart,
+  env = process.env,
   spawnProcess = spawn,
 }) {
   if (typeof executable !== "string" || executable.length === 0) throw new TypeError("missing Codex executable");
@@ -68,13 +69,13 @@ export async function runCodexQueue({
   let child;
   try {
     child = spawnProcess(executable, args, {
-      env: { ...process.env, CODEX_HOME: codexHome },
+      env: { ...env, CODEX_HOME: codexHome },
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
       detached: process.platform !== "win32",
     });
   } catch (error) {
-    return { kind: "failed", reason: `spawn_failed: ${error.message}` };
+    return { kind: "failed", started: false, reason: `spawn_failed:${error.code ?? "unknown"}: ${error.message}` };
   }
 
   let stdout = "";
@@ -111,7 +112,10 @@ export async function runCodexQueue({
     if (timedOut) signalProcessGroup(child, "SIGKILL");
   }, timeoutMs + 1000);
   let childRecordFailed = false;
-  if (onChildStart) {
+  let started = false;
+  child.once("spawn", () => {
+    started = true;
+    if (!onChildStart) return;
     try {
       onChildStart(child.pid);
     } catch {
@@ -119,7 +123,7 @@ export async function runCodexQueue({
       signalProcessGroup(child, "SIGTERM");
       killTimers.push(setTimeout(() => signalProcessGroup(child, "SIGKILL"), 1000));
     }
-  }
+  });
   const result = await closed;
   clearTimeout(timer);
   clearTimeout(hardKill);
@@ -127,9 +131,10 @@ export async function runCodexQueue({
   signal?.removeEventListener("abort", onAbort);
 
   if (childRecordFailed) return { kind: "failed", reason: "child_record_failed", stdout, stderr };
+  if (result.error && !started) return { kind: "failed", started: false, reason: `spawn_failed:${result.error.code ?? "unknown"}: ${result.error.message}`, stdout, stderr };
   if (aborted) return { kind: "cancelled", reason: "daemon_stopping", stdout, stderr };
   if (timedOut) return { kind: "timeout", stdout, stderr };
-  if (result.error) return { kind: "failed", reason: `spawn_failed: ${result.error.message}`, stdout, stderr };
+  if (result.error) return { kind: "failed", started, reason: `spawn_failed:${result.error.code ?? "unknown"}: ${result.error.message}`, stdout, stderr };
   const combined = `${stdout}\n${stderr}`;
   if (result.code !== 0) {
     if (combined.includes("code -32600")) return { kind: "archived", reason: "thread_archived" };

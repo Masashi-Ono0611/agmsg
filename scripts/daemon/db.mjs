@@ -19,6 +19,12 @@ export function openInstallDb(path, { readonly = false } = {}) {
   db.exec("PRAGMA busy_timeout = 5000;");
   if (!readonly) {
     db.exec(readFileSync(SCHEMA_PATH, "utf8"));
+    // Additive upgrade from rc.1; existing enable settings remain intact.
+    withImmediateTransaction(db, () => {
+      if (!db.prepare("SELECT 1 FROM pragma_table_info('meta') WHERE name='codex_path'").get()) {
+        db.exec("ALTER TABLE meta ADD COLUMN codex_path TEXT");
+      }
+    });
   }
   return db;
 }
