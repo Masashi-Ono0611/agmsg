@@ -273,13 +273,13 @@ _register_linux() {
   cat > "$unit_path" <<EOF
 [Unit]
 Description=agmsgd ($SKILL_DIR)
+StartLimitIntervalSec=600
+StartLimitBurst=5
 
 [Service]
 ExecStart=$LAUNCHER
 Restart=on-failure
 RestartSec=30s
-StartLimitIntervalSec=600
-StartLimitBurst=5
 
 [Install]
 WantedBy=default.target
@@ -637,12 +637,8 @@ cmd_enable() {
   cmd_start
 }
 
-cmd_disable() {
-  _ensure_install_db_schema
-  _with_op_lock "UPDATE daemon_intent SET desired = 'off', op_gen = op_gen + 1, set_by = 'disable', set_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');" _unregister
-  local socket
-  socket="$(sqlite3 "$INSTALL_DB" "SELECT socket FROM daemon_owner WHERE state = 'ready';" 2>/dev/null || true)"
-  _request_stop_over_socket "$socket"
+# Reads daemon_owner.state, waiting up to ~10s for it to become "none".
+_wait_owner_none() {
   local waited=0 state
   while [ "$waited" -lt 100 ]; do
     state="$(sqlite3 "$INSTALL_DB" "SELECT state FROM daemon_owner;" 2>/dev/null || true)"
@@ -650,6 +646,73 @@ cmd_disable() {
     waited=$((waited + 1))
     sleep 0.1
   done
+  printf '%s' "$state"
+}
+
+# Runs on the connection _with_op_lock holds (fds 8/9): one value from install.db.
+_lock_query() {
+  local row marker
+  printf '%s\n.print Q_END\n' "$1" >&8
+  IFS= read -r -t 10 row <&9 || return 1
+  IFS= read -r -t 10 marker <&9 || return 1
+  [ "${marker%$'\r'}" = Q_END ] || return 1
+  printf '%s' "${row%$'\r'}"
+}
+
+# Turns the intent off and records what it was and which op_gen this disable
+# owns, so the later steps touch only their own change.
+_disable_commit_intent() {
+  DISABLE_PREV_INTENT="$(_lock_query "SELECT desired FROM installdb.daemon_intent;")" || return 1
+  printf '%s\n' "UPDATE installdb.daemon_intent SET desired = 'off', op_gen = op_gen + 1, set_by = 'disable', set_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');" >&8
+  DISABLE_GEN="$(_lock_query "SELECT op_gen FROM installdb.daemon_intent;")" || return 1
+}
+
+# Unregisters only while the intent is still the one this disable wrote; a
+# later enable/start owns the service now and is left alone.
+_disable_unregister_if_current() {
+  local now
+  now="$(_lock_query "SELECT desired || '|' || op_gen FROM installdb.daemon_intent;")" || return 1
+  if [ "$now" != "off|$DISABLE_GEN" ]; then
+    DISABLE_SUPERSEDED=1
+    return 0
+  fi
+  _unregister
+}
+
+# After a failed unregister: put the intent back as it was, but only if it is
+# still the one this disable wrote.
+_disable_restore_intent() {
+  local now
+  now="$(_lock_query "SELECT desired || '|' || op_gen FROM installdb.daemon_intent;")" || return 1
+  [ "$now" = "off|$DISABLE_GEN" ] || return 0
+  printf '%s\n' "UPDATE installdb.daemon_intent SET desired = '$DISABLE_PREV_INTENT', op_gen = op_gen + 1, set_by = 'disable', set_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');" >&8
+}
+
+cmd_disable() {
+  _ensure_install_db_schema
+  # The daemon writes stopping -> none into install.db on its way out, so it
+  # must stop while no operation holds that database: commit the intent and
+  # release the lock first, let the daemon finish, and only then unregister
+  # the service under the lock. Stopping the service from inside the lock
+  # made the dying daemon fail with "database is locked" and left the record
+  # at ready.
+  local DISABLE_PREV_INTENT="" DISABLE_GEN="" DISABLE_SUPERSEDED=0
+  _with_op_lock "" _disable_commit_intent || return 1
+  local socket state
+  socket="$(sqlite3 "$INSTALL_DB" "SELECT socket FROM daemon_owner WHERE state = 'ready';" 2>/dev/null || true)"
+  _request_stop_over_socket "$socket"
+  state="$(_wait_owner_none)"
+  if ! _with_op_lock "" _disable_unregister_if_current; then
+    _with_op_lock "" _disable_restore_intent || true
+    return 1
+  fi
+  if [ "$DISABLE_SUPERSEDED" = 1 ]; then
+    echo "agmsg daemon disable: the service was changed by another command while disable was waiting; it was left as that command set it -- check 'agmsg daemon status'" >&2
+    return 1
+  fi
+  if [ "$state" != "none" ]; then
+    state="$(_wait_owner_none)"
+  fi
   if [ "$state" != "none" ]; then
     # A record written by an older version cannot be checked against this
     # boot. Disable is the deliberate way out of it: the daemon was asked to
