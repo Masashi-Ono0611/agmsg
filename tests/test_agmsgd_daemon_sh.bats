@@ -383,3 +383,32 @@ EOF
   [ ! -f "$marker" ]
   [ ! -f "$TEST_SKILL_DIR/run/agmsgd-$(_unit_id).xml" ]
 }
+
+@test "daemon.sh enable/disable: without a systemd user manager enable explains and changes nothing, disable still works" {
+  _seed_install_db
+  _write_completion_record
+  mkdir -p "$TEST_SKILL_DIR/fake-linux"
+  printf '#!/usr/bin/env bash\necho Linux\n' > "$TEST_SKILL_DIR/fake-linux/uname"
+  chmod +x "$TEST_SKILL_DIR/fake-linux/uname"
+  local before
+  before="$(sqlite3 "$TEST_SKILL_DIR/run/install.db" "SELECT coalesce(desired, '') || '|' || (SELECT node_path FROM meta) FROM daemon_intent;")"
+
+  PATH="$TEST_SKILL_DIR/fake-linux:$PATH" AGMSGD_SYSTEMCTL="$TEST_SKILL_DIR/no-such-systemctl" \
+    run bash "$DAEMON" enable
+  [ "$status" -eq 1 ]
+  echo "$output" | grep -q "systemd user services are not available"
+  ! echo "$output" | grep -q "command not found" || false
+  [ "$(sqlite3 "$TEST_SKILL_DIR/run/install.db" "SELECT coalesce(desired, '') || '|' || (SELECT node_path FROM meta) FROM daemon_intent;")" = "$before" ]
+  [ ! -e "$HOME/.config/systemd/user" ]
+
+  # A unit file left by an earlier enable must not make disable fail either.
+  local unit_id unit
+  unit_id="$(printf '%s:%s' "$TEST_SKILL_DIR" daemon-sh-test | shasum -a 256 | cut -c1-12)"
+  unit="$HOME/.config/systemd/user/agmsgd-$unit_id.service"
+  mkdir -p "$(dirname "$unit")"
+  : > "$unit"
+  PATH="$TEST_SKILL_DIR/fake-linux:$PATH" AGMSGD_SYSTEMCTL="$TEST_SKILL_DIR/no-such-systemctl" \
+    run bash "$DAEMON" disable
+  [ "$status" -eq 0 ]
+  [ ! -e "$unit" ]
+}

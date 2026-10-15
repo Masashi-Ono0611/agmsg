@@ -243,6 +243,10 @@ _unregister_darwin() {
   fi
 }
 
+# False on a machine with no systemd user manager (a container, WSL1, a
+# minimal image): no systemctl at all, or one that cannot reach a user bus.
+_systemd_user_usable() { "$AGMSGD_SYSTEMCTL" --user show-environment >/dev/null 2>&1; }
+
 _systemd_unit_path() { printf '%s/.config/systemd/user/agmsgd-%s.service' "$HOME" "$(_unit_id)"; }
 
 # NOT YET RUN ON LINUX in this environment -- configured with
@@ -276,12 +280,18 @@ _unregister_linux() {
   unit_path="$(_systemd_unit_path)"
   unit_name="$(basename "$unit_path")"
   if [ -f "$unit_path" ]; then
-    if ! "$AGMSGD_SYSTEMCTL" --user disable --now "$unit_name"; then
-      echo "agmsg daemon: could not disable systemd user service $unit_name" >&2
-      return 1
+    # With no systemd user manager there is nothing registered with it to
+    # undo; drop the unit file so disable can still finish.
+    if _systemd_user_usable; then
+      if ! "$AGMSGD_SYSTEMCTL" --user disable --now "$unit_name"; then
+        echo "agmsg daemon: could not disable systemd user service $unit_name" >&2
+        return 1
+      fi
+      rm -f "$unit_path"
+      "$AGMSGD_SYSTEMCTL" --user daemon-reload
+    else
+      rm -f "$unit_path"
     fi
-    rm -f "$unit_path"
-    "$AGMSGD_SYSTEMCTL" --user daemon-reload
   fi
 }
 
@@ -575,6 +585,11 @@ cmd_status() {
 
 cmd_enable() {
   _require_install_db
+  if [ "$(_os)" = linux ] && ! _systemd_user_usable; then
+    echo "agmsg daemon enable: systemd user services are not available here (systemctl --user does not work), so agmsgd cannot be registered to start on its own. Nothing was changed. 'agmsg daemon start' runs it for this session only." >&2
+    _path_hint start >&2
+    return 1
+  fi
   local node_path
   node_path="$(_resolve_node node)" || {
     echo "agmsg daemon enable: no usable Node found (need >= 22.13.0 with node:sqlite). Install one and try again." >&2
