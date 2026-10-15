@@ -140,6 +140,15 @@ agmsg_source_version() {
   fi
 }
 
+agmsg_install_restart_guidance() {
+  echo '  Next: finish your current work, then close and reopen each running agent.'
+  echo '    Resume the same conversation and run your messaging skill with actas <existing-agent-name> to refresh its destination.'
+  printf '    Check notice delivery from that session with: bash %q status <type> <project>\n' "$SKILL_DIR/scripts/delivery.sh"
+  printf '    If you use agmsgd, check it with: bash %q daemon status\n' "$SKILL_DIR/scripts/agmsg"
+  echo '    If status says the enabled daemon is stopped, run agmsg daemon start.'
+  echo '    This installation does not enable agmsgd or switch existing sessions automatically.'
+}
+
 # --- Defaults ---
 CMD_NAME=""
 UPDATE_ONLY=false
@@ -1197,9 +1206,7 @@ $_agmsg_running_team"
   fi
   agmsg_install_op_run_phase configure_codex_sandbox || exit 1
   echo ""
-  echo "  ! Restart any running agent sessions to pick up the updated scripts."
-  echo "    In-flight watch.sh processes detect this and stand down on their own;"
-  echo "    reopening the session brings delivery back."
+  agmsg_install_restart_guidance
   echo ""
   # #963: a sync engine has no equivalent self-detection, so this update
   # restarts one itself for every team the snapshot above found running.
@@ -1430,8 +1437,8 @@ echo ""
 echo "  ✓ Installed to ~/.agents/skills/$CMD_NAME/ (version $INSTALLED_VERSION)"
 echo ""
 echo "  Next steps:"
-echo "    1. Restart your agent (Claude Code / Codex / Gemini CLI / Antigravity / OpenCode) to pick up the new skill"
-echo "    2. Run the command to join a team:"
+agmsg_install_restart_guidance
+echo "    Run the command to join a team:"
 echo "       Claude Code:  /$CMD_NAME"
 echo "       Codex:        \$$CMD_NAME"
 echo "       Gemini CLI:   \$$CMD_NAME"

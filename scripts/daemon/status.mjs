@@ -15,7 +15,7 @@
 //     that says ready but a socket that refuses the connection is the
 //     "ready, but does not connect" case, which only an
 //     external prober (not the daemon answering about itself) can ever
-//     observe. Prints one JSON line to stdout; exit code follows the
+//     observe. Prints human-readable text, or JSON with --json; exit code follows the
 //     table's own exit column.
 
 import { existsSync, realpathSync } from "node:fs";
@@ -25,6 +25,7 @@ import { fileURLToPath } from "node:url";
 import { isAlive } from "./executor.mjs";
 import { openInstallDb } from "./db.mjs";
 import { PROTOCOL_VERSION } from "./control.mjs";
+import { listCodexRegistrations } from "./channels/codex-queue-store.mjs";
 
 const STARTING_STOPPING_GRACE_MS = 30_000;
 
@@ -133,11 +134,17 @@ export function readOwnerAndIntentReadOnly(installRoot) {
       if (!String(error?.message ?? "").includes("no such table")) throw error;
       claudeCodeSeats = { state: "unavailable", reason: "channel_not_initialized", seats: [] };
     }
+    let codexPending = [];
+    try {
+      codexPending = db.prepare("SELECT seat, created_at FROM beta_codex_queue WHERE state='pending' ORDER BY created_at, id").all();
+    } catch (error) {
+      if (!String(error?.message ?? "").includes("no such table")) throw error;
+    }
     const alive =
       owner.state === "none" || owner.executor_pid == null
         ? null
         : isAlive({ pid: owner.executor_pid, bootId: owner.executor_boot_id });
-    return { owner, intent, alive, codexSeats, claudeCodeSeats, lastAttempt };
+    return { owner, intent, alive, codexSeats, claudeCodeSeats, codexPending, lastAttempt };
   } finally {
     db.close();
   }
@@ -174,13 +181,15 @@ function probeSocket(socketPath, timeoutMs = 2000) {
 
 async function main() {
   const installRoot = process.argv[2];
+  const json = process.argv.slice(3).includes("--json");
+  const all = process.argv.slice(3).includes("--all");
   if (!installRoot) {
     process.stderr.write("usage: status.mjs <installRoot>\n");
     process.exit(2);
   }
-  let owner, intent, alive, codexSeats, claudeCodeSeats, lastAttempt;
+  let owner, intent, alive, codexSeats, claudeCodeSeats, codexPending, lastAttempt;
   try {
-    ({ owner, intent, alive, codexSeats, claudeCodeSeats, lastAttempt } = readOwnerAndIntentReadOnly(installRoot));
+    ({ owner, intent, alive, codexSeats, claudeCodeSeats, codexPending, lastAttempt } = readOwnerAndIntentReadOnly(installRoot));
   } catch (error) {
     // An input that can be detected as an error is reported at
     // that entry point, with a nonzero exit -- not a raw stack trace, and
@@ -191,8 +200,8 @@ async function main() {
   const reachable = owner.state === "ready" && owner.socket ? await probeSocket(owner.socket) : false;
   const result = classify({ owner, intent, alive, reachable, lastAttempt });
 
-  // The node:sqlite experimental-feature warning is surfaced here, always
-  // -- not hidden, not treated as a failure.
+  // The CLI suppresses Node's ExperimentalWarning category for managed SQLite
+  // usage. Ordinary warnings and errors are still surfaced.
   //
   // `process.exitCode = ...` and returning, NOT `process.exit(...)`: when
   // stdout is a pipe rather than a TTY (exactly what capturing this
@@ -205,9 +214,44 @@ async function main() {
   // unbuffered) looked completely fine. Setting exitCode and letting the
   // event loop drain naturally waits for the flush first.
   process.stdout.write(
-    `${JSON.stringify({ ...result, codex_seats: codexSeats, claude_code_seats: claudeCodeSeats, node_sqlite_experimental: true, node_version: process.version })}\n`,
+    json ? `${JSON.stringify({ ...result, codex_seats: codexSeats, claude_code_seats: claudeCodeSeats, codex_pending: codexPending, node_sqlite_experimental: true, node_version: process.version })}\n` : `${result.text}\n${formatClaudeSeats(claudeCodeSeats, all)}${formatUnregisteredPending(installRoot, codexPending, all)}`,
   );
   process.exitCode = result.exitCode;
+}
+
+function formatUnregisteredPending(installRoot, pending, all) {
+  if (!pending.length) return "";
+  let roster;
+  try { roster = listCodexRegistrations(join(installRoot, "teams")); } catch { /* Do not guess that an unreadable roster is empty. */ }
+  if (roster?.state !== "ok") return "Codex registrations could not be read; inspect pending confirmations with agmsg daemon status --json.\n";
+  const registered = new Set(roster.seats.map(({ team, agent }) => JSON.stringify([team, agent])));
+  const orphaned = pending.filter(row => !registered.has(row.seat));
+  if (!orphaned.length) return "";
+  let text = `Pending confirmations for unregistered seats: ${orphaned.length}. View the list with: agmsg daemon status --all\n`;
+  if (all) {
+    for (const row of orphaned) {
+      let label;
+      try { label = JSON.parse(row.seat).join("/"); } catch { label = "unidentified seat"; }
+      text += `Codex ${label}: unregistered; past destination; confirmation pending since ${row.created_at}\n`;
+    }
+  }
+  return text;
+}
+
+function formatClaudeSeats(inventory, all) {
+  let omitted = 0;
+  const lines = [];
+  for (const seat of inventory?.seats ?? []) {
+    if (!all && (seat.state === "unaddressable" || !seat.messaging_socket)) {
+      omitted += 1;
+      continue;
+    }
+    let label;
+    try { label = JSON.parse(seat.seat).join("/"); } catch { label = "unidentified seat"; }
+    lines.push(`Claude Code ${label}: last daemon observation: ${seat.state}${seat.reason ? ` (${seat.reason})` : ""}`);
+  }
+  if (omitted) lines.push(`Claude Code seats: ${omitted} unavailable destination records hidden. View them with: agmsg daemon status --all`);
+  return lines.length ? `${lines.join("\n")}\n` : "";
 }
 
 // `fileURLToPath(import.meta.url)` is realpath'd by Node's own module

@@ -13,6 +13,8 @@ usage: agmsg <command> [args]
 
 commands:
   daemon start|stop|status|enable|disable   manage the agmsgd beta daemon
+    status --all                           include older destination records
+    status --json                          machine-readable status
   --version                                 print the installed version
   help                                      show this message
 

@@ -116,7 +116,10 @@ agmsg_launcher_install() {
   esac
   resolved="$(command -v agmsg 2>/dev/null || true)"
   if [ -n "$resolved" ] && [ "$resolved" != "$target" ]; then
-    echo "    note: 'agmsg' currently resolves to $resolved, which comes first on PATH"
+    case "$resolved" in
+      */_npx/*|*\\_npx\\*) : ;; # Temporary installer entry, not a persistent PATH conflict.
+      *) echo "    note: 'agmsg' currently resolves to $resolved, which comes first on PATH" ;;
+    esac
   fi
   # Every PATH entry ahead of the launcher's directory is checked, not just the
   # first hit: during `npx agmsg install` a temporary entry sits first and an
@@ -158,6 +161,7 @@ agmsg_launcher_find_old_npm_entry() {
     rest="${rest#*:}"
     [ -n "$dir" ] || continue
     [ "$dir" = "$stop" ] && return 1
+    case "$dir" in */_npx/*|*\\_npx\\*) continue ;; esac
     if agmsg_launcher_is_old_npm_entry "$dir/agmsg"; then
       printf '%s\n' "$dir/agmsg"
       return 0

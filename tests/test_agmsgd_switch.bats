@@ -209,7 +209,7 @@ WRAPPER
 }
 
 @test "status on a never-started enabled install fails with recovery and missing destinations" {
-  run bash "$SCRIPTS/daemon.sh" status
+  run bash "$SCRIPTS/daemon.sh" status --all
   [ "$status" -eq 1 ]
   assert_contains 'agmsg daemon start'
   assert_contains 'no destination record'

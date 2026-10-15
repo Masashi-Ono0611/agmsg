@@ -39,6 +39,7 @@ AGMSGD_SCHTASKS="${AGMSGD_SCHTASKS:-schtasks}"
 _usage() {
   cat >&2 <<'EOF'
 usage: agmsg daemon start|stop|status|enable|disable
+status options: --json (machine-readable), --all (include older destinations)
 EOF
 }
 
@@ -387,7 +388,7 @@ _unregister() {
 _resolve_node() {
   local candidate="${1:-node}" resolved
   resolved="$(command -v "$candidate" 2>/dev/null)" || return 1
-  "$resolved" -e '
+  "$resolved" --disable-warning=ExperimentalWarning -e '
     const [maj, min] = process.versions.node.split(".").map(Number);
     if (maj < 22 || (maj === 22 && min < 13)) process.exit(1);
     require("node:sqlite");
@@ -524,23 +525,42 @@ cmd_stop() {
 
 cmd_status() {
   _require_install_db
-  agmsg_daemon_read_state
-  local health_rc=0
-  if [ "${AGMSGD_DESIRED:-unknown}" = on ] && [ "${AGMSGD_HEALTH:-unknown}" != ready ]; then
-    agmsg_daemon_recovery_text
-    health_rc=1
-  elif [ "${AGMSGD_HEALTH:-unknown}" = unknown ]; then
-    echo 'agmsg daemon status: install record could not be read; health is unknown'
-    health_rc=1
-  fi
+  local json=false AGMSG_DAEMON_ALL=0 option
+  for option in "$@"; do
+    case "$option" in
+      --json) json=true ;;
+      --all) AGMSG_DAEMON_ALL=1 ;;
+      *) _usage; return 2 ;;
+    esac
+  done
   local node_path
   node_path="$(_resolve_node node 2>/dev/null || true)"
   if [ -n "$node_path" ]; then
     local status_rc=0
-    "$node_path" "$SCRIPT_DIR/daemon/status.mjs" "$SKILL_DIR" || status_rc=$?
-    agmsg_daemon_seat_report status
-    [ "$health_rc" -eq 0 ] || return 1
+    if [ "$json" = true ]; then
+      "$node_path" --disable-warning=ExperimentalWarning "$SCRIPT_DIR/daemon/status.mjs" "$SKILL_DIR" --json || status_rc=$?
+    else
+      if [ "$AGMSG_DAEMON_ALL" = 1 ]; then
+        "$node_path" --disable-warning=ExperimentalWarning "$SCRIPT_DIR/daemon/status.mjs" "$SKILL_DIR" --all || status_rc=$?
+      else
+        "$node_path" --disable-warning=ExperimentalWarning "$SCRIPT_DIR/daemon/status.mjs" "$SKILL_DIR" || status_rc=$?
+      fi
+      agmsg_daemon_seat_report status
+    fi
     return "$status_rc"
+  fi
+  agmsg_daemon_read_state
+  local health_rc=0
+  if [ "${AGMSGD_DESIRED:-unknown}" = on ] && [ "${AGMSGD_HEALTH:-unknown}" != ready ]; then
+    [ "$json" = true ] || agmsg_daemon_recovery_text
+    health_rc=1
+  elif [ "${AGMSGD_HEALTH:-unknown}" = unknown ]; then
+    [ "$json" = true ] || echo 'agmsg daemon status: install record could not be read; health is unknown'
+    health_rc=1
+  fi
+  if [ "$json" = true ]; then
+    sqlite3 "$INSTALL_DB" "SELECT json_object('state',state,'intent',(SELECT desired FROM daemon_intent),'health','${AGMSGD_HEALTH:-unknown}','detail','no usable Node') FROM daemon_owner;"
+    return "$health_rc"
   fi
   # K14 fallback: no usable Node at all -- a minimal, honest read straight
   # from install.db rather than the fuller status.mjs decision text.
@@ -608,7 +628,7 @@ cmd_disable() {
 case "${1:-}" in
   start) cmd_start ;;
   stop) cmd_stop ;;
-  status) cmd_status ;;
+  status) shift; cmd_status "$@" ;;
   enable) cmd_enable ;;
   disable) cmd_disable ;;
   *) _usage; exit 2 ;;
