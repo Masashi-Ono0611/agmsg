@@ -507,8 +507,24 @@ cmd_start() {
     return 0
   fi
 
+  # A install that was never enabled (enable refuses without a service
+  # manager) has no Node recorded, and the launcher cannot start without
+  # one. Find it here the way enable does, and stop before touching the
+  # intent when there is none.
+  local recorded_node found_node found_version record_node_sql=""
+  recorded_node="$(sqlite3 "$INSTALL_DB" "SELECT node_path FROM meta;" 2>/dev/null || true)"
+  if [ -z "$recorded_node" ] || [ ! -x "$recorded_node" ]; then
+    found_node="$(_resolve_node node)" || {
+      echo "agmsg daemon start: no usable Node found (need >= 22.13.0 with node:sqlite), so agmsgd cannot start. Nothing was changed. Install Node from https://nodejs.org/en/download, then run agmsg daemon start." >&2
+      _path_hint start >&2
+      return 1
+    }
+    found_version="$("$found_node" -e 'console.log(process.versions.node)')"
+    record_node_sql="UPDATE meta SET node_path = '$(printf '%s' "$found_node" | sed "s/'/''/g")', node_version = '$found_version';"
+  fi
+
   local new_op_gen
-  _with_op_lock "UPDATE daemon_intent SET desired = 'on', op_gen = op_gen + 1, set_by = 'start', set_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');"
+  _with_op_lock "$record_node_sql UPDATE daemon_intent SET desired = 'on', op_gen = op_gen + 1, set_by = 'start', set_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');"
   new_op_gen="$(sqlite3 "$INSTALL_DB" "SELECT op_gen FROM daemon_intent;")"
   if _service_registered; then
     if ! _start_registered_service; then

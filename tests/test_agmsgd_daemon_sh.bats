@@ -182,6 +182,16 @@ _assert_start_result() {
   bash "$DAEMON" stop >/dev/null 2>&1 || true
 }
 
+@test "daemon.sh start: an install that never recorded Node finds and records it, then starts" {
+  _seed_install_db
+  _write_completion_record
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE meta SET node_path = NULL, node_version = NULL;"
+  _run_with_deadline 15 bash "$DAEMON" start
+  _assert_start_result 'running'
+  [ -x "$(sqlite3 "$TEST_SKILL_DIR/run/install.db" "SELECT node_path FROM meta;")" ]
+  bash "$DAEMON" stop >/dev/null 2>&1 || true
+}
+
 @test "daemon.sh start: a second start while already running is a no-op" {
   _seed_install_db
   _write_completion_record
