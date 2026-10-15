@@ -12,7 +12,10 @@ agmsg_daemon_seat_report() {
   local action="${1:-status}" cfg cfg_sql roster team agent project pid meta_type meta_project meta_pid
   local bridge record_status cached key driver record_type record_home label
   local seen='|' omitted=0 pending owner updated recent active display
-  local active_lines='' recent_lines='' older_lines=''
+  local active_lines='' recent_lines='' older_lines='' recovery
+  source "$SKILL_DIR/scripts/lib/type-registry.sh"
+  source "$SKILL_DIR/scripts/lib/boot-command.sh"
+  recovery="$(agmsg_actas_prompt codex '<name>')"
   driver="$(agmsg_storage_driver)" || driver=unknown
   for cfg in "$SKILL_DIR/teams/"*/config.json; do
     [ -f "$cfg" ] || continue
@@ -56,7 +59,7 @@ agmsg_daemon_seat_report() {
       agmsg_role_session_load "$team" "$agent" 2>/dev/null || true
       record_type="$(_agmsg_role_session_field "$_AGMSG_ROLE_SESSION_PATH" type)"
       record_home="$(_agmsg_role_session_field "$_AGMSG_ROLE_SESSION_PATH" codex_home)"
-      record_status='destination recorded'
+      record_status="destination recorded; current session not verified. In Codex, run $recovery to refresh the destination"
       if [ "$record_type" != codex ] || [ -z "${AGMSG_ROLE_SESSION_UUID:-}" ] || [ -z "$record_home" ]; then
         record_status='no destination record; restart Codex and run actas again to record it'
       fi

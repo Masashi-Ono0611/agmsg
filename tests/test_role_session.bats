@@ -133,10 +133,9 @@ fake_session() {
 @test "record: writes even when mkdir -p fails but the leaf dir already exists (#579)" {
   # Windows codex sandbox (workspace-write + elevated): mkdir -p walks the
   # already-existing intermediate path and returns EACCES, not EEXIST -- the
-  # leaf dir itself remains present and writable throughout. Stubbing mkdir to
-  # always fail reproduces that: the real RUN_DIR (made in setup()) is never
-  # touched, so mktemp on it still succeeds and the record must still be written.
-  mkdir() { return 1; }
+  # leaf dir itself remains present and writable throughout. Fail only -p:
+  # creating the writer lock directly inside RUN_DIR must still be allowed.
+  mkdir() { [ "${1:-}" != -p ] || return 1; command mkdir "$@"; }
   agmsg_role_session_record T alice "sid-x" /tmp/p1
   unset -f mkdir
   [ "$(agmsg_role_session_uuid T alice)" = "sid-x" ]

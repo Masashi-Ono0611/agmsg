@@ -139,12 +139,41 @@ agmsg_role_session_load() {
 #   owner=<instance_id>    the actas owner token written by actas-claim
 #   codex_home=<path>      the effective absolute Codex profile directory
 #   updated_at=<iso8601>   best-effort timestamp (empty if date(1) unavailable)
+# All read/modify/write operations share this lock. In particular, startup's
+# inactive-owner check and replacement must be one transaction with every writer.
+_agmsg_role_session_write() (
+  local dir
+  dir="$(_actas_lock_dir)"
+  [ -d "$dir" ] || mkdir -p "$dir" 2>/dev/null || return 1
+  AGMSG_HELD_LOCKS=''
+  source "$SKILL_DIR/scripts/lib/registry-lock.sh" || return 1
+  agmsg_lock_acquire "$dir" || return 1
+  trap agmsg_lock_release EXIT
+  "$@"
+)
+
 agmsg_role_session_record() {
+  [ -n "${1:-}" ] && [ -n "${2:-}" ] && [ -n "${3:-}" ] || return 0
+  if _agmsg_role_session_write _agmsg_role_session_record_unlocked "$@"; then return 0; fi
+  # Existing callers use best-effort recording; automatic takeover needs a verdict.
+  [ "${8:-}" != inactive ]
+}
+
+_agmsg_role_session_record_unlocked() {
   local team="$1" agent="$2" bare_sid="$3" project="${4:-}" type="${5:-}" owner="${6:-}" codex_home="${7:-}"
   [ -n "$team" ] && [ -n "$agent" ] && [ -n "$bare_sid" ] || return 0
   local path dir tmp ts named_ref="" named_epoch="" named_at=""
   _agmsg_role_session_path_into "$team" "$agent"
   path="$_AGMSG_ROLE_SESSION_PATH"
+  if [ "${8:-}" = inactive ]; then
+    agmsg_role_session_load "$team" "$agent"
+    if [ "$AGMSG_ROLE_SESSION_UUID" != "$bare_sid" ] \
+      && agmsg_instance_is_composite "${AGMSG_ROLE_SESSION_OWNER:-}"; then
+      local alive=0
+      agmsg_instance_alive "$AGMSG_ROLE_SESSION_OWNER" || alive=$?
+      [ "$alive" = 1 ] || return 1
+    fi
+  fi
   # The naming mark (named_ref / named_at, see agmsg_role_session_mark_named)
   # survives a re-record: this function rewrites the session fields, and the
   # mark is a fact about the PANE, not about the session. Dropping it here
@@ -220,7 +249,11 @@ agmsg_role_session_record() {
 # (the daemon derives the transcript path from BOTH claude_config_dir and
 # this session id together). Empty means "leave session= as it is" (every
 # other existing caller passes none).
-agmsg_role_session_set_messaging() {   # <team> <agent> <messaging_socket> <claude_config_dir> [<bare_sid>]
+agmsg_role_session_set_messaging() {
+  _agmsg_role_session_write _agmsg_role_session_set_messaging_unlocked "$@" || true
+}
+
+_agmsg_role_session_set_messaging_unlocked() {   # <team> <agent> <messaging_socket> <claude_config_dir> [<bare_sid>]
   local team="$1" agent="$2" socket="$3" config_dir="$4" bare_sid="${5:-}"
   [ -n "$team" ] && [ -n "$agent" ] || return 0
   local path dir tmp line
@@ -246,6 +279,10 @@ agmsg_role_session_set_messaging() {   # <team> <agent> <messaging_socket> <clau
 }
 
 agmsg_role_session_mark_named() {
+  _agmsg_role_session_write _agmsg_role_session_mark_named_unlocked "$@" || true
+}
+
+_agmsg_role_session_mark_named_unlocked() {
   local team="$1" agent="$2" ref="$3" epoch="${4:-}" project="${5:-}" type="${6:-}"
   [ -n "$team" ] && [ -n "$agent" ] && [ -n "$ref" ] || return 0
   local path dir tmp ts line
@@ -289,7 +326,11 @@ agmsg_role_session_mark_named() {
 # takes the same role-session PATH the guard already computed by substituting
 # "spawn." for "role-session." in that file name, rather than asking every
 # caller to re-derive team/agent just to hand them back in for re-encoding.
-agmsg_role_session_clear_named_at() {   # <role-session-record-path>
+agmsg_role_session_clear_named_at() {
+  _agmsg_role_session_write _agmsg_role_session_clear_named_at_unlocked "$@" || true
+}
+
+_agmsg_role_session_clear_named_at_unlocked() {   # <role-session-record-path>
   local path="$1" dir tmp line
   [ -n "$path" ] && [ -f "$path" ] || return 0
   dir="$(_actas_lock_dir)"
@@ -323,6 +364,10 @@ agmsg_role_session_named() {
 # a restarted server is a NEW attempt, exactly as the naming mark is.
 #   agmsg_role_session_mark_renamed <team> <agent> <ref> <epoch> <result> [project] [type]
 agmsg_role_session_mark_renamed() {
+  _agmsg_role_session_write _agmsg_role_session_mark_renamed_unlocked "$@" || true
+}
+
+_agmsg_role_session_mark_renamed_unlocked() {
   local team="$1" agent="$2" ref="$3" epoch="${4:-}" result="${5:-}" project="${6:-}" type="${7:-}"
   [ -n "$team" ] && [ -n "$agent" ] && [ -n "$ref" ] || return 0
   local path dir tmp ts line
