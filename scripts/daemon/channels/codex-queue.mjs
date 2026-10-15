@@ -115,10 +115,10 @@ function setQueueState(db, id, state, queueItemId = undefined) {
   });
 }
 
-function recordChildStart(db, id, pid, captureGroup) {
+function recordChildStart(db, id, pid, captureGroup, log = () => {}) {
   let group;
   try {
-    group = captureGroup(pid);
+    group = captureGroup(pid, (detail) => log(`codex queue: child start witness unavailable for pid ${pid}: ${detail}`));
   } catch {
     group = { state: "unreadable", reason: "child_start_witness_unavailable" };
   }
@@ -244,9 +244,9 @@ function bridgeState(runDir, team, agent, projects) {
 // crash before the child result was recorded cannot safely be retried here.
 async function pendingObservation(pending, now, observeGroup) {
   let children;
-  try { children = JSON.parse(pending.children); } catch { return { state: "pending", reason: "child_group_record_unreadable" }; }
+  try { children = JSON.parse(pending.children); } catch { return { state: "pending", reason: "child_group_record_unreadable", childrenUnresolved: true }; }
   if (children.state === "incomplete") return { state: "pending", reason: "queue_child_state_incomplete", childrenUnresolved: true };
-  if (children.state === "complete") {
+  if (children.state === "complete" || (children.state === "unreadable" && children.pgid !== undefined)) {
     let group;
     try { group = observeGroup(children); } catch { group = { state: "unreadable", reason: "child_group_observation_failed" }; }
     if (group?.state !== "absent") return { state: "pending", reason: group?.reason ?? "queue_child_still_running", childrenUnresolved: true };
@@ -291,7 +291,22 @@ export function createCodexQueueChannel({
     const seat = seatKey(team, agent);
     const registeredProjects = registrationProjects(teamConfig, agent);
     const bridge = bridgeState(join(installRoot, "run"), team, agent, registeredProjects);
-    const pending = readPending(db, seat);
+    let pending = readPending(db, seat);
+    if (pending && registered) {
+      // A reservation made for another thread than the one this seat's record
+      // names now is about a conversation that is gone. It is dropped and the
+      // current thread gets the nudge, but only once its child is shown to be
+      // finished: an old writer that may still be running keeps the Codex home
+      // blocked exactly as before.
+      const current = readSession(join(installRoot, "run"), team, agent);
+      if (current.state === "present" && current.record.thread && current.record.thread !== pending.thread) {
+        const old = await pendingObservation(pending, now, observeGroup);
+        if (!old.childrenUnresolved) {
+          setQueueState(db, pending.id, "expired");
+          pending = null;
+        }
+      }
+    }
     if (pending) {
       const observation = await pendingObservation(pending, now, observeGroup);
       if (observation.childrenUnresolved && pending.codex_home) blockedCodexHomes.add(pending.codex_home);
@@ -454,7 +469,7 @@ export function createCodexQueueChannel({
         message: inboxNudge(nonce),
         timeoutMs,
         signal: activeController.signal,
-        onChildStart: (pid) => recordChildStart(db, id, pid, captureGroup),
+        onChildStart: (pid) => recordChildStart(db, id, pid, captureGroup, log),
       });
     } finally {
       activeController = null;

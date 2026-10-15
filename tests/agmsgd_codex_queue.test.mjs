@@ -554,6 +554,46 @@ test('Codex channel queues one unread snapshot and confirms it before advancing 
   writeFileSync(path.join(teamsDir, 'alpha', 'config.json'), JSON.stringify({
     agents: { alice: { registrations: [{ type: 'codex', project: root }] } },
   }));
+  // A child whose start could not be witnessed is still observed by its group
+  // id: a group that is gone no longer holds the seat, and a reservation for a
+  // thread the seat no longer names is dropped and delivered to the current
+  // thread only once that group is gone.
+  const unwitnessed = JSON.stringify({ state: 'unreadable', reason: 'child_start_witness_unavailable', pgid: 4242, result: 'failed' });
+  const insertPending = (forThread, nonce, queueItem) => installDb.prepare(`
+    INSERT INTO beta_codex_queue (seat, codex_home, thread, up_to, nonce, queue_item_id, state, children, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, 'pending', ?, ?)
+  `).run(JSON.stringify(['alpha', 'alice']), codexHome, forThread, JSON.stringify({ eventSeq: 1, legacyId: 0 }), nonce, queueItem, unwitnessed, new Date().toISOString());
+  const latestState = () => installDb.prepare("SELECT state FROM beta_codex_queue WHERE seat = ? ORDER BY id DESC LIMIT 1").get(JSON.stringify(['alpha', 'alice'])).state;
+  const sentThreads = [];
+  const logs = [];
+  let groupState = 'absent';
+  const staleChannel = createCodexQueueChannel({
+    db: installDb, installRoot: root, expectedOpGen: 4, env: { AGMSG_STORAGE_PATH: storageDir },
+    observeGroup: () => ({ state: groupState }),
+    log: (message) => logs.push(message),
+    captureGroup: (pid, onFailure) => { onFailure('ps failed: status=1'); return { state: 'unreadable', reason: 'child_start_witness_unavailable', pgid: pid }; },
+    queue: async (request) => { request.onChildStart(4243); sentThreads.push(request.thread); return { kind: 'failed', started: false, reason: 'spawn_failed:test' }; },
+  });
+  insertPending(thread, 'unwitnessed-nonce', itemId);
+  await staleChannel.pollOnce();
+  assert.equal(latestState(), 'confirmed', 'a gone group with no start witness still resolves from the queue evidence');
+  insertPending('01a0ea97-c011-73f3-8470-fd59db15adbb', 'old-thread-nonce', null);
+  groupState = 'present';
+  await staleChannel.pollOnce();
+  assert.equal(installDb.prepare("SELECT state FROM beta_codex_queue WHERE nonce = 'old-thread-nonce'").get().state, 'pending', 'a group that may still write keeps the old reservation');
+  assert.deepEqual(sentThreads, []);
+  groupState = 'absent';
+  installDb.prepare("UPDATE beta_codex_queue SET children = 'incomplete' WHERE nonce = 'old-thread-nonce'").run();
+  await staleChannel.pollOnce();
+  assert.equal(installDb.prepare("SELECT state FROM beta_codex_queue WHERE nonce = 'old-thread-nonce'").get().state, 'pending', 'a reservation that never recorded its child keeps the old one');
+  assert.deepEqual(sentThreads, []);
+  installDb.prepare("UPDATE beta_codex_queue SET children = ? WHERE nonce = 'old-thread-nonce'").run(unwitnessed);
+  await staleChannel.pollOnce();
+  assert.equal(installDb.prepare("SELECT state FROM beta_codex_queue WHERE nonce = 'old-thread-nonce'").get().state, 'expired');
+  assert.deepEqual(sentThreads, [thread], 'the nudge goes to the thread the seat names now');
+  assert.ok(logs.some((line) => line.includes('ps failed: status=1')), 'a missing start witness leaves its cause in the log');
+  await staleChannel.stop();
+
   const bridgePid = String(process.pid);
   const bridgeBase = path.join(runDir, 'codex-bridge.alpha.alice');
   const bridgeWitness = processStartWitness(process.pid);
