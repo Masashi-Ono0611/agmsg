@@ -77,6 +77,12 @@ agmsg_daemon_seat_report() {
       # Bare historical thread IDs have no process witness. Do not scan all
       # session markers for each old role just to infer activity.
       if agmsg_instance_is_composite "$owner" && agmsg_instance_alive "$owner"; then active=1; fi
+      # A registration alone is not a historical destination. Keep actionable
+      # bridge/pending evidence visible, but omit seats never recorded at all.
+      if [ "$action" = status ] && [ "$active" = 0 ] && [ "$bridge" = stopped ] \
+        && [ ! -f "$_AGMSG_ROLE_SESSION_PATH" ]; then
+        continue
+      fi
       if [ "$action" = status ] && [ "${AGMSG_DAEMON_ALL:-0}" != 1 ] && [ "$active" = 0 ] && [ "$recent" != 1 ]; then
         omitted=$((omitted + 1))
         continue

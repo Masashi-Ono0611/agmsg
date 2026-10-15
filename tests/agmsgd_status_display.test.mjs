@@ -71,6 +71,20 @@ test('old destinations are counted by default and available with --all after cur
   assert.match(status(), /Codex test\/ancient:.*waiting for delivery confirmation/);
 });
 
+test('never-recorded seats are not counted as older destinations, but pending evidence stays visible', t => {
+  const { root, db, config, status } = fixture(t);
+  config.agents = { fresh: { registrations: [{ type: 'codex', project: '/fresh' }] } };
+  writeFileSync(join(root, 'teams/test/config.json'), JSON.stringify(config));
+  for (const flags of [[], ['--all']]) {
+    const text = status(...flags);
+    assert.doesNotMatch(text, /older destination|Older destination|Codex test\/fresh:/);
+    assert.match(text, /agmsgd has never been started/);
+  }
+  db.prepare("INSERT INTO beta_codex_queue (seat,codex_home,thread,up_to,nonce,state,children,created_at) VALUES (?, ?, ?, '{}', 'fresh-pending', 'pending', 'incomplete', '2020-01-01T00:00:00Z')")
+    .run(JSON.stringify(['test', 'fresh']), root, thread);
+  assert.match(status(), /Codex test\/fresh: no destination record;.*waiting for delivery confirmation/);
+});
+
 test('installer restart guidance tells users to resume, refresh their destination, and check status', () => {
   const source = readFileSync(join(repo, 'install.sh'), 'utf8');
   const fn = source.match(/agmsg_install_restart_guidance\(\) \{[\s\S]*?\n\}/)[0];
