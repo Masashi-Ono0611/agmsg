@@ -4208,6 +4208,14 @@ function teamConfigHolderIsAlive(record) {
   if (host !== hostname() || !pidText || !/^[1-9][0-9]{0,9}$/.test(pidText)) return undefined;
   const pid = Number(pidText);
   if (!Number.isSafeInteger(pid) || pid > 2_147_483_647) return undefined;
+  // Git Bash records an MSYS PID, outside native Windows Node's PID space.
+  // ESRCH there cannot disprove shell liveness. Only an identified Node writer
+  // may be checked; unknown commands/writers remain fail-closed as well.
+  if (process.platform === "win32") {
+    const command = /^command (.+)$/m.exec(record)?.[1];
+    const writer = /^writer (.+)$/m.exec(record)?.[1];
+    if (command !== "remote-sync.mjs" || (writer && writer !== "remote-sync.mjs")) return undefined;
+  }
   try { process.kill(pid, 0); return true; }
   catch (error) {
     if (error?.code === "ESRCH") return false;
@@ -4324,6 +4332,11 @@ export async function withTeamConfigLock(team, fn) {
   installTeamConfigLockSignalHandlers();
   const lockDir = join(dirname(teamConfigPath(team)), ".config.lock");
   const holderPath = `${lockDir}.holder`;
+  // Prepare every fallible record input before mkdir, matching registry-lock.sh
+  // (#1592). After acquisition only the synchronous record write remains.
+  const token = randomBytes(16).toString("hex");
+  const record = `token ${token}\npid ${process.pid}\ncommand remote-sync.mjs\nhost ${hostname()}\n`;
+  const held = { lockDir, holderPath, token };
   for (let attempt = 0; ; attempt += 1) {
     try { mkdirSync(lockDir); break; }
     catch (error) {
@@ -4351,11 +4364,8 @@ export async function withTeamConfigLock(team, fn) {
   // landing between them found heldTeamConfigLock still null and exited over
   // an empty, un-annotated directory, the original bug moved into a
   // narrower window instead of closed.
-  const token = randomBytes(16).toString("hex");
-  const held = { lockDir, holderPath, token };
   try {
-    writeFileSync(holderPath,
-      `token ${token}\npid ${process.pid}\ncommand remote-sync.mjs\nhost ${hostname()}\n`);
+    writeFileSync(holderPath, record);
   } catch { /* best-effort: the lock is held as of the mkdir above regardless */ }
   heldTeamConfigLock = held;
   try {

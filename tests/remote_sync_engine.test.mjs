@@ -2288,6 +2288,84 @@ test("SIGTERM while this process holds the team config lock releases it before e
   }
 });
 
+// Test value: protects preparation failures from leaking record-less locks;
+// fails_when entropy generation throws after mkdir; seam: none;
+// no_claim: asynchronous SIGKILL cannot be excluded between filesystem calls.
+test("the Node team config lock prepares its record before taking the directory", async () => {
+  const root = await mkdtemp(join(tmpdir(), "agmsg-lock-prepare-"));
+  const modulePath = new URL("../scripts/internal/remote-sync.mjs", import.meta.url).href;
+  await mkdir(join(root, "teams", "demo"), { recursive: true });
+  try {
+    const script = `import assert from "node:assert/strict";
+      import crypto from "node:crypto";
+      import { syncBuiltinESMExports } from "node:module";
+      import { existsSync } from "node:fs";
+      crypto.randomBytes = () => { throw new Error("entropy unavailable"); };
+      syncBuiltinESMExports();
+      const { withTeamConfigLock } = await import(${JSON.stringify(modulePath)});
+      await assert.rejects(() => withTeamConfigLock("demo", async () => {
+        assert.fail("entered without a record");
+      }), /entropy unavailable/);
+      assert.equal(existsSync(${JSON.stringify(join(root, "teams", "demo", ".config.lock"))}), false);
+    `;
+    const result = spawnSync(process.execPath, ["--input-type=module", "-e", script],
+      { env: { ...process.env, AGMSG_SYNC_CONNECTION_DIR: root }, encoding: "utf8", timeout: 15_000 });
+    assert.equal(result.status, 0, result.stderr);
+  } finally { await rm(root, { recursive: true, force: true }); }
+});
+
+// Test value: protects a live shell holder from native Windows PID-space confusion;
+// fails_when Node trusts ESRCH for a shell's MSYS PID; seam: none;
+// no_claim: non-Windows runs simulate the native PID mismatch, hosted Windows runs use its real PID spaces.
+test("native Windows Node leaves a shell-held team config lock alone (#1555)",
+  { timeout: 30_000 }, async () => {
+  const root = await mkdtemp(join(tmpdir(), "agmsg-shell-node-lock-"));
+  const teamDir = join(root, "teams", "demo");
+  const lockDir = join(teamDir, ".config.lock");
+  const holderPath = `${lockDir}.holder`;
+  const registry = fileURLToPath(new URL("../scripts/lib/registry-lock.sh", import.meta.url));
+  const modulePath = new URL("../scripts/internal/remote-sync.mjs", import.meta.url).href;
+  await mkdir(teamDir, { recursive: true });
+  const shell = spawn("bash", ["-c", 'if command -v cygpath >/dev/null 2>&1; then registry=$(cygpath -u "$1"); team=$(cygpath -u "$2"); else registry=$1; team=$2; fi; source "$registry"; agmsg_lock_acquire "$team" || exit; while :; do sleep 1; done',
+    "remote.sh", registry, teamDir], { env: { ...process.env, HOSTNAME: hostname() }, stdio: "ignore" });
+  try {
+    for (let i = 0; i < 200 && !existsSync(holderPath); i++) {
+      await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    assert.ok(existsSync(holderPath), "shell never published its holder");
+    const record = await readFile(holderPath, "utf8");
+    assert.match(record, /^command remote.sh$/m);
+    const shellPid = Number(/^pid ([0-9]+)$/m.exec(record)?.[1]);
+    assert.ok(shellPid > 0);
+    const script = `import assert from "node:assert/strict";
+      import { readFileSync, existsSync } from "node:fs";
+      const nativeWindows = process.platform === "win32";
+      if (!nativeWindows) {
+        Object.defineProperty(process, "platform", { value: "win32" });
+        const kill = process.kill;
+        process.kill = (pid, signal) => {
+          if (pid === ${shellPid} && signal === 0) throw Object.assign(new Error("MSYS PID absent from native namespace"), { code: "ESRCH" });
+          return kill(pid, signal);
+        };
+      }
+      const { withTeamConfigLock } = await import(${JSON.stringify(modulePath)});
+      await assert.rejects(() => withTeamConfigLock("demo", async () => {
+        assert.fail("Node entered a shell-held critical section");
+      }), /timed out acquiring the team registry lock/);
+      assert.equal(existsSync(${JSON.stringify(lockDir)}), true);
+      assert.equal(readFileSync(${JSON.stringify(holderPath)}, "utf8"), ${JSON.stringify(record)});
+    `;
+    const result = spawnSync(process.execPath, ["--input-type=module", "-e", script],
+      { env: { ...process.env, AGMSG_SYNC_CONNECTION_DIR: root }, encoding: "utf8", timeout: 20_000 });
+    assert.equal(result.status, 0, result.stderr);
+    assert.equal(shell.exitCode, null, "shell exited before the exclusion check");
+  } finally {
+    shell.kill("SIGTERM");
+    if (shell.exitCode === null && shell.signalCode === null) await once(shell, "exit");
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test("the Node team config lock recovers a same-host holder that is gone (#1555)",
   { timeout: 30_000 }, async () => {
   const root = await mkdtemp(join(tmpdir(), "agmsg-node-stale-lock-"));
