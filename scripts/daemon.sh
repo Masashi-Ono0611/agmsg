@@ -115,14 +115,20 @@ _with_op_lock_run() {
   }
   AGMSGD_LOCK_INSTALL_ID="${expected_generation%%:*}"
   lock_dir="$(mktemp -d "$SKILL_DIR/run/daemon-op-lock.XXXXXX")" || return 1
-  if [ "$(_os)" = windows ]; then
+  if [ "$(_os)" = windows ] && [ "${BASH_VERSINFO[0]}" -ge 4 ]; then
     # The native sqlite3 on Windows cannot be driven through an MSYS FIFO (it
     # never answers), so talk to it over a coprocess's anonymous pipes. eval
-    # keeps the coproc syntax out of the parse for shells that lack it.
-    eval 'coproc AGMSGD_LOCK_SQL { sqlite3 -batch "$LOCK_DB"; }'
-    lock_pid="$AGMSGD_LOCK_SQL_PID"
-    exec 8>&"${AGMSGD_LOCK_SQL[1]}" 9<&"${AGMSGD_LOCK_SQL[0]}"
-    eval "exec ${AGMSGD_LOCK_SQL[1]}>&- ${AGMSGD_LOCK_SQL[0]}<&-"
+    # keeps the coproc syntax out of the parse for shells that lack it (bash
+    # 3.2 has no coproc; Git Bash ships bash 5).
+    eval 'coproc agmsgd_lock_sql { sqlite3 -batch "$LOCK_DB" 3>&- 4>&-; }'
+    lock_pid="${agmsgd_lock_sql_PID:-}"
+    if [ -z "$lock_pid" ] || [ -z "${agmsgd_lock_sql[0]:-}" ] || [ -z "${agmsgd_lock_sql[1]:-}" ]; then
+      rmdir "$lock_dir" 2>/dev/null || true
+      echo 'agmsg daemon: could not start sqlite3 to hold the install operation lock' >&2
+      return 1
+    fi
+    exec 8>&"${agmsgd_lock_sql[1]:-}" 9<&"${agmsgd_lock_sql[0]:-}"
+    eval "exec ${agmsgd_lock_sql[1]:-}>&- ${agmsgd_lock_sql[0]:-}<&-"
   else
     mkfifo "$lock_dir/in" "$lock_dir/out"
     sqlite3 -batch "$LOCK_DB" < "$lock_dir/in" > "$lock_dir/out" 3>&- 4>&- &
