@@ -25,7 +25,7 @@ import {
   readClaudeRoleSession,
 } from "./claude-code-queue-store.mjs";
 import {
-  QUEUE_CONFIRMATION_TTL_MS,
+  checkSocketOwnership,
   inboxNudge,
   newNonce,
   observeTranscript,
@@ -116,11 +116,8 @@ function storagePaths(installRoot, env) {
   };
 }
 
-async function pendingObservation(pending, now, observe) {
-  const createdAt = Date.parse(pending.created_at);
-  const ageMs = Number.isFinite(createdAt) ? now() - createdAt : NaN;
-  const observation = observe(pending.transcript_path, pending.nonce);
-  return resolvePendingDelivery({ observation, ageMs, ttlMs: QUEUE_CONFIRMATION_TTL_MS });
+function pendingObservation(pending, observe) {
+  return resolvePendingDelivery({ observation: observe(pending.transcript_path, pending.nonce) });
 }
 
 export function createClaudeCodeQueueChannel({
@@ -138,6 +135,7 @@ export function createClaudeCodeQueueChannel({
   readSnapshot = readUnreadSnapshot,
   send = sendClaudeCodeMessage,
   observe = observeTranscript,
+  socketAlive = checkSocketOwnership,
   hostPlatform = process.platform,
 }) {
   let stopped = false;
@@ -147,29 +145,43 @@ export function createClaudeCodeQueueChannel({
     const { team, agent, teamConfig, registered = true } = registration;
     const seat = seatKey(team, agent);
     const pending = readPending(db, seat);
+    // At most one nudge is outstanding per seat, and an outstanding one is not
+    // re-sent on a timer: Claude Code holds a message received mid-work until
+    // the work pauses, so a long wait is normal, not a loss. It is re-sent only
+    // when the thing it was sent to is gone (see below).
     if (pending) {
-      const observation = await pendingObservation(pending, now, observe);
-      if (!registered) {
-        if (observation.state === "confirmed") setQueueState(db, pending.id, "confirmed");
-        else if (observation.state === "expired") setQueueState(db, pending.id, "expired");
-        saveSeat(db, { seat, messagingSocket: pending.messaging_socket, state: "unaddressable", reason: "seat_registration_missing" }, now);
-        return;
-      }
+      const observation = pendingObservation(pending, observe);
       if (observation.state === "confirmed") {
         setQueueState(db, pending.id, "confirmed");
         saveSeat(db, { seat, messagingSocket: pending.messaging_socket, state: "addressable" }, now);
         return;
       }
-      if (observation.state === "expired") {
+      if (!registered) {
         setQueueState(db, pending.id, "expired");
-        saveSeat(db, { seat, messagingSocket: pending.messaging_socket, state: "blocked", reason: observation.reason }, now);
+        saveSeat(db, { seat, messagingSocket: pending.messaging_socket, state: "unaddressable", reason: "seat_registration_missing" }, now);
         return;
       }
-      // Still pending — includes the "held" case: Held is worth surfacing as
-      // a status, but it is not a delivery confirmation, so the seat must
-      // never be marked notified on it alone.
-      saveSeat(db, { seat, messagingSocket: pending.messaging_socket, state: "addressable", reason: observation.reason }, now);
-      return;
+      const session = readSession(join(installRoot, "run"), team, agent);
+      const record = session.state === "present" ? session.record : null;
+      const transcriptNow = record
+        ? resolveTranscriptPath(record.claude_config_dir, record.project, record.session)
+        : "";
+      // The nudge is out of date when its socket is gone, or the seat's record
+      // now names another socket or session (/compact, restart, --resume).
+      // Nothing else makes it stale: not the time that has passed.
+      // Only a socket that is plainly absent counts as gone. A check that merely
+      // could not run (stat failed, wrong owner) proves nothing about the nudge
+      // the seat still holds, and sending another would duplicate it.
+      const socketCheck = socketAlive(pending.messaging_socket);
+      const socketGone = socketCheck.reason === "messaging_socket_missing";
+      const recordMoved = record && (
+        record.messaging_socket !== pending.messaging_socket ||
+        (transcriptNow && transcriptNow !== pending.transcript_path));
+      if (!socketGone && !recordMoved) {
+        saveSeat(db, { seat, messagingSocket: pending.messaging_socket, state: "addressable", reason: socketCheck.state === "ok" ? observation.reason : socketCheck.reason }, now);
+        return;
+      }
+      setQueueState(db, pending.id, "expired");
     }
     if (!registered) return;
     if (hostPlatform === "win32") {
@@ -262,7 +274,7 @@ export function createClaudeCodeQueueChannel({
       saveSeat(db, { seat, messagingSocket: record.messaging_socket, state: "blocked", reason: `send_failed:${result.reason}` }, now);
       return;
     }
-    const firstCheck = await pendingObservation(readPending(db, seat), now, observe);
+    const firstCheck = pendingObservation(readPending(db, seat), observe);
     if (firstCheck.state === "confirmed") {
       setQueueState(db, id, "confirmed");
       saveSeat(db, { seat, messagingSocket: record.messaging_socket, state: "addressable" }, now);

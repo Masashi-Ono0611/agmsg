@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -7,8 +7,10 @@ import test from 'node:test';
 import {
   observeTranscript,
   resolvePendingDelivery,
-  QUEUE_CONFIRMATION_TTL_MS,
 } from '../scripts/daemon/channels/claude-code-queue-io.mjs';
+import { createClaudeCodeQueueChannel } from '../scripts/daemon/channels/claude-code-queue.mjs';
+import { ensureClaudeCodeChannelSchema } from '../scripts/daemon/channels/claude-code-queue-store.mjs';
+import { openInstallDb } from '../scripts/daemon/db.mjs';
 
 function temporaryDirectory(t) {
   const dir = mkdtempSync(path.join(os.tmpdir(), 'agmsg-cc-queue-'));
@@ -38,7 +40,7 @@ test('observeTranscript: a queue-operation enqueue line is not delivery evidence
   })}\n`);
   let observation = observeTranscript(transcriptPath, nonce);
   assert.equal(observation.state, 'absent');
-  let resolved = resolvePendingDelivery({ observation, ageMs: 1000, ttlMs: QUEUE_CONFIRMATION_TTL_MS });
+  let resolved = resolvePendingDelivery({ observation });
   assert.equal(resolved.state, 'pending');
 
   // The real delivered record appended afterward (as the genuine sequence
@@ -56,26 +58,71 @@ test('observeTranscript: a queue-operation enqueue line is not delivery evidence
   })}\n`);
   observation = observeTranscript(transcriptPath, nonce);
   assert.equal(observation.state, 'delivered');
-  resolved = resolvePendingDelivery({ observation, ageMs: 1000, ttlMs: QUEUE_CONFIRMATION_TTL_MS });
+  resolved = resolvePendingDelivery({ observation });
   assert.equal(resolved.state, 'confirmed');
 });
 
-// #1577 review: a transcript that is genuinely missing (its session/project
-// no longer has a live file to write to) must eventually expire with a
-// reason, not poll forever -- but a transcript that merely failed to read
-// (a transient fs error) must stay pending indefinitely, since that one
-// really could resolve on the next read. Distinguishing these two is the
-// property this test pins.
-test('resolvePendingDelivery: a missing transcript expires at the TTL; a read failure never does', () => {
-  const missing = { state: 'unreadable', reason: 'transcript_missing' };
-  const readFailed = { state: 'unreadable', reason: 'transcript_read_failed' };
+// No clock decides a pending nudge: whatever the transcript shows (or fails to
+// show), it stays pending until the channel itself sees the socket or the
+// seat's record change.
+test('resolvePendingDelivery: nothing but a delivered nonce ends a pending nudge', () => {
+  for (const observation of [
+    { state: 'absent' },
+    { state: 'held' },
+    { state: 'unreadable', reason: 'transcript_missing' },
+    { state: 'unreadable', reason: 'transcript_read_failed' },
+  ]) {
+    assert.equal(resolvePendingDelivery({ observation, ageMs: 10 ** 9 }).state, 'pending');
+  }
+  assert.equal(resolvePendingDelivery({ observation: { state: 'delivered' } }).state, 'confirmed');
+});
 
-  const missingBeforeTtl = resolvePendingDelivery({ observation: missing, ageMs: 1000, ttlMs: QUEUE_CONFIRMATION_TTL_MS });
-  assert.equal(missingBeforeTtl.state, 'pending');
-  const missingAfterTtl = resolvePendingDelivery({ observation: missing, ageMs: QUEUE_CONFIRMATION_TTL_MS + 1, ttlMs: QUEUE_CONFIRMATION_TTL_MS });
-  assert.equal(missingAfterTtl.state, 'expired');
-  assert.equal(missingAfterTtl.reason, 'transcript_missing');
+function channelFixture(t) {
+  const root = temporaryDirectory(t);
+  mkdirSync(path.join(root, 'run'));
+  const db = openInstallDb(path.join(root, 'run', 'install.db'));
+  ensureClaudeCodeChannelSchema(db);
+  db.exec("UPDATE daemon_intent SET desired='on', op_gen=1");
+  t.after(() => db.close());
+  const state = { session: 'sess-1', socket: '/tmp/cc-socks/1.sock', sent: 0, hours: 0, alive: { state: 'ok' } };
+  const channel = createClaudeCodeQueueChannel({
+    db, installRoot: root, expectedOpGen: 1, env: { AGMSG_STORAGE_PATH: root },
+    now: () => Date.UTC(2026, 9, 14) + state.hours * 3_600_000,
+    log: () => {},
+    listSeats: () => ({ state: 'ok', seats: [{ team: 'test', agent: 'alice', teamConfig: { agents: { alice: { registrations: [{ type: 'claude-code', project: root }] } } } }] }),
+    readSession: () => ({ state: 'present', record: { team: 'test', agent: 'alice', type: 'claude-code', project: root, claude_config_dir: root, messaging_socket: state.socket, session: state.session } }),
+    readDriver: () => ({ state: 'ok', driver: 'sqlite' }),
+    openStore: () => ({ close() {} }),
+    readSnapshot: () => ({ state: 'ok', unread: true, upTo: '{}' }),
+    send: async () => { state.sent += 1; return { state: 'sent' }; },
+    observe: () => ({ state: 'absent' }),
+    socketAlive: () => state.alive,
+    hostPlatform: 'linux',
+  });
+  return { db, channel, state };
+}
 
-  const readFailedAfterTtl = resolvePendingDelivery({ observation: readFailed, ageMs: QUEUE_CONFIRMATION_TTL_MS + 1, ttlMs: QUEUE_CONFIRMATION_TTL_MS });
-  assert.equal(readFailedAfterTtl.state, 'pending');
+test('an unconfirmed nudge is not sent again, however long the same session and socket stay up', async (t) => {
+  const { db, channel, state } = channelFixture(t);
+  await channel.pollOnce();
+  for (const hours of [1, 9, 40]) {
+    state.hours = hours;
+    await channel.pollOnce();
+  }
+  // A check that could not run is not evidence the socket is gone.
+  state.alive = { state: 'unreadable', reason: 'messaging_socket_stat_failed' };
+  await channel.pollOnce();
+  assert.equal(state.sent, 1);
+  assert.equal(db.prepare("SELECT COUNT(*) AS n FROM beta_claude_queue WHERE state='pending'").get().n, 1);
+  await channel.stop();
+});
+
+test('a nudge is sent again once the seat record names another session', async (t) => {
+  const { db, channel, state } = channelFixture(t);
+  await channel.pollOnce();
+  state.session = 'sess-2';
+  await channel.pollOnce();
+  assert.equal(state.sent, 2);
+  assert.deepEqual(db.prepare('SELECT state FROM beta_claude_queue ORDER BY id').all().map((row) => row.state), ['expired', 'pending']);
+  await channel.stop();
 });

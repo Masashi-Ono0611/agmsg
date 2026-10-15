@@ -16,7 +16,7 @@ import { closeSync, lstatSync, openSync, readFileSync, readSync, statSync } from
 import process from "node:process";
 import { isAbsolute } from "node:path";
 
-export { newNonce, inboxNudge, QUEUE_CONFIRMATION_TTL_MS } from "./codex-queue-io.mjs";
+export { newNonce, inboxNudge } from "./codex-queue-io.mjs";
 
 const SEND_TIMEOUT_MS = 5_000;
 // Bound the transcript read to its tail: a long-lived seat's jsonl grows
@@ -50,7 +50,7 @@ export function resolveTranscriptPath(claudeConfigDir, project, sessionId) {
 // record must never be written to on trust alone. A symlinked path is
 // refused the same way every other agmsg state-file reader on this codebase
 // refuses one.
-function checkSocketOwnership(socketPath) {
+export function checkSocketOwnership(socketPath) {
   let stat;
   try {
     stat = lstatSync(socketPath);
@@ -172,27 +172,15 @@ export function observeTranscript(transcriptPath, nonce) {
   return { state: "absent" };
 }
 
-// Single-observation analogue of codex-queue-io.mjs's resolvePendingQueue:
-// this channel has only the transcript to read, not a separate queue-item
-// check, so "present" collapses to one case (delivered) instead of two.
-export function resolvePendingDelivery({ observation, ageMs, ttlMs }) {
+// Reads one transcript observation as a delivery state. There is deliberately
+// no clock here: a nudge the seat has not shown yet is "pending" for as long as
+// the same session and socket stay alive, however long that is. Claude Code
+// holds a message received mid-work until the work pauses, so elapsed time says
+// nothing about whether it was lost, and a wall clock jumps across a sleep.
+// Only the caller's own evidence (socket gone, record changed) ends a pending
+// nudge, and that is not decided here.
+export function resolvePendingDelivery({ observation }) {
   if (observation?.state === "delivered") return { state: "confirmed", reason: "nonce_observed" };
-  const ageKnown = Number.isSafeInteger(ageMs) && ageMs >= 0;
-  if (observation?.state === "unreadable") {
-    // A transcript that is genuinely absent past the TTL is never coming
-    // back on its own (the session that would create it is gone, or this
-    // record's project/session no longer matches a live one) -- expire it
-    // with a reason that says so, rather than polling it forever. Any OTHER
-    // unreadable cause (a transient read failure, a malformed line) stays
-    // pending indefinitely: that one really could resolve on the next read,
-    // and timing it out would report a seat undeliverable that might not be.
-    if (observation.reason === "transcript_missing" && ageKnown && ageMs >= ttlMs) {
-      return { state: "expired", reason: "transcript_missing" };
-    }
-    return { state: "pending", reason: observation.reason ?? "transcript_unreadable" };
-  }
-  if (!ageKnown) return { state: "pending", reason: "pending_age_unreadable" };
-  const reason = observation?.state === "held" ? "peer_held" : "awaiting_confirmation";
-  if (ageMs >= ttlMs) return { state: "expired", reason: observation?.state === "held" ? "confirmation_timeout:peer_held" : "confirmation_timeout" };
-  return { state: "pending", reason };
+  if (observation?.state === "unreadable") return { state: "pending", reason: observation.reason ?? "transcript_unreadable" };
+  return { state: "pending", reason: observation?.state === "held" ? "peer_held" : "awaiting_confirmation" };
 }
