@@ -408,6 +408,19 @@ teardown() {
   [ "$status" -eq 0 ]
 }
 
+@test "install: --update starts an agmsgd that was turned on again, instead of leaving it stopped" {
+  HOME="$FAKE_HOME" bash "$REPO_ROOT/install.sh" --cmd agmsg
+  sqlite3 "$SK/run/install.db" "UPDATE meta SET node_path = '$(command -v node)'; UPDATE daemon_intent SET desired = 'on';"
+  [ "$(sqlite3 "$SK/run/install.db" "SELECT state FROM daemon_owner;")" = "none" ]
+  HOME="$FAKE_HOME" run bash "$REPO_ROOT/install.sh" --update
+  local owner_state
+  owner_state="$(sqlite3 "$SK/run/install.db" "SELECT state FROM daemon_owner;")"
+  bash "$SK/scripts/daemon.sh" stop || true
+  [ "$status" -eq 0 ]
+  [ "${output#*starting the updated version}" != "$output" ]
+  [ "$owner_state" = "ready" ]
+}
+
 @test "install: ships an executable uninstall.sh so npx/curl installs have one to run later" {
   # setup.sh's temp checkout is deleted right after install, so a copy inside
   # the skill dir is the only uninstaller npx/curl-installed users ever have.

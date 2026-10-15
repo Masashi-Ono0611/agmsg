@@ -496,7 +496,18 @@ _wait_for_ready() {
   return 1
 }
 
+# `start --only-if-op-gen N` is what an update uses to bring a daemon back: it
+# starts only if the intent is still the "on" at op_gen N the update saw, so a
+# stop/disable/start made by a person in the meantime is never undone.
 cmd_start() {
+  local only_gen=""
+  case "${1:-}" in
+    --only-if-op-gen)
+      only_gen="${2:-}"
+      case "$only_gen" in ''|*[!0-9]*) _usage; return 2 ;; esac ;;
+    '') ;;
+    *) _usage; return 2 ;;
+  esac
   _ensure_install_db_schema
   local state
   state="$(sqlite3 "$INSTALL_DB" "SELECT state FROM daemon_owner;")"
@@ -523,9 +534,24 @@ cmd_start() {
     record_node_sql="UPDATE meta SET node_path = '$(printf '%s' "$found_node" | sed "s/'/''/g")', node_version = '$found_version';"
   fi
 
+  # An install enabled by an earlier version (or updated before Codex was on
+  # PATH) can hold an empty meta.codex_path, which blocks every Codex seat:
+  # fill it from the current PATH, never overwriting a path already there.
+  local codex_fill="" codex_path
+  codex_path="$(_resolve_codex 2>/dev/null || true)"
+  if [ -n "$codex_path" ]; then
+    codex_fill="UPDATE meta SET codex_path = '$(printf '%s' "$codex_path" | sed "s/'/''/g")' WHERE COALESCE(codex_path, '') = '';"
+  fi
   local new_op_gen
-  _with_op_lock "$record_node_sql UPDATE daemon_intent SET desired = 'on', op_gen = op_gen + 1, set_by = 'start', set_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');"
+  local start_where=""
+  [ -z "$only_gen" ] || start_where=" WHERE desired = 'on' AND op_gen = $only_gen"
+  _with_op_lock "$record_node_sql $codex_fill UPDATE daemon_intent SET desired = 'on', op_gen = op_gen + 1, set_by = 'start', set_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')$start_where;"
   new_op_gen="$(sqlite3 "$INSTALL_DB" "SELECT op_gen FROM daemon_intent;")"
+  # The guarded UPDATE applied only if it left "on" at op_gen+1 written by start.
+  if [ -n "$only_gen" ] && [ "$(sqlite3 "$INSTALL_DB" "SELECT desired || '|' || op_gen || '|' || set_by FROM daemon_intent;")" != "on|$((only_gen + 1))|start" ]; then
+    echo "agmsg daemon start: agmsgd was turned off or changed while waiting; left as it is now"
+    return 0
+  fi
   if _service_registered; then
     if ! _start_registered_service; then
       echo "agmsg daemon start: the registered service manager could not start agmsgd" >&2
@@ -797,7 +823,7 @@ cmd_disable() {
 }
 
 case "${1:-}" in
-  start) cmd_start ;;
+  start) shift; cmd_start "$@" ;;
   stop) cmd_stop ;;
   status) shift; cmd_status "$@" ;;
   enable) cmd_enable ;;

@@ -140,12 +140,36 @@ agmsg_source_version() {
   fi
 }
 
+# After an --update the running agmsgd notices the new files within one poll
+# (5s), stops itself with "stepped_aside_for_update" and nothing starts it
+# again. When the install had the daemon turned on, wait for that step-aside
+# (bounded) and start the new version, so an enabled daemon comes back by
+# itself. A failure here never fails the update; it says how to start it.
+agmsg_install_restart_daemon() {   # <skill_dir>
+  local skill="$1" db="$1/run/install.db" intent op_gen state waited=0
+  [ -f "$db" ] || return 0
+  # The intent as the update saw it; the start below only goes ahead if it is
+  # still this one, so a stop or disable during the wait is not undone.
+  intent="$(sqlite3 "$db" "SELECT desired || '|' || op_gen FROM daemon_intent;" 2>/dev/null || true)"
+  case "$intent" in on\|[0-9]*) op_gen="${intent#on|}" ;; *) return 0 ;; esac
+  while [ "$waited" -lt 25 ]; do
+    state="$(sqlite3 "$db" "SELECT state FROM daemon_owner;" 2>/dev/null || true)"
+    [ "$state" = ready ] || break
+    waited=$((waited + 1))
+    sleep 1
+  done
+  echo "  ~ agmsgd is turned on; starting the updated version"
+  if ! bash "$skill/scripts/daemon.sh" start --only-if-op-gen "$op_gen"; then
+    echo "  ! agmsgd did not start after the update; run: bash $(printf '%q' "$skill/scripts/agmsg") daemon start" >&2
+  fi
+}
+
 agmsg_install_restart_guidance() {
   echo '  Next: finish your current work, then close and reopen each running agent.'
   echo '    Resume the same conversation and run your messaging skill with actas <existing-agent-name> to refresh its destination.'
   printf '    Check notice delivery from that session with: bash %q status <type> <project>\n' "$SKILL_DIR/scripts/delivery.sh"
   printf '    If you use agmsgd, check it with: bash %q daemon status\n' "$SKILL_DIR/scripts/agmsg"
-  echo '    If status says the enabled daemon is stopped, run agmsg daemon start.'
+  echo '    An update starts an enabled agmsgd again by itself; if status still says it is stopped, run agmsg daemon start.'
   echo '    This installation does not enable agmsgd or switch existing sessions automatically.'
 }
 
@@ -1237,6 +1261,7 @@ $_agmsg_running_team"
   echo "    Check with 'delivery.sh status <type> <project>'. (#133)"
   echo ""
   agmsg_install_operation_finish || exit 1
+  agmsg_install_restart_daemon "$SKILL_DIR"
   echo "  ✓ Update complete"
   echo ""
   exit 0
