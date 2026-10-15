@@ -320,6 +320,32 @@ EOF
   [ "$(sqlite3 "$TEST_SKILL_DIR/run/install.db" "SELECT state FROM daemon_owner;")" = "none" ]
 }
 
+@test "daemon.sh: an install.db with only the 2-column meta -- status only reads, enable and disable bring it up to date" {
+  [ "$(uname -s)" = "Darwin" ] || skip "this test's fake stands in for launchd specifically"
+  mkdir -p "$TEST_SKILL_DIR/run"
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "CREATE TABLE meta (schema_version INTEGER NOT NULL, install_id TEXT NOT NULL); INSERT INTO meta VALUES (1, 'daemon-sh-test');"
+  _write_completion_record
+  local fake_launchctl
+  fake_launchctl="$(_fake_launchctl)"
+
+  run bash "$DAEMON" status
+  [ "$status" -eq 0 ]
+  [ "${output#*not in use yet}" != "$output" ]
+  [ -z "$(sqlite3 "$TEST_SKILL_DIR/run/install.db" "SELECT name FROM sqlite_master WHERE name='daemon_owner';")" ]
+  AGMSGD_LAUNCHCTL="$fake_launchctl" AGMSGD_FAKE_LAUNCHD_MARKER="$TEST_SKILL_DIR/fake-launchd/registered" AGMSGD_FAKE_LAUNCHD_EVENTS="$TEST_SKILL_DIR/fake-launchd/events" AGMSGD_FAKE_OP_LOCK_DB="$TEST_SKILL_DIR/run/install-op.lock.db" AGMSGD_TEST_LAUNCHER="$SCRIPTS/daemon/agmsgd-launch.sh" \
+    run bash "$DAEMON" enable
+  [ "$status" -eq 0 ]
+  [ "$(sqlite3 "$TEST_SKILL_DIR/run/install.db" "SELECT install_id FROM meta;")" = "daemon-sh-test" ]
+  [ "$(sqlite3 "$TEST_SKILL_DIR/run/install.db" "SELECT desired FROM daemon_intent;")" = "on" ]
+  AGMSGD_LAUNCHCTL="$fake_launchctl" AGMSGD_FAKE_LAUNCHD_MARKER="$TEST_SKILL_DIR/fake-launchd/registered" AGMSGD_FAKE_LAUNCHD_EVENTS="$TEST_SKILL_DIR/fake-launchd/events" AGMSGD_FAKE_OP_LOCK_DB="$TEST_SKILL_DIR/run/install-op.lock.db" \
+    run bash "$DAEMON" disable
+  [ "$status" -eq 0 ]
+  printf 'not a sqlite database' > "$TEST_SKILL_DIR/run/install.db"
+  run bash "$DAEMON" status
+  [ "$status" -ne 0 ]
+  [ "${output#*not in use yet}" = "$output" ]
+}
+
 @test "daemon.sh start: stale ready state asks the registered manager to start the service" {
   [ "$(uname -s)" = "Darwin" ] || skip "this test's fake stands in for launchd specifically"
   _seed_install_db

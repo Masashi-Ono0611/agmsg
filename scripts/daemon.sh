@@ -21,6 +21,8 @@ source "$SCRIPT_DIR/lib/daemon-state.sh"
 source "$SCRIPT_DIR/lib/storage.sh"
 # shellcheck source=lib/daemon-seats.sh
 source "$SCRIPT_DIR/lib/daemon-seats.sh"
+# shellcheck source=lib/install-db.sh
+source "$SCRIPT_DIR/lib/install-db.sh"
 
 _path_hint() {
   printf 'If agmsg is not found, use "%s/scripts/agmsg" daemon %s.\n' "$SKILL_DIR" "$1"
@@ -48,6 +50,17 @@ _require_install_db() {
     echo "agmsg daemon: run/install.db does not exist -- run install.sh first" >&2
     exit 1
   fi
+}
+
+# An install.db made by an older install.sh lacks meta's node columns and the
+# daemon tables; bring it up to schema.sql. Only the commands that change
+# daemon state call this -- status stays a read.
+_ensure_install_db_schema() {
+  _require_install_db
+  agmsg_install_db_apply_schema "$INSTALL_DB" "$SCRIPT_DIR/daemon/schema.sql" || {
+    echo "agmsg daemon: could not bring run/install.db up to date" >&2
+    exit 1
+  }
 }
 
 # Runs $1 (one or more SQL statements against install.db's tables,
@@ -451,7 +464,7 @@ _wait_for_ready() {
 }
 
 cmd_start() {
-  _require_install_db
+  _ensure_install_db_schema
   local state
   state="$(sqlite3 "$INSTALL_DB" "SELECT state FROM daemon_owner;")"
   if [ "$state" = "ready" ] && node "$SCRIPT_DIR/daemon/status.mjs" "$SKILL_DIR" >/dev/null 2>&1; then
@@ -509,7 +522,7 @@ _request_stop_over_socket() {
 }
 
 cmd_stop() {
-  _require_install_db
+  _ensure_install_db_schema
   # Stop takes no operation lock.
   local desired
   desired="$(sqlite3 "$INSTALL_DB" "SELECT desired FROM daemon_intent;" 2>/dev/null || true)"
@@ -543,6 +556,14 @@ cmd_status() {
       *) _usage; return 2 ;;
     esac
   done
+  local owner_tables
+  # Only a database that answers and has no daemon_owner table is "not in use
+  # yet"; a query that fails (corrupt, locked) falls through to the normal
+  # read below and is reported as unknown.
+  if owner_tables="$(sqlite3 "$INSTALL_DB" "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='daemon_owner';" 2>/dev/null)" && [ "$owner_tables" = 0 ] && [ "$json" != true ]; then
+    echo "agmsg daemon status: agmsgd is not in use yet (turn it on with 'agmsg daemon enable')"
+    return 0
+  fi
   local node_path
   node_path="$(_resolve_node node 2>/dev/null || true)"
   if [ -n "$node_path" ]; then
@@ -584,7 +605,7 @@ cmd_status() {
 }
 
 cmd_enable() {
-  _require_install_db
+  _ensure_install_db_schema
   if [ "$(_os)" = linux ] && ! _systemd_user_usable; then
     echo "agmsg daemon enable: systemd user services are not available here (systemctl --user does not work), so agmsgd cannot be registered to start on its own. Nothing was changed. 'agmsg daemon start' runs it for this session only." >&2
     _path_hint start >&2
@@ -617,7 +638,7 @@ cmd_enable() {
 }
 
 cmd_disable() {
-  _require_install_db
+  _ensure_install_db_schema
   _with_op_lock "UPDATE daemon_intent SET desired = 'off', op_gen = op_gen + 1, set_by = 'disable', set_at = strftime('%Y-%m-%dT%H:%M:%fZ','now');" _unregister
   local socket
   socket="$(sqlite3 "$INSTALL_DB" "SELECT socket FROM daemon_owner WHERE state = 'ready';" 2>/dev/null || true)"

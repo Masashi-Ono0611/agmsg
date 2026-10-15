@@ -12,9 +12,9 @@
 #
 # schema_version starts at 1 so a later migration has a value to gate a
 # table-adding ALTER on. This script initially writes only
-# `meta(schema_version, install_id)`; the Node/CLI-only columns
-# (node_path, node_version) are added by whichever PR implements
-# `enable`/`disable`.
+# `meta(schema_version, install_id)`; agmsg_install_db_apply_schema below
+# adds the Node/CLI-only columns (node_path, node_version) and the daemon
+# tables, for both a fresh install and an --update over an older install.db.
 #
 # Required caller-set variable: none. Sources scripts/lib/compat.sh (for
 # compat_uuid7) and scripts/lib/sqlite-output.sh (for normalized query output)
@@ -58,4 +58,21 @@ agmsg_install_db_ensure_meta() {   # <install_db_path>
     fi
   fi
   printf '%s\n' "$id"
+}
+
+# Brings install.db up to scripts/daemon/schema.sql: adds the meta columns an
+# older install.db lacks (CREATE TABLE IF NOT EXISTS never alters an existing
+# table), then applies the idempotent schema. The one place both install.sh and
+# `agmsg daemon enable` go through. Never touches an existing install_id.
+# Returns 1 on any sqlite failure.
+agmsg_install_db_apply_schema() {   # <install_db_path> <schema_sql_path>
+  local db="$1" schema="$2" col present
+  for col in node_path node_version codex_path; do
+    # One scalar per column: a multi-line result carries a CR on every line
+    # from native Windows sqlite3.exe, which a name comparison would miss.
+    present="$(agmsg_sqlite_capture "$db" "SELECT count(*) FROM pragma_table_info('meta') WHERE name = '$col';")" || return 1
+    [ "$present" = 1 ] && continue
+    sqlite3 "$db" "ALTER TABLE meta ADD COLUMN $col TEXT;" 2>/dev/null || return 1
+  done
+  sqlite3 "$db" < "$schema" 2>/dev/null
 }

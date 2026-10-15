@@ -372,6 +372,10 @@ agmsg_install_operation_begin() {
     echo "  ! could not read or create install.db's meta row" >&2
     return 1
   fi
+  if ! agmsg_install_db_apply_schema "$install_db" "$SCRIPT_DIR/scripts/daemon/schema.sql"; then
+    echo "  ! could not apply the daemon schema to install.db" >&2
+    return 1
+  fi
   agmsg_install_op_require || return 1
   if ! agmsg_install_manifest_rotate_prev "$manifest"; then
     echo "  ! could not move the previous completion record aside" >&2
