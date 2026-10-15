@@ -12,7 +12,7 @@
 
 import { randomUUID } from "node:crypto";
 import { createConnection } from "node:net";
-import { closeSync, lstatSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { closeSync, lstatSync, openSync, readFileSync, readSync, readdirSync, statSync } from "node:fs";
 import process from "node:process";
 import { isAbsolute } from "node:path";
 
@@ -42,7 +42,34 @@ export function resolveTranscriptPath(claudeConfigDir, project, sessionId) {
   if (typeof sessionId !== "string" || !sessionId) return "";
   const encoded = encodeClaudeProjectDir(project);
   if (!encoded) return "";
-  return `${claudeConfigDir}/projects/${encoded}/${sessionId}.jsonl`;
+  const expected = `${claudeConfigDir}/projects/${encoded}/${sessionId}.jsonl`;
+  if (isFile(expected)) return expected;
+  // The seat's conversation can live under another project directory than the
+  // one its record names (it was started elsewhere). A session id is unique, so
+  // exactly one match under the config dir is that conversation; none or
+  // several keeps the expected path and the caller's own "missing" answer.
+  if (!/^[A-Za-z0-9._-]+$/.test(sessionId) || sessionId.startsWith(".")) return expected;
+  let dirs;
+  try {
+    dirs = readdirSync(`${claudeConfigDir}/projects`, { withFileTypes: true });
+  } catch {
+    return expected;
+  }
+  const found = [];
+  for (const entry of dirs) {
+    if (!entry.isDirectory()) continue;
+    const candidate = `${claudeConfigDir}/projects/${entry.name}/${sessionId}.jsonl`;
+    if (isFile(candidate)) found.push(candidate);
+  }
+  return found.length === 1 ? found[0] : expected;
+}
+
+function isFile(path) {
+  try {
+    return lstatSync(path).isFile();
+  } catch {
+    return false;
+  }
 }
 
 // Refuses to write unless the path is a Unix domain socket owned by this

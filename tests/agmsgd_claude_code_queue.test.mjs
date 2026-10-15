@@ -6,6 +6,7 @@ import test from 'node:test';
 
 import {
   observeTranscript,
+  resolveTranscriptPath,
   resolvePendingDelivery,
 } from '../scripts/daemon/channels/claude-code-queue-io.mjs';
 import { createClaudeCodeQueueChannel } from '../scripts/daemon/channels/claude-code-queue.mjs';
@@ -143,4 +144,21 @@ test('a nudge is sent again once the seat record names another session', async (
   assert.equal(state.sent, 2);
   assert.deepEqual(db.prepare('SELECT state FROM beta_claude_queue ORDER BY id').all().map((row) => row.state), ['expired', 'pending']);
   await channel.stop();
+});
+
+test('a conversation stored under another project directory is found by its session id, only when exactly one matches', (t) => {
+  const config = temporaryDirectory(t);
+  const session = '0d7c2a52-5d4c-4d0f-8c0a-6b6f5f3f9a11';
+  const expected = `${config}/projects/-proj-recorded/${session}.jsonl`;
+  const elsewhere = `${config}/projects/-proj-started-elsewhere/${session}.jsonl`;
+  mkdirSync(path.dirname(elsewhere), { recursive: true });
+  writeFileSync(elsewhere, '');
+  assert.equal(resolveTranscriptPath(config, '/proj/recorded', session), elsewhere);
+  const second = `${config}/projects/-proj-another/${session}.jsonl`;
+  mkdirSync(path.dirname(second), { recursive: true });
+  writeFileSync(second, '');
+  assert.equal(resolveTranscriptPath(config, '/proj/recorded', session), expected, 'two matches decide nothing');
+  mkdirSync(path.dirname(expected), { recursive: true });
+  writeFileSync(expected, '');
+  assert.equal(resolveTranscriptPath(config, '/proj/recorded', session), expected, 'the recorded project wins when it has the file');
 });
