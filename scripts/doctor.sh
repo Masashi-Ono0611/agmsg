@@ -106,6 +106,8 @@ RUN_DIR="$SKILL_DIR/run"
 . "$SCRIPT_DIR/lib/type-registry.sh"
 # shellcheck disable=SC1091
 . "$SCRIPT_DIR/lib/validate.sh"
+# shellcheck disable=SC1091
+. "$SCRIPT_DIR/lib/stale-outcome-files.sh"
 
 # --- orphaned run/ records (#1507) -----------------------------------------
 #
@@ -284,6 +286,97 @@ _doctor_print_orphans() {
   fi
 }
 
+# --- registry locks with no holder record (#865) ---------------------------
+#
+# A registry lock (teams/<team>/.config.lock) names its holder in a record
+# beside it. The next command that needs the lock breaks one whose holder is
+# gone, but a lock with NO record cannot be told from one taken a moment ago
+# whose owner has not written the record yet, so nothing breaks it and every
+# command for that team then waits out its budget and fails.
+#
+# REPORTED, NEVER REMOVED, not even by --fix. Removing one safely needs the
+# acquiring side to cooperate: whatever this checks about the directory can stop
+# being true before the `rmdir` runs (the lock is released, a new owner takes
+# the same path and has not recorded itself yet), and no age or second look
+# closes that. So doctor finds them and prints the command; running it is the
+# operator's call, when every agmsg sync and seat is stopped.
+# Installation-wide, like the orphaned records above.
+LOCKS_NO_RECORD=""
+
+# Only the holder file is a record. The copy a killed release leaves behind
+# (`<lock>.holder.releasing.<pid>`) is not tied to the directory that is there
+# now, so it is not counted; a lock with only that is listed like any other.
+_doctor_lock_has_record() {   # <lock dir>
+  [ -f "$1.holder" ]
+}
+
+# Fills LOCKS_NO_RECORD with one team directory name per line. The three globs
+# are the ones remote.sh doctor uses: `*` skips a leading dot, so `.foo` and
+# `..foo` need their own.
+_doctor_scan_record_less_locks() {
+  local lock name
+  LOCKS_NO_RECORD=""
+  for lock in "$SKILL_DIR"/teams/*/.config.lock "$SKILL_DIR"/teams/.[!.]*/.config.lock "$SKILL_DIR"/teams/..?*/.config.lock; do
+    [ -d "$lock" ] || continue
+    if _doctor_lock_has_record "$lock"; then continue; fi
+    name="${lock%/.config.lock}"; name="${name##*/}"
+    LOCKS_NO_RECORD="${LOCKS_NO_RECORD}${name}"$'\n'
+  done
+}
+
+# Under --redacted the team name (and the path in the command) is replaced.
+_doctor_print_locks() {
+  local n name q
+  [ -n "$LOCKS_NO_RECORD" ] || return 0
+  n="$(printf '%s' "$LOCKS_NO_RECORD" | grep -c . || true)"
+  echo "registry locks with no holder record -- nothing can tell whether they are held ($n):"
+  while IFS= read -r name; do
+    [ -n "$name" ] || continue
+    if [ "$REDACTED" = 1 ]; then
+      _redact_team "$name"; echo "  team: $_REDACT_OUT"
+    else
+      # QUOTED, because this line is meant to be pasted: the store root and the
+      # team name can both contain a space. `rmdir`, not `rm -r`, so the paste
+      # cannot remove anything but an empty lock directory.
+      q="$(printf "'%s'" "$(printf '%s' "$SKILL_DIR/teams/$name/.config.lock" | sed "s/'/'\\\\''/g")")"
+      echo "  team: $name"
+      echo "    rmdir $q"
+    fi
+  done <<< "$LOCKS_NO_RECORD"
+  echo "  run a rmdir only when every agmsg sync and seat is stopped; a lock taken a moment ago looks the same."
+  echo
+}
+
+# --- leaked storage sync driver outcome files (#1572) -----------------------
+#
+# AGMSG_SQLITE_OUTCOME_FILE (lib/storage.sh `_agmsg_sqlite_recording`, read by
+# scripts/internal/storage-sync-driver.sh) used to go unremoved on every
+# ordinary successful "apply"/"read-apply" call before #1572, on an install
+# made before that fix. See lib/stale-outcome-files.sh for the exact match
+# criteria (location, name, size, content, age) this only ever removes a
+# file matching all of.
+STALE_OUTCOME_FILES=""
+_doctor_scan_stale_outcome_files() {
+  STALE_OUTCOME_FILES="$(agmsg_stale_outcome_candidates)"
+}
+
+_doctor_print_stale_outcome_files() {
+  local n dir example_n=0
+  [ -n "$STALE_OUTCOME_FILES" ] || return 0
+  n="$(printf '%s\n' "$STALE_OUTCOME_FILES" | grep -c . || true)"
+  dir="$(_agmsg_stale_outcome_dir)"
+  echo "leaked storage sync driver outcome files in $dir (#1572, fixed; left over from before the fix) ($n):"
+  while IFS= read -r f; do
+    [ -n "$f" ] || continue
+    example_n=$((example_n + 1))
+    [ "$example_n" -le 5 ] || continue
+    echo "  $f"
+  done <<< "$STALE_OUTCOME_FILES"
+  if [ "$n" -gt 5 ]; then echo "  ... and $((n - 5)) more"; fi
+  echo "  remove them with: doctor.sh --fix"
+  echo
+}
+
 # --- --fix: its own mode, not a flag on the report -------------------------
 #
 # Lists what would go, asks once (--yes skips only the question), then removes
@@ -299,36 +392,72 @@ if [ "$FIX" = 1 ]; then
     exit 2
   fi
   _doctor_scan_orphan_run_records
-  if [ -z "$ORPHAN_SEATS" ]; then
-    echo "nothing to fix: no orphaned run/ records."
+  _doctor_scan_stale_outcome_files
+  if [ -z "$ORPHAN_SEATS" ] && [ -z "$STALE_OUTCOME_FILES" ]; then
+    echo "nothing to fix: no orphaned run/ records, no leaked outcome files."
     if [ -n "$ORPHAN_AMBIGUOUS" ]; then echo; _doctor_print_orphans; fi
     exit 0
   fi
-  _doctor_print_orphans
-  if [ "$ASSUME_YES" != 1 ]; then
-    printf 'Remove the records listed above? (y/n) [n]: '
-    read -r _doctor_answer || _doctor_answer=""
-    case "$_doctor_answer" in y|Y) ;; *) echo "Aborted; nothing removed."; exit 1 ;; esac
-  fi
-  _doctor_removed=0 _doctor_skipped=0
-  while IFS="$_DOCTOR_US" read -r _s _team _agent _pane _files; do
-    [ -n "$_s" ] || continue
-    # The scan is older than the question above: a team of this name may have
-    # been created while it waited, and its records now belong to a live team.
-    # Checked again, right before each seat's files go.
-    _enc_team="$(_actas_lock_encode "$_team")"
-    case $'\n'"$(_doctor_existing_enc_teams)"$'\n' in
-      *$'\n'"$_enc_team"$'\n'*) _doctor_skipped=$((_doctor_skipped + 1)); continue ;;
+  _doctor_aborted=0
+  if [ -n "$ORPHAN_SEATS" ]; then
+    _doctor_print_orphans
+    if [ "$ASSUME_YES" != 1 ]; then
+      printf 'Remove the orphaned run/ records listed above? (y/n) [n]: '
+      read -r _doctor_answer || _doctor_answer=""
+      case "$_doctor_answer" in y|Y) ;; *) echo "Aborted; run/ records not removed."; _doctor_aborted=1; _doctor_answer="" ;; esac
+    else
+      _doctor_answer=y
+    fi
+    case "$_doctor_answer" in
+      y|Y)
+        _doctor_removed=0 _doctor_skipped=0
+        while IFS="$_DOCTOR_US" read -r _s _team _agent _pane _files; do
+          [ -n "$_s" ] || continue
+          # The scan is older than the question above: a team of this name may
+          # have been created while it waited, and its records now belong to a
+          # live team. Checked again, right before each seat's files go.
+          _enc_team="$(_actas_lock_encode "$_team")"
+          case $'\n'"$(_doctor_existing_enc_teams)"$'\n' in
+            *$'\n'"$_enc_team"$'\n'*) _doctor_skipped=$((_doctor_skipped + 1)); continue ;;
+          esac
+          for _f in $_files; do
+            rm -f "$RUN_DIR/$_f"
+          done
+          _doctor_removed=$((_doctor_removed + 1))
+        done <<< "$ORPHAN_SEATS"
+        echo "removed the run/ records of $_doctor_removed seat(s)."
+        if [ "$_doctor_skipped" -gt 0 ]; then
+          echo "left $_doctor_skipped seat(s) alone: their team exists now."
+        fi
+        ;;
     esac
-    for _f in $_files; do
-      rm -f "$RUN_DIR/$_f"
-    done
-    _doctor_removed=$((_doctor_removed + 1))
-  done <<< "$ORPHAN_SEATS"
-  echo "removed the run/ records of $_doctor_removed seat(s)."
-  if [ "$_doctor_skipped" -gt 0 ]; then
-    echo "left $_doctor_skipped seat(s) alone: their team exists now."
   fi
+  if [ -z "$ORPHAN_SEATS" ] && [ -n "$ORPHAN_AMBIGUOUS" ]; then
+    # Only reached here when ORPHAN_SEATS was empty: otherwise the call
+    # above already printed this section too (it prints both at once).
+    _doctor_print_orphans
+  fi
+  # Independent of the orphan-records section above: either can be present
+  # without the other, so one being empty (or its own prompt declined) never
+  # skips the other.
+  if [ -n "$STALE_OUTCOME_FILES" ]; then
+    [ -n "$ORPHAN_SEATS$ORPHAN_AMBIGUOUS" ] && echo
+    _doctor_print_stale_outcome_files
+    if [ "$ASSUME_YES" != 1 ]; then
+      printf 'Remove the leaked outcome files listed above? (y/n) [n]: '
+      read -r _doctor_answer || _doctor_answer=""
+      case "$_doctor_answer" in y|Y) ;; *) echo "Aborted; outcome files not removed."; _doctor_aborted=1; _doctor_answer="" ;; esac
+    else
+      _doctor_answer=y
+    fi
+    case "$_doctor_answer" in
+      y|Y)
+        _doctor_outcome_removed="$(printf '%s\n' "$STALE_OUTCOME_FILES" | agmsg_remove_stale_outcome_files)"
+        echo "removed $_doctor_outcome_removed leaked outcome file(s)."
+        ;;
+    esac
+  fi
+  [ "$_doctor_aborted" -eq 0 ] || exit 1
   exit 0
 fi
 
@@ -935,6 +1064,18 @@ fi
 if [ -n "$ORPHAN_AMBIGUOUS" ]; then
   _warn "run/ holds records for a team that no longer exists that cannot be attributed to one seat (\"__\" inside a name); they are left alone, remove them by hand"
 fi
+# Registry locks with no holder record (#865): also installation-wide. Nothing
+# else ever breaks one, so a team that keeps timing out on its lock lands here.
+_doctor_scan_record_less_locks
+if [ -n "$LOCKS_NO_RECORD" ]; then
+  _warn "teams/ holds registry lock(s) with no holder record, and every command for those teams waits on them (see 'registry locks with no holder record' above); the rmdir to run by hand is listed there, only when every agmsg sync and seat is stopped"
+fi
+# Leaked storage sync driver outcome files (#1572): installation-wide too,
+# and only ever left by an install made before that fix.
+_doctor_scan_stale_outcome_files
+if [ -n "$STALE_OUTCOME_FILES" ]; then
+  _warn "$(_agmsg_stale_outcome_dir) holds leaked storage sync driver outcome file(s) from before #1572 (see 'leaked storage sync driver outcome files' above); fix them with: doctor.sh --fix"
+fi
 WARN_COUNT="$(printf '%s\n' "$WARNINGS" | grep -c . || true)"
 
 echo "$TEAM_COUNT team(s), $TOTAL_PAIR_COUNT registration(s), $WARN_COUNT warning(s)"
@@ -945,6 +1086,8 @@ if [ -n "$GLOBAL_WATCH_LINE" ]; then
 fi
 printf '%s' "$REPORT_BLOCKS"
 _doctor_print_orphans
+_doctor_print_locks
+_doctor_print_stale_outcome_files
 
 if [ -n "$WARNINGS" ]; then
   echo "warnings:"

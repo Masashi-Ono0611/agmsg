@@ -75,7 +75,7 @@ Four possible outputs:
   > - **Team name**: a group of agents that can message each other (available: <list from output>)
   > - **Agent name**: this agent's identity within the team
 
-  1. Ask: "Enter a team name (joins existing or creates new)"
+  1. Ask: "Enter a team name (joins existing or creates new)". If that name is not in `available_teams` and `~/.agents/skills/agmsg/scripts/team-list.sh --json --scope all` shows a team whose `binding_state` is not `none`, do not create it yet: ask whether to create a new local team or bring in the team of that name from a server (`remote pull`; after it succeeds, return to Identity setup). With no such team, create it locally without mentioning remote.
   2. If the team name given already appears in `available_teams`, run `~/.agents/skills/agmsg/scripts/team.sh <team>` to see the current roster (name, type, project) and note the names already in use. Look for a naming convention already in play (e.g. a shared base name with role and number suffixes (`<base>-<role><n>`), or names derived from the team name) and, when one exists, propose 2-3 unused names that extend it; otherwise propose 2-3 short, distinctive identity names (not a bare tool-type label like `codex`/`cc`). Either way, names must not collide with the roster. Then ask: "Enter a name for this agent (suggestions: <name1>, <name2>, <name3> — or type your own)". For a brand-new team, skip the roster check and just ask: "Enter a name for this agent".
   3. **You MUST use join.sh** — run: `~/.agents/skills/agmsg/scripts/join.sh <team> <agent_name> claude-code "$(pwd)"`
   4. Show the result and explain:
@@ -98,7 +98,7 @@ Four possible outputs:
 
   1. Show the suggested agent names to the user.
   2. Ask whether to reuse one of those names or choose a new one.
-  3. Ask for the team name to join (existing or new).
+  3. Ask for the team name to join (existing or new). If that name is not in `available_teams` and `~/.agents/skills/agmsg/scripts/team-list.sh --json --scope all` shows a team whose `binding_state` is not `none`, do not create it yet: ask whether to create a new local team or bring in the team of that name from a server (`remote pull`; after it succeeds, return to Identity setup). With no such team, create it locally without mentioning remote. If the team is in `available_teams`, run `~/.agents/skills/agmsg/scripts/team.sh <team>` and check that the agent name you are about to use (reused or new) is not already in its roster.
   4. Run: `~/.agents/skills/agmsg/scripts/join.sh <team> <agent_name> claude-code "$(pwd)"`
   5. Then continue with the normal post-join flow above.
 
@@ -185,6 +185,10 @@ If argument is "version":
 1. Run: `~/.agents/skills/agmsg/scripts/version.sh`
 2. Show the output — the installed version (git-describe provenance recorded at install time).
 
+If asked to update or upgrade agmsg:
+1. Run: `npx agmsg@latest install --update` — add `--cmd <name>` when this machine has more than one agmsg install. It keeps the database and team configs and replaces the scripts.
+2. Tell the user to restart running agent sessions so they pick up the new scripts.
+
 If argument is "where" (e.g. asked to report this session's own pane or placement):
 1. Run: `~/.agents/skills/agmsg/scripts/where.sh`
 2. Report exactly what it prints. Do not try to answer this by naming a terminal yourself or running any terminal-specific command directly — this call already asked every driver on this session's behalf.
@@ -201,12 +205,12 @@ If argument starts with "actas" followed by an agent name (e.g. "actas alice"):
     - `status=held team=<team> owner=<sid>`: another live session currently owns `<name>` in `<team>`. Tell the user: "Cannot actas as `<name>` — it is held by session `<sid>` in team `<team>`. Run `/agmsg drop <name>` in that session first, then retry." Then abort — do NOT touch the running Monitor.
     - `status=not_registered`: shouldn't happen if step 3 ran; treat as an error.
 5. **Switch receive too — exclusive role mode.**
-   a. Run TaskList. Find any task whose description begins with "agmsg inbox stream".
-   b. **If a matching task is found**: TaskStop it.
-   c. **If no matching task is found** (typical when /agmsg actas runs as the first command of a fresh session — SessionStart hasn't fired the Monitor directive yet, or you're invoking actas before the agent acted on it): skip TaskStop entirely. There is no Monitor to stop. Do NOT attempt TaskStop with a guessed or empty task_id — it will fail with "Invalid tool parameters" and confuse the flow.
+   a. Find this session's agmsg watch Monitor task: a task in TaskList whose description begins with "agmsg inbox stream", or the task_id returned by a Monitor call you made earlier in this conversation. Not every environment lists Monitor tasks in TaskList, so an empty list does not mean none is running.
+   b. **If you have such a task_id**: TaskStop it.
+   c. **If you have none** (typical when /agmsg actas runs as the first command of a fresh session — SessionStart hasn't fired the Monitor directive yet, or you're invoking actas before the agent acted on it): skip TaskStop. Do NOT attempt TaskStop with a guessed or empty task_id — it will fail with "Invalid tool parameters" and confuse the flow. Starting a new watcher for this session in step d replaces any previous one.
    d. Run `~/.agents/skills/agmsg/scripts/delivery.sh status claude-code "$(pwd)"` and read its **first line**.
       - **`mode: monitor` or `mode: both`**: invoke a fresh Monitor, regardless of whether step b or c applied:
-        - command: `~/.agents/skills/agmsg/scripts/watch.sh $CLAUDE_CODE_SESSION_ID "$(pwd)" claude-code <name> --max-seconds=1790`
+        - command: `~/.agents/skills/agmsg/scripts/watch.sh $CLAUDE_CODE_SESSION_ID "$(pwd)" claude-code <name> --max-seconds=1750`
         - description: `agmsg inbox stream (acting as <name>)`
         - persistent: true
         - timeout_ms: 1800000
@@ -219,17 +223,17 @@ If argument starts with "actas" followed by an agent name (e.g. "actas alice"):
 6. Set the session's active FROM to `<name>` — use `<name>` in every `send.sh` call for the rest of this session.
 7. Tell the user: "Now acting as `<name>`. Sends use `<name>` as from; receive restricted to `<name>` only."
 8. **Only if this session was NOT launched via `spawn`** — check the environment variable `AGMSG_SPAWNED` (e.g. `printenv AGMSG_SPAWNED`): `spawn` exports `AGMSG_SPAWNED=1` and already named the session `<team>-<agent>` via `-n`, so when it is set, **skip this tip entirely**. When it is UNSET (a human typed `claude` then actas'd, so the session has no convention name), additionally suggest to the user: "Tip: rename this session to `<team>-<name>` with `/rename <team>-<name>` so it's easy to find in the `/resume` picker and stays labeled after a restart." `/rename` is a user-typed slash command — you cannot invoke it yourself, so only suggest it.
-9. **Confirm the Monitor actually attached** — only when step 5d invoked a fresh Monitor (`mode: monitor` or `mode: both`): run TaskList once more and confirm a task whose description begins with `agmsg inbox stream` is present. Do NOT read this off the terminal UI's background-task footer — it does not reliably reflect whether a Monitor is really streaming for this session; TaskList is the only check that does. If the task is missing, retry the Monitor invocation from step 5d once. If it is still missing after the retry, tell the user `actas` completed but delivery could not be confirmed as attached, and do not describe delivery as active.
+9. **Confirm the Monitor actually attached** — only when step 5d invoked a fresh Monitor (`mode: monitor` or `mode: both`): confirm the Monitor call from step 5d started (it returned a task id rather than an error). TaskList may list this task, but not every environment does (the desktop app's Code tab runs the Monitor and delivers its events without listing it), so a task missing from TaskList is not a failure: judge by the Monitor call starting and its events arriving. The background-task footer is not a reliable check either. If the Monitor call failed, retry the invocation from step 5d once. If it still fails after the retry, tell the user `actas` completed but delivery could not be confirmed as attached, and do not describe delivery as active.
 If argument starts with "drop" followed by an agent name (e.g. "drop alice"):
 1. Parse the role name.
 2. Run `~/.agents/skills/agmsg/scripts/reset.sh "$(pwd)" claude-code <name> "$CLAUDE_CODE_SESSION_ID"` to remove only that role's registration for this project. If the role has no other registrations left, reset.sh also drops it from the team config. The 4th argument releases any actas exclusivity locks this session held on the role so peers can pick it up immediately (see #62).
 3. If the session's active FROM was `<name>`, clear that state. Then:
-   a. Run TaskList. Find any task whose description begins with "agmsg inbox stream".
-   b. **If a matching task is found**: TaskStop it.
-   c. **If no matching task is found**: skip TaskStop. Do NOT attempt TaskStop with a guessed or empty task_id.
+   a. Find this session's agmsg watch Monitor task: a task in TaskList whose description begins with "agmsg inbox stream", or the task_id returned by a Monitor call you made earlier in this conversation. An empty TaskList does not mean none is running.
+   b. **If you have such a task_id**: TaskStop it.
+   c. **If you have none**: skip TaskStop. Do NOT attempt TaskStop with a guessed or empty task_id.
    d. Run `~/.agents/skills/agmsg/scripts/delivery.sh status claude-code "$(pwd)"` and read its **first line**.
       - **`mode: monitor` or `mode: both`**: invoke a fresh Monitor with the default subscription (no `actas` name filter — receives every (team, agent) pair currently registered for this project that isn't held by another session):
-        - command: `~/.agents/skills/agmsg/scripts/watch.sh $CLAUDE_CODE_SESSION_ID "$(pwd)" claude-code --max-seconds=1790`
+        - command: `~/.agents/skills/agmsg/scripts/watch.sh $CLAUDE_CODE_SESSION_ID "$(pwd)" claude-code --max-seconds=1750`
         - description: `agmsg inbox stream`
         - persistent: true
         - timeout_ms: 1800000
@@ -284,7 +288,7 @@ If argument starts with "poke" (e.g. "poke reviewer status?"):
 3. `poke` TYPES INTO another agent's session and submits it, as if a person had typed it there. Use it to reach a member whose watcher is not delivering (that is what it is for); use `send` for ordinary messages, which the member reads on its own terms.
 4. Exit codes split what "could not poke" means — see the shape and the pointer to the driver-specific file in point 4 of the "where" section above. **13** specifically means: do not fall back to `send` silently; the two are not the same act, say which one you did. Two more codes are `poke.sh`'s own, the same across every driver (not in the per-driver files, which only cover the driver's own layer below this one): **14** means it found the input box and it looks like someone is actively typing there right now — a transient condition `--retries` waits out. **15** means it could not even confirm where the input box is on this read (e.g. a mid-redraw screen) — a different finding from 14, not a typing detection, though it is also transient and also covered by `--retries`.
 
-If argument is "mode", run `~/.agents/skills/agmsg/scripts/delivery.sh status claude-code "$(pwd)"`. Show the output to the user, and if it says `mode: monitor` (or `both`), say explicitly that this reports project *configuration* only — it does not prove the runtime Monitor task is attached in the current session. To confirm the runtime state, run TaskList and look for a task whose description begins with `agmsg inbox stream` (after an `actas` it reads `agmsg inbox stream (acting as <name>)`) — that is the reliable check; the background-task footer is not (it does not reliably reflect whether a Monitor is really streaming for this session).
+If argument is "mode", run `~/.agents/skills/agmsg/scripts/delivery.sh status claude-code "$(pwd)"`. Show the output to the user, and if it says `mode: monitor` (or `both`), say explicitly that this reports project *configuration* only — it does not prove the runtime Monitor task is attached in the current session. To confirm the runtime state, look for a Monitor whose description begins with `agmsg inbox stream` (after an `actas` it reads `agmsg inbox stream (acting as <name>)`). TaskList may list this task, but not every environment does (the desktop app's Code tab runs the Monitor and delivers its events without listing it), so a task missing from TaskList is not a failure: judge by the Monitor call starting and its events arriving. The background-task footer is not a reliable check either.
 
 For `mode monitor|turn|both|off`, run `delivery.sh set <mode> claude-code "$(pwd)"` and follow its `AGMSG-DIRECTIVE` block. Legacy `hook on` maps to `turn`; `hook off` maps to `off`.
 
@@ -311,7 +315,7 @@ If argument starts with "rename-team":
 If argument starts with "delete-team" or asks to delete/remove a team's data:
 1. Accept only an explicit user request — never delete a team on an inference alone.
 2. Parse the team name and which of `--delete` (the team itself: config, roster, identity history, per-agent runtime state), `--force` (with `--delete`: also remove every remaining member first, the same effect as `leave.sh` for each), and `--purge-messages` (only its message history) the user wants — they can be combined.
-3. Run `~/.agents/skills/agmsg/scripts/team.sh <team>` first and show the roster. `--delete` refuses unless every member has already left (run `leave.sh` for each remaining one first, or use `--force`) and the team is not actively synced.
+3. Run `~/.agents/skills/agmsg/scripts/team.sh <team>` first and show the roster. `--delete` refuses unless every member has already left (run `leave.sh` for each remaining one first, or use `--force`) and the team is not actively synced (if it is, run `remote disconnect <team>` first).
 4. Repeat back exactly what will be lost — identity history for `--delete` (and, with `--force`, which members will be removed first), message history for `--purge-messages` — and wait for the user's explicit confirmation before running anything.
 5. Run: `~/.agents/skills/agmsg/scripts/team.sh <team> [--delete] [--force] [--purge-messages] --yes` — pass `--yes` since the confirmation already happened in chat; the script's own interactive prompt would otherwise block waiting for input this agent can't supply.
 6. Show the result.
@@ -364,7 +368,7 @@ If argument starts with "remote disconnect":
 3. Show the output to the user.
 
 If argument starts with "remote forget":
-1. Parse the required `<team>`. This permanently deletes that team's local roster, history, keys, trust, and sync state, but never changes the server.
+1. Parse the required `<team>`. This permanently deletes that team's local roster, history, keys, trust, and sync state, but never changes the server. It applies only to a team that has a remote binding; to delete any other local team, use `delete-team` above (`team.sh <team> --delete`).
 2. Do not add `--yes` yourself. Run: `bash ~/.agents/skills/agmsg/scripts/remote.sh forget <team>`
 3. The command requires the user to confirm in their terminal. If this agent has no interactive terminal, show the deletion summary and tell the user to rerun the displayed command directly; never bypass confirmation for them.
 

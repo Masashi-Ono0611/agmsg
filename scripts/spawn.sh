@@ -516,7 +516,11 @@ PLAIN_WITNESS="${BOOT}.plain-witness"
   printf 'if [ -f %q ]; then\n' "$PLAIN_WITNESS_REQUEST"
   echo '  case "${TERM_PROGRAM:-}" in iTerm.app) _agmsg_emulator=iterm ;; Apple_Terminal) _agmsg_emulator=terminal ;; *) _agmsg_emulator=unknown ;; esac'
   echo '  _agmsg_tty="$(tty 2>/dev/null || true)"'
-  echo '  _agmsg_start="$(ps -o lstart= -p "$$" 2>/dev/null | sed '\''s/^ *//; s/ *$//'\'' | tr '\'' '\'' '\''_'\'')"'
+  # LC_ALL=C: the start time is a witness compared byte for byte, not a date to
+  # read. In another locale ps spells it with that locale's day and month names
+  # (and punctuation such as '.' or '/'), which the checks reject and which would
+  # not compare equal to the same value read back in a different locale.
+  echo '  _agmsg_start="$(LC_ALL=C ps -o lstart= -p "$$" 2>/dev/null | sed '\''s/^ *//; s/ *$//'\'' | tr '\'' '\'' '\''_'\'')"'
   printf '  _agmsg_witness_tmp=%q.$$\n' "$PLAIN_WITNESS"
   echo '  { printf '\''%s\t%s\t%s\t%s'\'' "$_agmsg_emulator" "$_agmsg_tty" "$$" "$_agmsg_start"; echo; } > "$_agmsg_witness_tmp"'
   printf '  mv "$_agmsg_witness_tmp" %q\n' "$PLAIN_WITNESS"

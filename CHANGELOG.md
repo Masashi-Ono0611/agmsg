@@ -4,6 +4,35 @@ All notable changes to this project are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.3] - 2026-10-05
+
+### Added
+- Sessions in the Claude desktop app (Code tab) and the Codex desktop app are recognized as desktop seats: team status shows them as such, and they are never recorded against a terminal pane. Message delivery is unchanged. (#1563, #1565)
+
+### Fixed
+- Remote sync no longer leaves a small temp file behind for every message it applies; on a long-running synced team these filled the temp directory (on Linux tmpfs, until it ran out of inodes) (#1572)
+- `install --update` removes the temp files leaked before this fix, and `doctor` reports them (`doctor --fix` removes them) (#1575)
+- Stop treating a missing TaskList entry as a failed watch (#1571)
+- Drop the previous name's placement record for this pane on a switch (#1568)
+- End the Claude Code watch at 1750 seconds, not 1790 (#1561)
+- Break a registry lock only when its recorded holder is gone (#1556)
+
+### Documentation
+- Ask before creating a team when remote is in use; point at delete and update (#1574)
+
+### If you use remote sync and are already affected
+Check whether you use remote sync: `~/.agents/skills/agmsg/scripts/remote.sh status` lists each team, and only teams shown as `connected` are affected.
+
+If your temp directory is already full (on Linux, commands fail with "No space left on device" even though the disk has room), free it before updating. This removes only files that match the leaked files exactly: directly in the temp directory, named `tmp.` plus 10 characters, exactly 3 bytes containing the line `ok`, and older than 10 minutes:
+
+```sh
+find "${TMPDIR:-/tmp}" -maxdepth 1 -type f -name 'tmp.??????????' -size 3c -mmin +10 -print0 | xargs -0 grep -lx --null ok | xargs -0 rm -f
+```
+
+Then update with `npx agmsg@latest install --update`, which removes the rest. Afterwards, `doctor` reports any that remain and `doctor --fix` removes them.
+
+[1.5.3]: https://github.com/fujibee/agmsg/compare/v1.5.2...v1.5.3
+
 ## [1.5.2] - 2026-10-02
 
 ### Added

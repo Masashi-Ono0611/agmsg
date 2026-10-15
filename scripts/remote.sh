@@ -2990,7 +2990,7 @@ cmd_status() {
     fi
     case "$rc" in
       0) : ;;
-      2) echo "agmsg: team '$team' could not be read -- its config exists but could not be parsed (or its lock could not be acquired); connection state is unknown, not confirmed unconnected (#650)" >&2; exit 2 ;;
+      2) echo "agmsg: team '$team' could not be read -- its config exists but could not be parsed (or its lock could not be acquired -- doctor.sh lists registry locks with no holder record and prints the rmdir line); connection state is unknown, not confirmed unconnected (#650)" >&2; exit 2 ;;
       *) echo "agmsg: team '$team' has never been connected" >&2; exit 1 ;;
     esac
     return
