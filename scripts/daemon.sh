@@ -23,6 +23,10 @@ source "$SCRIPT_DIR/lib/storage.sh"
 source "$SCRIPT_DIR/lib/daemon-seats.sh"
 # shellcheck source=lib/install-db.sh
 source "$SCRIPT_DIR/lib/install-db.sh"
+# shellcheck source=lib/sqlpath.sh
+source "$SCRIPT_DIR/lib/sqlpath.sh"
+# shellcheck source=lib/hash.sh
+source "$SCRIPT_DIR/lib/hash.sh"
 
 _path_hint() {
   printf 'If agmsg is not found, use "%s/scripts/agmsg" daemon %s.\n' "$SKILL_DIR" "$1"
@@ -81,7 +85,7 @@ _ensure_install_db_schema() {
 _install_generation() {
   local install_id manifest_path_sql manifest_id manifest_gen
   install_id="$(sqlite3 "$INSTALL_DB" "SELECT install_id FROM meta;" 2>/dev/null)" || return 1
-  manifest_path_sql="$(printf '%s' "$SKILL_DIR/run/install-manifest.json" | sed "s/'/''/g")"
+  manifest_path_sql="$(agmsg_sql_readfile_path "$SKILL_DIR/run/install-manifest.json")"
   IFS='|' read -r manifest_id manifest_gen < <(sqlite3 :memory: "SELECT json_extract(CAST(readfile('$manifest_path_sql') AS TEXT), '\$.install_id') || '|' || json_extract(CAST(readfile('$manifest_path_sql') AS TEXT), '\$.gen');" 2>/dev/null) || return 1
   [ -n "$install_id" ] && [ "$manifest_id" = "$install_id" ] && [ -n "$manifest_gen" ] || return 1
   printf '%s:%s' "$install_id" "$manifest_gen"
@@ -92,21 +96,41 @@ _install_generation() {
 # acquisition and rechecked while the lock is held, so an upgrade between
 # those points cannot register an obsolete launcher.
 _with_op_lock() {
+  # A lock helper that exits early must show up as "could not acquire", not as
+  # this shell dying silently on a write to a closed pipe (exit 141).
+  trap '' PIPE
+  local rc=0
+  _with_op_lock_run "$@" || rc=$?
+  trap - PIPE
+  return "$rc"
+}
+
+_with_op_lock_run() {
   local statements="$1" expected_generation current_generation ready applied lock_pid attach_path lock_dir
   local AGMSGD_LOCK_INSTALL_ID
   shift
   expected_generation="$(_install_generation)" || {
-    echo "agmsg daemon: cannot read a complete install generation" >&2
+    echo "agmsg daemon: could not read this install's record (run/install-manifest.json does not match run/install.db, or one of them cannot be read). Repair it with: npx agmsg@next install --update (add --cmd <name> if this is a named install or several installs exist), then try again." >&2
     return 1
   }
   AGMSGD_LOCK_INSTALL_ID="${expected_generation%%:*}"
   lock_dir="$(mktemp -d "$SKILL_DIR/run/daemon-op-lock.XXXXXX")" || return 1
-  mkfifo "$lock_dir/in" "$lock_dir/out"
-  sqlite3 -batch "$LOCK_DB" < "$lock_dir/in" > "$lock_dir/out" 3>&- 4>&- &
-  lock_pid=$!
-  exec 8> "$lock_dir/in"
-  exec 9< "$lock_dir/out"
-  attach_path="$(printf '%s' "$INSTALL_DB" | sed "s/'/''/g")"
+  if [ "$(_os)" = windows ]; then
+    # The native sqlite3 on Windows cannot be driven through an MSYS FIFO (it
+    # never answers), so talk to it over a coprocess's anonymous pipes. eval
+    # keeps the coproc syntax out of the parse for shells that lack it.
+    eval 'coproc AGMSGD_LOCK_SQL { sqlite3 -batch "$LOCK_DB"; }'
+    lock_pid="$AGMSGD_LOCK_SQL_PID"
+    exec 8>&"${AGMSGD_LOCK_SQL[1]}" 9<&"${AGMSGD_LOCK_SQL[0]}"
+    eval "exec ${AGMSGD_LOCK_SQL[1]}>&- ${AGMSGD_LOCK_SQL[0]}<&-"
+  else
+    mkfifo "$lock_dir/in" "$lock_dir/out"
+    sqlite3 -batch "$LOCK_DB" < "$lock_dir/in" > "$lock_dir/out" 3>&- 4>&- &
+    lock_pid=$!
+    exec 8> "$lock_dir/in"
+    exec 9< "$lock_dir/out"
+  fi
+  attach_path="$(agmsg_sql_readfile_path "$INSTALL_DB")"
   printf '%s\n' '.bail on' "ATTACH DATABASE '$attach_path' AS installdb;" 'BEGIN EXCLUSIVE;' '.print LOCKED' >&8
   if ! IFS= read -r -t 10 ready <&9 || [ "$ready" != "LOCKED" ]; then
     printf 'ROLLBACK;\n.quit\n' >&8 2>/dev/null || true
@@ -119,7 +143,7 @@ _with_op_lock() {
     return 1
   fi
   local generation_row generation_marker manifest_sql
-  manifest_sql="$(printf '%s' "$SKILL_DIR/run/install-manifest.json" | sed "s/'/''/g")"
+  manifest_sql="$(agmsg_sql_readfile_path "$SKILL_DIR/run/install-manifest.json")"
   printf '%s\n' "SELECT CASE WHEN json_extract(CAST(readfile('$manifest_sql') AS TEXT), '\$.install_id') = (SELECT install_id FROM installdb.meta) THEN (SELECT install_id FROM installdb.meta) || ':' || json_extract(CAST(readfile('$manifest_sql') AS TEXT), '\$.gen') ELSE '' END;" '.print GENERATION_END' >&8
   IFS= read -r -t 10 generation_row <&9 || generation_row=""
   IFS= read -r -t 10 generation_marker <&9 || generation_marker=""
@@ -191,7 +215,8 @@ _unit_id() {
   if [ -z "$install_id" ]; then
     install_id="$(sqlite3 "$INSTALL_DB" "SELECT install_id FROM meta;" 2>/dev/null)"
   fi
-  printf '%s:%s' "$SKILL_DIR" "$install_id" | shasum -a 256 | cut -c1-12
+  # shasum is absent from Git Bash; agmsg_sha256 falls back to sha256sum.
+  printf '%s:%s' "$SKILL_DIR" "$install_id" | agmsg_sha256 | cut -c1-12
 }
 
 _os() {
@@ -323,7 +348,7 @@ _start_registered_service() {
   case "$(_os)" in
     darwin) "$AGMSGD_LAUNCHCTL" kickstart "gui/$(id -u)/$(_launchd_label)" ;;
     linux) "$AGMSGD_SYSTEMCTL" --user start "$(basename "$(_systemd_unit_path)")" ;;
-    windows) "$AGMSGD_SCHTASKS" /Run /TN "$(_schtasks_name)" ;;
+    windows) _schtasks /Run /TN "$(_schtasks_name)" ;;
     *) echo "agmsg daemon start: unsupported resident manager" >&2; return 1 ;;
   esac
 }
@@ -337,6 +362,12 @@ _start_unregistered_launcher() {
 # NOT YET RUN ON WINDOWS in this environment -- written to the Windows
 # Task Scheduler contract (LogonTrigger + RestartOnFailure via XML, since plain
 # `/Create` flags do not set restart-on-failure) and shellchecked only.
+# schtasks takes /Create-style switches; without this Git Bash rewrites a
+# leading-slash argument into a path ("C:/Program Files/Git/Create").
+_schtasks() {
+  MSYS2_ARG_CONV_EXCL='*' "$AGMSGD_SCHTASKS" "$@"
+}
+
 _register_windows() {
   local node_path="$1" name xml
   name="$(_schtasks_name)"
@@ -366,7 +397,9 @@ _register_windows() {
 EOF
   { printf '\xff\xfe'; iconv -f UTF-8 -t UTF-16LE "$xml_utf8"; } > "$xml"
   rm -f "$xml_utf8"
-  "$AGMSGD_SCHTASKS" /Create /TN "$name" /XML "$xml" /F
+  local native_xml
+  native_xml="$(cygpath -w "$xml" 2>/dev/null || printf '%s' "$xml")"
+  _schtasks /Create /TN "$name" /XML "$native_xml" /F
 }
 
 _unregister_windows() {
@@ -376,7 +409,7 @@ _unregister_windows() {
   if [ ! -f "$xml" ]; then
     return 0
   fi
-  if ! "$AGMSGD_SCHTASKS" /Delete /TN "$name" /F; then
+  if ! _schtasks /Delete /TN "$name" /F; then
     echo "agmsg daemon: could not delete scheduled task $name" >&2
     return 1
   fi
@@ -491,6 +524,10 @@ cmd_start() {
     _path_hint status
   else
     echo "agmsg daemon start: did not become ready in time -- check 'agmsg daemon status'" >&2
+    if [ "$(_os)" = windows ] && _service_registered; then
+      echo "agmsg daemon start: the scheduled task $(_schtasks_name) was created and started, but agmsgd never reported ready. Task Scheduler's own record of the run follows; 'agmsg daemon disable' removes the task." >&2
+      _schtasks /Query /TN "$(_schtasks_name)" /V /FO LIST 2>&1 | grep -E 'Status|Last Run Time|Last Result|Task To Run' >&2 || true
+    fi
     agmsg_daemon_warn_if_stopped always
     _path_hint status >&2
     return 1

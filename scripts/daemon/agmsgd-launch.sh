@@ -56,6 +56,11 @@ _agmsgd_launch_lock_held() {
 # path; this does not decide completeness, only the version match.
 _agmsgd_launch_check_bootstrap_version() {
   local manifest_path="$1" recorded
+  # sqlite3 is a native binary on Windows and cannot open a Git Bash path from
+  # inside a readfile() literal; this file sources no lib, so convert inline.
+  if command -v cygpath >/dev/null 2>&1; then
+    manifest_path="$(cygpath -w "$manifest_path" 2>/dev/null || printf '%s' "$manifest_path")"
+  fi
   recorded="$(sqlite3 :memory: "
     WITH raw(json) AS (SELECT CAST(readfile('$(printf '%s' "$manifest_path" | sed "s/'/''/g")') AS TEXT))
     SELECT json_extract(json, '\$.bootstrap_version') FROM raw;

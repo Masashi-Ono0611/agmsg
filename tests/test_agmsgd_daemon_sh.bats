@@ -277,7 +277,14 @@ case "$1" in
   /Delete) rm -f "${AGMSGD_FAKE_TASK_MARKER:?}" ;;
 esac
 EOF
-  chmod +x "$TEST_SKILL_DIR/fake-windows/uname" "$TEST_SKILL_DIR/fake-windows/schtasks"
+  # Passes the path through and records what was asked to be converted: the
+  # native sqlite3 on Windows cannot open a Git Bash path named inside SQL.
+  cat > "$TEST_SKILL_DIR/fake-windows/cygpath" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' "$2" >> "${AGMSGD_FAKE_CYGPATH_LOG:?}"
+printf '%s\n' "$2"
+EOF
+  chmod +x "$TEST_SKILL_DIR/fake-windows/uname" "$TEST_SKILL_DIR/fake-windows/schtasks" "$TEST_SKILL_DIR/fake-windows/cygpath"
 }
 
 @test "daemon.sh enable/disable: registers a resident unit (via a fake launchctl on macOS) and cleans it up" {
@@ -465,9 +472,13 @@ EOF
   capture="$TEST_SKILL_DIR/fake-windows/captured.xml"
   marker="$TEST_SKILL_DIR/fake-windows/registered"
 
+  export AGMSGD_FAKE_CYGPATH_LOG="$TEST_SKILL_DIR/fake-windows/cygpath.log"
   PATH="$TEST_SKILL_DIR/fake-windows:$PATH" AGMSGD_SCHTASKS="$TEST_SKILL_DIR/fake-windows/schtasks" AGMSGD_FAKE_TASK_XML="$capture" AGMSGD_FAKE_TASK_MARKER="$marker" AGMSGD_TEST_LAUNCHER="$SCRIPTS/daemon/agmsgd-launch.sh" \
     _run_with_deadline 15 bash "$DAEMON" enable
   [ "$status" -eq 0 ]
+  # Every path named inside SQL went through the native-path conversion.
+  grep -Fq "$TEST_SKILL_DIR/run/install-manifest.json" "$AGMSGD_FAKE_CYGPATH_LOG"
+  grep -Fq "$TEST_SKILL_DIR/run/install.db" "$AGMSGD_FAKE_CYGPATH_LOG"
   [ "$(od -An -tx1 -N2 "$capture" | tr -d ' \n')" = "fffe" ]
   iconv -f UTF-16LE -t UTF-8 "$capture" | grep -q 'encoding="UTF-16"'
 
