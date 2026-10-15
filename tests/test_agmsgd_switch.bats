@@ -208,12 +208,11 @@ WRAPPER
   refute grep -q agmsgd "$TEST_SKILL_DIR/two.out"
 }
 
-@test "status on a never-started enabled install fails with recovery and missing destinations" {
+@test "status on a never-started enabled install fails with recovery and omits never-recorded seats" {
   run bash "$SCRIPTS/daemon.sh" status --all
   [ "$status" -eq 1 ]
   assert_contains 'agmsg daemon start'
-  assert_contains 'no destination record'
-  assert_contains 'demo/alice'
+  assert_lacks 'demo/alice'
 }
 
 @test "executor evidence recognizes a live ready owner and rejects a changed boot" {

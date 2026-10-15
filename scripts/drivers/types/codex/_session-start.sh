@@ -70,7 +70,7 @@ agmsg_resolve_codex_thread() {
   fi
   # Hook input identifies this session directly; a rollout lookup only infers it.
   if [[ "${SESSION_ID:-}" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; then
-    printf '%s' "$SESSION_ID"
+    printf '%s' "${SESSION_ID:-}"
     return 0
   fi
   local sessions_dir="$HOME/.codex/sessions"
@@ -122,7 +122,7 @@ agmsg_codex_refresh_destination() {
     IFS=$'\t' read -r chosen_team chosen_name <<< "$pairs"
   else
     # Environment-only driver observations perform no terminal writes or RPCs.
-    source "$SKILL_DIR/scripts/lib/terminal-registry.sh" || return 1
+    source "${SKILL_DIR:-}/scripts/lib/terminal-registry.sh" || return 1
     local here terminal id epoch ref path recorded record_project record_type mark matches=0
     here="$(agmsg_terminal_self_env)"
     case "$here" in ''|unknown:*) return 1 ;; esac
@@ -152,13 +152,13 @@ agmsg_codex_refresh_destination() {
   owner="$(agmsg_instance_id "$thread" codex 2>/dev/null)" || return 1
   agmsg_role_session_record "$chosen_team" "$chosen_name" "$thread" "$project" codex "$owner" "$profile" inactive || return 1
   agmsg_role_session_load "$chosen_team" "$chosen_name"
-  [ "$AGMSG_ROLE_SESSION_UUID" = "$thread" ] \
+  [ "${AGMSG_ROLE_SESSION_UUID:-}" = "$thread" ] \
     && [ "$(_agmsg_role_session_field "$_AGMSG_ROLE_SESSION_PATH" codex_home)" = "$profile" ] || return 1
   AGMSG_CODEX_REFRESHED_PAIR="$chosen_team"$'\t'"$chosen_name"
 }
 
 agmsg_codex_unseated_notice() {
-  source "$SKILL_DIR/scripts/lib/boot-command.sh"
+  source "${SKILL_DIR:-}/scripts/lib/boot-command.sh"
   printf 'AGMSG delivery: this session is not connected to a seat yet. Run %s in Codex to receive messages.\n' "$(agmsg_actas_prompt codex '<name>')"
 }
 
