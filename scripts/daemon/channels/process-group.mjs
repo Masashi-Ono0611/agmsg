@@ -5,7 +5,7 @@
 import { execFileSync } from "node:child_process";
 import { readFileSync } from "node:fs";
 import { platform } from "node:os";
-import { bootId } from "../executor.mjs";
+import { bootId, sameBoot } from "../executor.mjs";
 
 export function processStartWitness(pid) {
   if (!Number.isSafeInteger(pid) || pid < 2) return null;
@@ -74,7 +74,9 @@ export function observeProcessGroup(record) {
     return { state: "present" };
   }
   if (record.kind !== "posix-process-group") return { state: "unreadable", reason: "child_group_kind_mismatch" };
-  if (bootId() !== record.boot_id) return { state: "absent" };
+  const sameBootId = sameBoot(record.boot_id);
+  if (sameBootId === null) return { state: "unreadable", reason: "child_boot_id_unreadable" };
+  if (!sameBootId) return { state: "absent" };
   try {
     process.kill(-record.pgid, 0);
   } catch (error) {

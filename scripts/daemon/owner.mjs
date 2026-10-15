@@ -52,7 +52,7 @@ export function takeOwnership(db, { installRoot, expectedDesired, expectedOpGen,
       } else {
         const alive = isAlive({ pid: owner.executor_pid, bootId: owner.executor_boot_id });
         if (alive === true) refuse = "current owner is alive";
-        else if (alive === null) refuse = "current owner's liveness cannot be determined";
+        else if (alive === null) refuse = "current owner's liveness cannot be determined; if agmsgd is not running, run agmsg daemon disable and then agmsg daemon enable";
         // alive === false (confirmed dead): fall through, this call takes over.
       }
     }

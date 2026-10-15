@@ -630,6 +630,25 @@ cmd_disable() {
     sleep 0.1
   done
   if [ "$state" != "none" ]; then
+    # A record written by an older version cannot be checked against this
+    # boot. Disable is the deliberate way out of it: the daemon was asked to
+    # stop above, so drop the unverifiable record instead of leaving it to
+    # block every later start.
+    local AGMSGD_DESIRED AGMSGD_HEALTH AGMSGD_REASON seen_gen seen_pid seen_boot
+    IFS='|' read -r seen_gen seen_pid seen_boot < <(sqlite3 "$INSTALL_DB" "SELECT gen, COALESCE(executor_pid,0), COALESCE(executor_boot_id,'') FROM daemon_owner;" 2>/dev/null || true)
+    agmsg_daemon_read_state
+    # Only the exact record that was just judged unverifiable may be dropped:
+    # a daemon started since then has a different gen, and is left alone.
+    case "$seen_gen|$seen_pid|$seen_boot" in
+      *[!0-9\|]*|''|'||'*) ;;
+      *)
+        if [ "${AGMSGD_HEALTH:-}" = unverifiable ]; then
+          _with_op_lock "UPDATE daemon_owner SET state = 'none', socket = NULL, last_end_reason = 'record from an older version discarded by disable', last_end_at = strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE gen = $seen_gen AND executor_pid = $seen_pid AND executor_boot_id = '$seen_boot' AND state = 'ready';"
+          state="$(sqlite3 "$INSTALL_DB" "SELECT state FROM daemon_owner;" 2>/dev/null || true)"
+        fi ;;
+    esac
+  fi
+  if [ "$state" != "none" ]; then
     echo "agmsg daemon disable: service was unregistered but agmsgd has not confirmed stopping -- check 'agmsg daemon status'" >&2
     return 1
   fi

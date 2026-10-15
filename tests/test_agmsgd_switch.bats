@@ -219,7 +219,7 @@ WRAPPER
 @test "executor evidence recognizes a live ready owner and rejects a changed boot" {
   local boot
   case "$(uname -s)" in
-    Darwin) boot="$(sysctl -n kern.boottime | sed -n 's/.*sec = \([0-9]*\),.*/\1/p')" ;;
+    Darwin) boot="$(sysctl -n kern.bootsessionuuid)" ;;
     Linux) boot="$(sed -n 's/^btime //p' /proc/stat)" ;;
     *) skip 'POSIX beta executor evidence' ;;
   esac
@@ -227,6 +227,16 @@ WRAPPER
   run bash -c 'source "$SCRIPTS/lib/daemon-state.sh"; agmsg_daemon_read_state; printf "%s\n" "$AGMSGD_HEALTH"'
   [ "$status" -eq 0 ]
   [ "$output" = ready ]
+  if [ "$(uname -s)" = Darwin ]; then
+    # A record written when the boot id was kern.boottime seconds: the kernel
+    # shifts that value with clock adjustments, so while its pid exists it
+    # is neither confirmed nor refuted.
+    local legacy
+    legacy="$(( $(sysctl -n kern.boottime | sed -n 's/.*sec = \([0-9]*\),.*/\1/p') - 3 ))"
+    sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_owner SET executor_boot_id='$legacy';"
+    run bash -c 'source "$SCRIPTS/lib/daemon-state.sh"; agmsg_daemon_read_state; printf "%s\n" "$AGMSGD_HEALTH"'
+    [ "$output" = unverifiable ]
+  fi
   sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_owner SET executor_boot_id='previous-boot';"
   run bash -c 'source "$SCRIPTS/lib/daemon-state.sh"; agmsg_daemon_read_state; printf "%s\n" "$AGMSGD_HEALTH"'
   [ "$output" = stopped ]

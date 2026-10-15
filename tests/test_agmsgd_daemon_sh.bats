@@ -309,6 +309,15 @@ EOF
   [ "$(sqlite3 "$TEST_SKILL_DIR/run/install.db" "SELECT state FROM daemon_owner;")" = "none" ]
   grep -q '^locked bootstrap$' "$events"
   grep -q '^locked bootout$' "$events"
+
+  # A record from an older version (boot id in kern.boottime seconds) whose
+  # pid still exists and that has no control socket cannot be checked; disable
+  # drops it rather than failing.
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_owner SET state='ready', executor_pid=$$, executor_boot_id='1', socket=NULL, executor_started_at=strftime('%Y-%m-%dT%H:%M:%fZ','now');"
+  AGMSGD_LAUNCHCTL="$fake_launchctl" AGMSGD_FAKE_LAUNCHD_MARKER="$marker" AGMSGD_FAKE_LAUNCHD_EVENTS="$events" AGMSGD_FAKE_OP_LOCK_DB="$TEST_SKILL_DIR/run/install-op.lock.db" \
+    run bash "$DAEMON" disable
+  [ "$status" -eq 0 ]
+  [ "$(sqlite3 "$TEST_SKILL_DIR/run/install.db" "SELECT state FROM daemon_owner;")" = "none" ]
 }
 
 @test "daemon.sh start: stale ready state asks the registered manager to start the service" {

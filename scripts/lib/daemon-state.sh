@@ -4,6 +4,8 @@
 [ -n "${_AGMSG_DAEMON_STATE_SH:-}" ] && return 0
 _AGMSG_DAEMON_STATE_SH=1
 _AGMSG_DAEMON_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# shellcheck disable=SC1091
+source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/instance-id.sh"
 
 agmsg_daemon_read_state() {
   AGMSGD_DESIRED=unknown; AGMSGD_HEALTH=unknown; AGMSGD_REASON="install record unavailable"
@@ -25,7 +27,7 @@ agmsg_daemon_read_state() {
   case "$pid" in ''|*[!0-9]*|0|1) return 0 ;; esac
   case "$(uname -s)" in
     Darwin)
-      current_boot="$(sysctl -n kern.boottime 2>/dev/null | sed -n 's/.*sec = \([0-9]*\),.*/\1/p')"
+      current_boot="$(sysctl -n kern.bootsessionuuid 2>/dev/null)"
       process_start="$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null)" || process_start=""
       started_epoch="$(LC_ALL=C date -j -f '%a %b %e %T %Y' "$process_start" +%s 2>/dev/null)" || started_epoch=""
       ;;
@@ -42,6 +44,18 @@ agmsg_daemon_read_state() {
       ;;
     *) AGMSGD_REASON="platform liveness check unavailable"; return 0 ;;
   esac
+  # A macOS record written before the boot id became kern.bootsessionuuid
+  # holds kern.boottime seconds, which the kernel shifts when the clock is
+  # stepped. While its pid still exists it can be neither confirmed nor
+  # refuted.
+  if [ "$(uname -s)" = Darwin ] && [ -n "$current_boot" ] && [ "$current_boot" != "$boot" ]; then
+    case "$boot" in ''|*[!0-9]*) ;; *)
+      if _agmsg_pid_alive "$pid"; then
+        AGMSGD_HEALTH=unverifiable
+        return 0
+      fi ;;
+    esac
+  fi
   if [ -z "$current_boot" ] || [ "$current_boot" != "$boot" ] || [ -z "$started_epoch" ]; then
     AGMSGD_REASON="executor missing or boot/start evidence does not match ($AGMSGD_REASON)"
     return 0
@@ -69,6 +83,10 @@ agmsg_daemon_read_state() {
 }
 
 agmsg_daemon_recovery_text() {
+  if [ "$AGMSGD_HEALTH" = unverifiable ]; then
+    printf 'agmsgd (Codex notices) was recorded by an older version, so whether it is still running cannot be checked. Run agmsg daemon stop and then agmsg daemon start to update the record. Unread messages are preserved. If agmsg is not found, use "%s/scripts/agmsg" daemon stop.\n' "$_AGMSG_DAEMON_ROOT"
+    return 0
+  fi
   printf 'agmsgd (Codex notices) is stopped while enabled (reason: %s). Run agmsg daemon start (recommended), or agmsg daemon disable and restart your Codex sessions. Unread messages are preserved.' "$AGMSGD_REASON"
   case "$AGMSGD_REASON" in *Node*|*node*)
     printf ' Install Node >= 22.13.0 from https://nodejs.org/en/download, then run agmsg daemon enable.' ;;

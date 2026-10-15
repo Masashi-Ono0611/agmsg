@@ -33,7 +33,7 @@ _mark_daemon_ready() {
   sqlite3 "$RUN_DIR/install.db" < "$SCRIPTS/daemon/schema.sql"
   local boot
   case "$(uname -s)" in
-    Darwin) boot="$(sysctl -n kern.boottime | sed -n 's/.*sec = \([0-9]*\),.*/\1/p')" ;;
+    Darwin) boot="$(sysctl -n kern.bootsessionuuid)" ;;
     Linux) boot="$(sed -n 's/^btime //p' /proc/stat)" ;;
     *) skip 'POSIX beta executor evidence' ;;
   esac
