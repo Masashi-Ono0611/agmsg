@@ -475,3 +475,52 @@ agmsg_role_session_match_unique() {
   printf '%s\n' "$match"
   return 0
 }
+
+# Print "<socket>\t<claude_config_dir>" for this Claude Code process, or
+# nothing (rc 1) when it has no usable messaging socket. Same guard shape
+# codex-record-session.sh applies to CODEX_HOME: anything that is not an
+# absolute path, or that carries a control character, is never published as a
+# delivery destination (a malformed value would look addressable and silently
+# never deliver). CLAUDE_CONFIG_DIR falls back to ~/.claude only when unset;
+# it must never be hardcoded, since accounts can live elsewhere.
+agmsg_claude_code_native_target() {
+  local raw="${CLAUDE_CODE_MESSAGING_SOCKET:-}" socket="" config_dir="${CLAUDE_CONFIG_DIR:-${HOME:+$HOME/.claude}}"
+  case "$raw" in
+    uds:/*) socket="${raw#uds:}" ;;
+    /*) socket="$raw" ;;
+  esac
+  case "$socket" in *[[:cntrl:]]*) socket="" ;; esac
+  case "$config_dir" in
+    *[[:cntrl:]]*) config_dir="" ;;
+    /*) ;;
+    *) config_dir="" ;;
+  esac
+  [ -n "$socket" ] && [ -n "$config_dir" ] || return 1
+  printf '%s\t%s\n' "$socket" "$config_dir"
+}
+
+# Publish <socket>/<config_dir> into <team>/<agent>'s record for <bare_sid>,
+# then read it back: the same check the daemon applies before it will address
+# the seat, so "the record took" is verified, not assumed. rc 0 only when it did.
+agmsg_role_session_publish_messaging() {   # <team> <agent> <socket> <config_dir> <bare_sid>
+  local team="$1" agent="$2" socket="$3" config_dir="$4" bare_sid="$5"
+  agmsg_role_session_set_messaging "$team" "$agent" "$socket" "$config_dir" "$bare_sid"
+  [ "$(agmsg_role_session_get "$team" "$agent" messaging_socket 2>/dev/null || true)" = "$socket" ] \
+    && [ "$(agmsg_role_session_get "$team" "$agent" claude_config_dir 2>/dev/null || true)" = "$config_dir" ] \
+    && [ "$(agmsg_role_session_uuid "$team" "$agent" 2>/dev/null || true)" = "$bare_sid" ]
+}
+
+# rc 0 only when agmsgd's Claude channel will accept this install's storage.
+# The answer comes from the daemon's own reader (storage-gate.mjs calls
+# readStorageDriver), run with the node the daemon itself runs on (the
+# node_path recorded at enable), not whatever node is first on PATH: an older
+# PATH node would fail the check while the daemon is fine. Declaring the
+# native channel when the daemon will refuse to deliver would leave the seat
+# with neither the daemon nor a Monitor; an unreadable node_path or a failed
+# check is "not ready".
+agmsg_claude_code_native_storage_ready() {
+  local node_path
+  node_path="$(sqlite3 -readonly -cmd '.timeout 100' "${SKILL_DIR:-}/run/install.db" 'SELECT node_path FROM meta;' 2>/dev/null)" || return 1
+  [ -n "$node_path" ] && [ -x "$node_path" ] || return 1
+  "$node_path" "${SKILL_DIR:-}/scripts/daemon/channels/storage-gate.mjs" >/dev/null 2>&1
+}

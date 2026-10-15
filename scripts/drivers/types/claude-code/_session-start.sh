@@ -18,28 +18,17 @@
 #     to ~/.claude, since this machine's own accounts live elsewhere.
 
 agmsg_session_start() {
-  if ! declare -F agmsg_role_session_set_messaging >/dev/null 2>&1; then
+  if ! declare -F agmsg_claude_code_native_target >/dev/null 2>&1; then
     # shellcheck disable=SC1091
     . "${SKILL_DIR:-}/scripts/lib/role-session.sh"
   fi
 
-  # Same guard shape codex-record-session.sh applies to CODEX_HOME: anything
-  # that is not an absolute path, or that carries a control character, is
-  # never published as a delivery destination (a malformed value is worse
-  # than none -- it would look addressable and silently never deliver).
-  local raw_socket="${CLAUDE_CODE_MESSAGING_SOCKET:-}" socket=""
-  case "$raw_socket" in
-    uds:/*) socket="${raw_socket#uds:}" ;;
-    /*) socket="$raw_socket" ;;
-  esac
-  case "$socket" in *[[:cntrl:]]*) socket="" ;; esac
-
-  local config_dir="${CLAUDE_CONFIG_DIR:-${HOME:+$HOME/.claude}}"
-  case "$config_dir" in
-    *[[:cntrl:]]*) config_dir="" ;;
-    /*) ;;
-    *) config_dir="" ;;
-  esac
+  # A malformed or missing destination is never published (see
+  # agmsg_claude_code_native_target).
+  local target socket config_dir
+  target="$(agmsg_claude_code_native_target)" || return 0
+  socket="${target%%$'\t'*}"
+  config_dir="${target#*$'\t'}"
 
   # Check every OTHER precondition FIRST, before ever touching a lock
   # (#1577 re-review): a session that cannot possibly use the native path
@@ -48,7 +37,6 @@ agmsg_session_start() {
   # agmsgd disabled or no socket could still silently seize an actas lock it
   # was never going to use -- only Monitor's own watch.sh was ever supposed
   # to touch that lock in that case.
-  if [ -z "$socket" ]; then return 0; fi
   if ! command -v _agmsg_detect_platform >/dev/null 2>&1; then
     # shellcheck disable=SC1091
     . "${SKILL_DIR:-}/scripts/lib/compat.sh"
@@ -61,31 +49,67 @@ agmsg_session_start() {
   fi
   agmsg_daemon_read_state
   [ "${AGMSGD_HEALTH:-}" = ready ] || return 0
+  if ! agmsg_claude_code_native_storage_ready; then
+    echo "AGMSG delivery: agmsgd is running, but its Claude channel only reads the sqlite storage and this install's storage config is not usable for it, so the native channel is not used. Next: arm the Monitor below."
+    return 0
+  fi
 
   # Claim ONLY the single role this session is actually resuming as -- never
   # loop over every pair whose record happens to share this bare sid
   # (#1577 re-review: the same conversation can carry session=<bare sid>
   # into MORE THAN ONE role's record over its life, e.g. actas alice then
   # later actas bob; a resumed session must take back only whichever one
-  # role it is now, not seize every stale name it ever wore). Delegates to
-  # agmsg_role_session_match_unique -- the SAME ambiguity rule session-
-  # start.sh's own narrowing uses elsewhere in this file: a second
-  # qualifying record makes the whole lookup refuse rather than guess.
-  if ! command -v agmsg_role_session_match_unique >/dev/null 2>&1 \
-     || ! command -v actas_lock_claim >/dev/null 2>&1; then
+  # role it is now, not seize every stale name it ever wore).
+  #
+  # The seat is chosen the way session-start.sh's own resume does: only the
+  # (team, agent) pairs registered for THIS project count, so a record left
+  # by a team that is no longer registered cannot make the answer ambiguous.
+  # A pair is a candidate when its role-session record carries this bare sid,
+  # or when this sid owns its actas lock (a record with no session row is
+  # still this session's seat). Still exactly one or none: a second
+  # candidate refuses rather than guesses -- but says so.
+  if ! command -v actas_lock_claim >/dev/null 2>&1; then
     # shellcheck disable=SC1091
     . "${SKILL_DIR:-}/scripts/lib/actas-lock.sh"
   fi
-  local bare_sid my_instance project_phys match pair_team pair_agent
+  local bare_sid my_instance pair_team="" pair_agent=""
   bare_sid="$(agmsg_instance_bare_sid "${SESSION_ID:-}" 2>/dev/null || true)"
   my_instance="$(agmsg_normalize_instance_id "${SESSION_ID:-}" "${TYPE:-}" 2>/dev/null || true)"
   [ -n "$bare_sid" ] || return 0
   agmsg_instance_is_composite "$my_instance" 2>/dev/null || return 0
-  project_phys="$(agmsg_canonical_path "${PROJECT:-}" 2>/dev/null || printf '%s' "${PROJECT:-}")"
-  match="$(agmsg_role_session_match_unique "${TYPE:-}" "$project_phys" "$bare_sid" 2>/dev/null)" || return 0
-  pair_team="${match%%$'\t'*}"
-  pair_agent="${match#*$'\t'}"
-  [ -n "$pair_team" ] && [ -n "$pair_agent" ] || return 0
+  local _tab _p_team _p_agent _rs _own _owner _n=0
+  _tab="$(printf '\t')"
+  while IFS="$_tab" read -r _p_team _p_agent; do
+    [ -n "$_p_team" ] && [ -n "$_p_agent" ] || continue
+    _rs="$(agmsg_role_session_uuid "$_p_team" "$_p_agent" 2>/dev/null || true)"
+    _owner=""
+    _own="$(actas_lock_read "$_p_team" "$_p_agent" 2>/dev/null)" || _own=""
+    if [ "${_own%%"$_tab"*}" = ok ]; then
+      _owner="$(agmsg_instance_bare_sid "${_own#*"$_tab"}" 2>/dev/null || true)"
+    fi
+    if [ "$_rs" = "$bare_sid" ] || [ "$_owner" = "$bare_sid" ]; then
+      _n=$((_n + 1)); pair_team="$_p_team"; pair_agent="$_p_agent"
+    fi
+  done <<EOF
+${PAIRS:-}
+EOF
+  if [ "$_n" -eq 0 ]; then
+    # Nothing recorded for this session. The seat is still decided when this
+    # project has exactly one registered pair of this type: that is the seat
+    # session-start.sh's own Monitor directive would watch (it only falls
+    # back to the generic watcher for a single pair), so take it.
+    if [ "$(printf '%s\n' "${PAIRS:-}" | grep -c '.' || true)" -eq 1 ]; then
+      IFS="$_tab" read -r pair_team pair_agent <<EOF
+${PAIRS:-}
+EOF
+    else
+      echo "AGMSG delivery: agmsgd is running, but this project has several registered seats and none is recorded for this session, so the native channel is not used. Next: run /agmsg actas <name> (it switches to direct delivery), or arm the Monitor below."
+      return 0
+    fi
+  elif [ "$_n" -gt 1 ]; then
+    echo "AGMSG delivery: agmsgd is running, but this session is recorded under $_n registered seats, so the native channel is not used. Next: arm the Monitor below; the extra records stay until they are cleaned up."
+    return 0
+  fi
 
   # actas_lock_claim is the write gate -- the SAME primitive watch.sh uses to
   # reclaim a role's lock across --resume (session-start.sh's own 4th-arg
@@ -98,23 +122,29 @@ agmsg_session_start() {
   # "owning" the same pair, while a real --resume (new pid, old pid now
   # dead) correctly reclaims.
   local claim_result
-  claim_result="$(actas_lock_claim "$pair_team" "$pair_agent" "$my_instance" 2>/dev/null)" || claim_result="unknown:claim_failed"
-  [ "$claim_result" = ok ] || return 0
+  claim_result="$(actas_lock_claim "$pair_team" "$pair_agent" "$my_instance" 2>/dev/null || true)"
+  [ -n "$claim_result" ] || claim_result="unknown:claim_failed"
+  if [ "$claim_result" != ok ]; then
+    echo "AGMSG delivery: agmsgd is running, but seat $pair_agent@$pair_team could not be claimed ($claim_result), so the native channel is not used. Next: arm the Monitor below."
+    return 0
+  fi
 
   # Write, then read back: this is the SAME check the daemon itself applies
   # (messaging_socket/claude_config_dir both present and non-empty) before
   # it will ever address this seat, so "the record actually took" must be
   # verified here too, not assumed from the write call returning.
-  agmsg_role_session_set_messaging "$pair_team" "$pair_agent" "$socket" "$config_dir" "$bare_sid"
-  local readback_socket readback_config_dir readback_session
-  readback_socket="$(agmsg_role_session_get "$pair_team" "$pair_agent" messaging_socket 2>/dev/null || true)"
-  readback_config_dir="$(agmsg_role_session_get "$pair_team" "$pair_agent" claude_config_dir 2>/dev/null || true)"
-  readback_session="$(agmsg_role_session_uuid "$pair_team" "$pair_agent" 2>/dev/null || true)"
-  if [ "$readback_socket" = "$socket" ] && [ -n "$config_dir" ] && \
-     [ "$readback_config_dir" = "$config_dir" ] && [ "$readback_session" = "$bare_sid" ]; then
+  # Only now, holding the lock, may a missing record be created: an existing
+  # record belongs to whoever it names, and the claim above is what shows the
+  # seat is ours.
+  if [ -z "$(agmsg_role_session_get "$pair_team" "$pair_agent" type 2>/dev/null || true)" ]; then
+    agmsg_role_session_record "$pair_team" "$pair_agent" "$bare_sid" \
+      "$(agmsg_canonical_path "${PROJECT:-}" 2>/dev/null || printf '%s' "${PROJECT:-}")" "${TYPE:-}" "$my_instance"
+  fi
+  if agmsg_role_session_publish_messaging "$pair_team" "$pair_agent" "$socket" "$config_dir" "$bare_sid"; then
     cat <<EOF
 AGMSG delivery: agmsgd is running and will deliver to this session directly (native channel). No Monitor needed.
 EOF
     exit 0
   fi
+  echo "AGMSG delivery: agmsgd is running, but the delivery record for $pair_agent@$pair_team did not take, so the native channel is not used. Next: arm the Monitor below, then run agmsg doctor."
 }

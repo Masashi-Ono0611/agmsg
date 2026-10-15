@@ -37,7 +37,7 @@ _mark_daemon_ready() {
     Linux) boot="$(sed -n 's/^btime //p' /proc/stat)" ;;
     *) skip 'POSIX beta executor evidence' ;;
   esac
-  sqlite3 "$RUN_DIR/install.db" "UPDATE daemon_intent SET desired='on';
+  sqlite3 "$RUN_DIR/install.db" "UPDATE meta SET node_path='$(command -v node)'; UPDATE daemon_intent SET desired='on';
     UPDATE daemon_owner SET state='ready', executor_pid=$$, executor_boot_id='$boot', executor_started_at=strftime('%Y-%m-%dT%H:%M:%fZ','now');"
 }
 
@@ -102,23 +102,42 @@ _mark_daemon_ready() {
   grep -qF "agmsgd is running and will deliver" <<<"$output"
 }
 
+# rc.2: an old record of the same session under a team that is no longer
+# registered used to make the seat lookup ambiguous, so the switch to direct
+# delivery was dropped without a word. Only registered pairs count now.
+@test "session-start: a stale record of an unregistered team does not block the switch to direct delivery" {
+  _mark_daemon_ready
+  env AGMSG_AGENT_PID=$$ bash "$SCRIPTS/actas-claim.sh" "$PROJ" claude-code alice "sid-stale-twin" >/dev/null
+  source "$SCRIPTS/lib/role-session.sh"
+  agmsg_role_session_record gone-team alice "sid-stale-twin" "$PROJ" claude-code
+  run env AGMSG_AGENT_PID=$$ AGMSG_RESOLVE_PROJECT=0 CLAUDE_CODE_MESSAGING_SOCKET="uds:/tmp/cc-socks/sid-stale-twin.sock" \
+    bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< '{"session_id":"sid-stale-twin"}'
+  [ "$status" -eq 0 ]
+  refute grep -q "AGMSG monitor mode" <<<"$output"
+  grep -qF "agmsgd is running and will deliver" <<<"$output"
+}
+
 @test "session-start: agmsgd not running -> the usual Monitor directive still fires" {
   run _run_session_start "sid-no-daemon"
   [ "$status" -eq 0 ]
   grep -qF "AGMSG monitor mode" <<<"$output"
 }
 
-# The counterexample #1577 review required: daemon ready is NOT enough by
-# itself. A seat that was only joined (never actas-claimed, so it has no
-# role-session record at all, let alone a messaging_socket field) must keep
-# its only delivery path -- Monitor -- rather than be silenced on the
-# assumption the daemon can reach it.
-@test "session-start: agmsgd ready but NO role-session record -> Monitor directive still fires" {
+# #1577 review required a seat with no record to keep Monitor, since the
+# daemon cannot address it. rc.2 (the new path is the default)
+# reverses that for the one case where the seat is not in doubt: the project
+# has a single registered pair of this type, which is the seat the Monitor
+# directive itself would watch. Nothing is recorded and no lock exists (the
+# shape of a seat never recorded); the switch writes the record and takes the lock.
+@test "session-start: agmsgd ready, NO record, NO lock, one registered seat -> switches to direct delivery" {
   _mark_daemon_ready
-  run _run_session_start "sid-ready-no-record"
+  run env AGMSG_AGENT_PID=$$ AGMSG_RESOLVE_PROJECT=0 CLAUDE_CODE_MESSAGING_SOCKET="uds:/tmp/cc-socks/sid-ready-no-record.sock" \
+    bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< '{"session_id":"sid-ready-no-record"}'
   [ "$status" -eq 0 ]
-  grep -qF "AGMSG monitor mode" <<<"$output"
-  refute grep -q "agmsgd is running and will deliver" <<<"$output"
+  refute grep -q "AGMSG monitor mode" <<<"$output"
+  grep -qF "agmsgd is running and will deliver" <<<"$output"
+  source "$SCRIPTS/lib/role-session.sh"
+  [ "$(agmsg_role_session_get team alice messaging_socket)" = /tmp/cc-socks/sid-ready-no-record.sock ]
 }
 
 # #1577 re-review: comparing only the BARE session id let one process
@@ -129,6 +148,62 @@ _mark_daemon_ready() {
 # own SESSION_ID is the SAME bare "shared" but a DIFFERENT live pid, so the
 # caller's own composite id differs from bob's lock owner even though their
 # bare sids are identical. Only an exact composite match may write.
+# The seat's record belongs to whoever it names: another live session holding
+# the lock must keep its record even when the record lacks a type line.
+@test "session-start: a lone seat held by another live session keeps that session's record" {
+  _mark_daemon_ready
+  source "$SCRIPTS/lib/role-session.sh"
+  source "$SCRIPTS/lib/actas-lock.sh"
+  agmsg_role_session_record team alice peer "$PROJ" ""
+  actas_lock_claim team alice "peer.$$" >/dev/null
+  run env AGMSG_AGENT_PID=1 AGMSG_RESOLVE_PROJECT=0 CLAUDE_CODE_MESSAGING_SOCKET="uds:/tmp/cc-socks/new.sock" \
+    bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< '{"session_id":"new"}'
+  [ "$status" -eq 0 ]
+  [ "$(agmsg_role_session_uuid team alice)" = peer ]
+}
+
+# The daemon's Claude channel blocks any non-sqlite storage, so declaring the
+# native channel there would leave the seat with no delivery at all.
+@test "actas-claim: a non-sqlite storage config never declares delivery=native" {
+  _mark_daemon_ready
+  printf '{"storage":"jsonl"}\n' > "$BATS_TEST_TMPDIR/config.json"
+  run env AGMSG_CONFIG="$BATS_TEST_TMPDIR/config.json" AGMSG_AGENT_PID=$$ CLAUDE_CODE_MESSAGING_SOCKET="uds:/tmp/cc-socks/sid-jsonl.sock" \
+    bash "$SCRIPTS/actas-claim.sh" "$PROJ" claude-code alice "sid-jsonl"
+  [ "$status" -eq 0 ]
+  refute grep -qx "delivery=native" <<<"$output"
+  run env AGMSG_CONFIG="$BATS_TEST_TMPDIR/config.json" AGMSG_AGENT_PID=$$ AGMSG_RESOLVE_PROJECT=0 CLAUDE_CODE_MESSAGING_SOCKET="uds:/tmp/cc-socks/sid-jsonl.sock" \
+    bash "$SCRIPTS/session-start.sh" claude-code "$PROJ" <<< '{"session_id":"sid-jsonl"}'
+  grep -qF "AGMSG monitor mode" <<<"$output"
+  refute grep -q "agmsgd is running and will deliver" <<<"$output"
+}
+
+# The gate asks the daemon's own config reader, so what the daemon refuses
+# (here a symlinked config) is refused here too.
+@test "native storage gate: a symlinked sqlite config is refused, as the daemon refuses it" {
+  _mark_daemon_ready
+  source "$SCRIPTS/lib/role-session.sh"
+  mkdir -p "$BATS_TEST_TMPDIR/cfg"
+  printf '{"storage":"sqlite"}\n' > "$BATS_TEST_TMPDIR/cfg/real.json"
+  ln -s "$BATS_TEST_TMPDIR/cfg/real.json" "$BATS_TEST_TMPDIR/cfg/link.json"
+  AGMSG_CONFIG="$BATS_TEST_TMPDIR/cfg/real.json" agmsg_claude_code_native_storage_ready
+  run env AGMSG_CONFIG="$BATS_TEST_TMPDIR/cfg/link.json" SKILL_DIR="$SKILL_DIR" \
+    bash -c '. "$1/scripts/lib/role-session.sh"; agmsg_claude_code_native_storage_ready' _ "$SCRIPTS/.."
+  [ "$status" -ne 0 ]
+}
+
+# A seat chosen by actas moves to direct delivery on the spot, even when the
+# project registers several seats (session-start alone cannot pick one then).
+@test "actas-claim: daemon ready and a messaging socket -> records the socket and prints delivery=native" {
+  _mark_daemon_ready
+  bash "$SCRIPTS/join.sh" team bob claude-code "$PROJ" >/dev/null
+  run env AGMSG_AGENT_PID=$$ CLAUDE_CODE_MESSAGING_SOCKET="uds:/tmp/cc-socks/sid-actas-native.sock" \
+    bash "$SCRIPTS/actas-claim.sh" "$PROJ" claude-code bob "sid-actas-native"
+  [ "$status" -eq 0 ]
+  grep -qx "delivery=native" <<<"$output"
+  source "$SCRIPTS/lib/role-session.sh"
+  [ "$(agmsg_role_session_get team bob messaging_socket)" = /tmp/cc-socks/sid-actas-native.sock ]
+}
+
 @test "session-start: a different live pid with the SAME bare session id never overwrites that seat's record" {
   _mark_daemon_ready
   bash "$SCRIPTS/join.sh" team bob claude-code "$PROJ" >/dev/null
