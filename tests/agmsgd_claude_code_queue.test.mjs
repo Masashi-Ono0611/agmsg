@@ -21,11 +21,12 @@ function temporaryDirectory(t) {
 // Load-bearing property: a `queue-operation`/`enqueue` line fires on mere
 // receipt, Held or not, so it must NEVER by itself cause a seat to be marked
 // delivered -- never notify on evidence that could just as well be a hold.
-// Only the `type:"user"` line whose `origin.body` carries the nonce counts.
+// Only the `type:"user"` line whose `origin.body` carries the nonce, or the
+// mid-turn `queued_command` attachment whose `prompt` carries it, counts.
 // This reproduces both line shapes measured against a live Claude Code
 // transcript in one file and asserts the queue-operation line alone is not
 // enough, while the user/origin.body line is.
-test('observeTranscript: a queue-operation enqueue line is not delivery evidence; only the user/origin.body line is', (t) => {
+test('observeTranscript: a queue-operation enqueue line is not delivery evidence; the user/origin.body line and a mid-turn queued_command attachment are', (t) => {
   const dir = temporaryDirectory(t);
   const transcriptPath = path.join(dir, 'session.jsonl');
   const nonce = 'abc123-test-nonce';
@@ -60,6 +61,23 @@ test('observeTranscript: a queue-operation enqueue line is not delivery evidence
   assert.equal(observation.state, 'delivered');
   resolved = resolvePendingDelivery({ observation });
   assert.equal(resolved.state, 'confirmed');
+
+  // Absorbed mid-turn: enqueue, remove, then a queued_command attachment and
+  // no user line at all. The model read it, so it is delivered.
+  writeFileSync(transcriptPath, `${JSON.stringify({
+    type: 'queue-operation',
+    operation: 'enqueue',
+    content: `<cross-session-message from="agmsgd">${marker}</cross-session-message>`,
+  })}\n${JSON.stringify({
+    type: 'queue-operation',
+    operation: 'remove',
+    reason: 'absorbed_mid_turn',
+    content: `<cross-session-message from="agmsgd">${marker}</cross-session-message>`,
+  })}\n${JSON.stringify({
+    type: 'attachment',
+    attachment: { type: 'queued_command', prompt: `<cross-session-message from="agmsgd">${marker}</cross-session-message>` },
+  })}\n`);
+  assert.equal(observeTranscript(transcriptPath, nonce).state, 'delivered');
 });
 
 // No clock decides a pending nudge: whatever the transcript shows (or fails to

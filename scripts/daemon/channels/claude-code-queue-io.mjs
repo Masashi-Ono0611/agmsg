@@ -136,9 +136,12 @@ function readTail(path, maxBytes) {
 // Reads the delivery outcome straight from the receiving session's own
 // transcript. Measured line shapes (2026-10-05 addendum):
 //   - delivered: a `type:"user"` line with `origin.body` containing the
-//     nonce verbatim — the ONLY line this treats as proof of delivery.
+//     nonce verbatim — proof of delivery (with the mid-turn shape below).
 //   - held/declined: a `type:"system"`, `subtype:"informational"` line whose
 //     `content` (a possibly-truncated preview) contains the nonce.
+//   - absorbed mid-turn (measured 2026-10-15): a `type:"attachment"` line
+//     whose `attachment.type` is `queued_command` and whose
+//     `attachment.prompt` contains the nonce; the model read it in that turn.
 //   - a `type:"queue-operation"`, `operation:"enqueue"` line fires on mere
 //     receipt, held or not — deliberately never read as evidence here (G4:
 //     never mark a seat notified on evidence that could be a hold).
@@ -162,6 +165,14 @@ export function observeTranscript(transcriptPath, nonce) {
       continue;
     }
     if (row?.type === "user" && typeof row?.origin?.body === "string" && row.origin.body.includes(marker)) {
+      return { state: "delivered" };
+    }
+    // A nudge that arrives while the seat is mid-turn is absorbed into that
+    // turn: the model reads it as a queued_command attachment and no user line
+    // is ever written for it. Without this the nudge stays pending forever and
+    // the seat gets no further notices.
+    if (row?.type === "attachment" && row?.attachment?.type === "queued_command"
+      && typeof row.attachment.prompt === "string" && row.attachment.prompt.includes(marker)) {
       return { state: "delivered" };
     }
     if (row?.type === "system" && row?.subtype === "informational" && typeof row?.content === "string" && row.content.includes(marker)) {
