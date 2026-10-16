@@ -456,6 +456,47 @@ _wait_exit() {  # <pid> <tenths>
   wait "$pid"
   grep -qF 'disable-window probe' "$out"
   grep -qF 'agmsg watch: re-arm' "$out"
+
+  # Follow-up to the #1633 review: messaging_socket alone proves the
+  # record EXISTS, not that the daemon would treat it as addressable --
+  # claude-code-queue.mjs's own createPending also demands type=claude-code,
+  # a non-empty claude_config_dir, and a project match before it will ever
+  # enqueue. Simulate a stale record left behind by this exact (team, agent)
+  # pair once having been claimed from a DIFFERENT project (the daemon's own
+  # role_session_project_mismatch) by corrupting just the project= line; the
+  # socket/session/type fields are all still genuinely this seat's own.
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_intent SET desired='on';"
+  local rs_file
+  rs_file="$(ls "$TEST_SKILL_DIR"/run/role-session.*erin 2>/dev/null | head -1)"
+  [ -n "$rs_file" ]
+  sed -i.bak 's#^project=.*#project=/tmp/agmsg-some-other-project#' "$rs_file"
+  bash "$SCRIPTS/send.sh" team bob erin "project-mismatch probe" >/dev/null
+  AGMSG_AGENT_PID=$$ AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" s-ms-native "$PROJ" claude-code erin --max-seconds=2 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'project-mismatch probe' "$out"
+  grep -qF 'agmsg watch: re-arm' "$out"
+
+  # Review round 2: being looked up BY (team, agent) only proves the
+  # FILENAME encodes this pair, not that the record's own team=/agent=
+  # CONTENT fields agree with it -- the daemon's reader checks those
+  # separately (role_session_identity_mismatch) and the shell getters enforce
+  # nothing on their own. Restore the project= line this test corrupted above,
+  # then corrupt only agent= to a different seat name.
+  mv -f "$rs_file.bak" "$rs_file"
+  sed -i.bak 's#^agent=.*#agent=some-other-seat#' "$rs_file"
+  bash "$SCRIPTS/send.sh" team bob erin "identity-mismatch probe" >/dev/null
+  AGMSG_AGENT_PID=$$ AGMSG_WATCH_INTERVAL=1 \
+    bash "$SCRIPTS/watch.sh" s-ms-native "$PROJ" claude-code erin --max-seconds=2 >"$out" 2>/dev/null 3>&- 4>&- &
+  pid=$!
+  _bg_track "$pid"
+  _wait_exit "$pid" 150 || { _stop_watcher "$pid"; false; }
+  wait "$pid"
+  grep -qF 'identity-mismatch probe' "$out"
+  grep -qF 'agmsg watch: re-arm' "$out"
 }
 
 @test "watch: restart delivers messages that arrived while the watcher was down" {
