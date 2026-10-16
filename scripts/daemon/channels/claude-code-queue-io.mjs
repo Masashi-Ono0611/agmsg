@@ -290,16 +290,23 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
     return { dev: stat.dev, ino: stat.ino, offset, skipRemainder: false, state: "absent" };
   }
   function open(path) {
-    const stat = lstatSync(path);
+    const stat = lstatSync(path, { bigint: true });
     if (!stat.isFile() || stat.isSymbolicLink()) throw new Error("not_regular_file");
     const fd = openSync(path, "r");
     try {
-      const opened = fstatSync(fd);
-      if (!opened.isFile() || opened.dev !== stat.dev || opened.ino !== stat.ino) throw new Error("transcript_replaced");
-      return { fd, stat: opened };
+      const version = fstatSync(fd, { bigint: true });
+      if (!version.isFile() || version.dev !== stat.dev || version.ino !== stat.ino) throw new Error("transcript_replaced");
+      return { fd, stat: { dev: version.dev, ino: version.ino, size: Number(version.size) }, version };
     } catch (error) {
       closeSync(fd);
       throw error;
+    }
+  }
+  function assertStable(fd, path, before) {
+    const after = fstatSync(fd, { bigint: true });
+    const current = lstatSync(path, { bigint: true });
+    if (!current.isFile() || ["dev", "ino", "size", "mtimeNs", "ctimeNs"].some((field) => before[field] !== after[field] || before[field] !== current[field])) {
+      throw Object.assign(new Error("transcript_changed_during_read"), { code: "TRANSCRIPT_CHANGED" });
     }
   }
   function atRowBoundary(fd, offset) {
@@ -321,7 +328,14 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
       // same-inode rewrite may keep/grow the size while moving that boundary.
       if (entry.offset && !entry.skipRemainder && !atRowBoundary(fd, entry.offset)) entry = fresh(stat, nonce);
       put(path, nonce, entry);
-      if (entry.state === "delivered") return { state: entry.state };
+      // Evidence and progress must come from one stable file version. A
+      // short read can otherwise combine a pre-rewrite type with a post-rewrite
+      // body. On change the catch below drops all progress for recovery.
+      const finish = () => {
+        assertStable(fd, path, opened.version);
+        return { state: entry.state };
+      };
+      if (entry.state === "delivered") return finish();
       const buffer = Buffer.alloc(TRANSCRIPT_CHUNK_BYTES);
       let offset = entry.offset;
       let decoder = new StringDecoder("utf8");
@@ -346,16 +360,16 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
           entry.skipRemainder = false;
           decoder = new StringDecoder("utf8");
           row = transcriptRow(`[agmsg:${nonce}]`);
-          if (outcome === "delivered") { entry.state = outcome; return { state: outcome }; }
+          if (outcome === "delivered") { entry.state = outcome; return finish(); }
           if (outcome === "held") entry.state = outcome;
           start = end + 1;
         }
         offset += count;
       }
-      return { state: entry.state };
+      return finish();
     } catch (error) {
       entries.delete(key(path, nonce));
-      return { state: "unreadable", reason: error?.code === "ENOENT" ? "transcript_missing" : "transcript_read_failed" };
+      return { state: "unreadable", reason: error?.code === "ENOENT" ? "transcript_missing" : error?.code === "TRANSCRIPT_CHANGED" ? "transcript_changed_during_read" : "transcript_read_failed" };
     } finally {
       if (fd !== undefined) closeSync(fd);
     }
@@ -371,6 +385,7 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
       // EOF may be inside a row written before this notice. Its appended
       // suffix must never be considered a standalone delivery record.
       entry.skipRemainder = !atRowBoundary(fd, entry.offset);
+      assertStable(fd, path, opened.version);
       put(path, nonce, entry);
     } catch { entries.delete(key(path, nonce)); }
     finally { if (fd !== undefined) closeSync(fd); }

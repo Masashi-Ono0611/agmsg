@@ -365,3 +365,35 @@ test('an incomplete UTF-8 suffix after a JSON object cannot be ignored at the ne
   writeFileSync(file, Buffer.concat([Buffer.from(deliveredRow('utf8-tail').trimEnd()), Buffer.from([0xe3, 10])]));
   assert.equal(observeTranscript(file, 'utf8-tail').state, 'absent');
 });
+
+test('a same-size rewrite during short reads cannot synthesize delivery evidence', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  const nonce = 'scan-rewrite';
+  const user = deliveredRow(nonce);
+  const tool = user.replace('"user"', '"tool"');
+  assert.equal(Buffer.byteLength(user), Buffer.byteLength(tool));
+  writeFileSync(file, user);
+  let rewrite = true;
+  const observe = createTranscriptObserver({ read(fd, buffer, offset, length, position) {
+    const count = readSync(fd, buffer, offset, Math.min(length, 14), position);
+    if (rewrite) { rewrite = false; writeFileSync(file, tool); }
+    return count;
+  } });
+  assert.equal(observe(file, nonce).state, 'unreadable');
+  assert.equal(observeTranscript(file, nonce).state, 'absent');
+  assert.equal(observe(file, nonce).state, 'absent', 'unstable scan progress is discarded');
+});
+
+test('append during a scan defers confirmation and the next observation recovers delivery', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  const nonce = 'scan-append';
+  writeFileSync(file, deliveredRow(nonce));
+  let append = true;
+  const observe = createTranscriptObserver({ read(fd, buffer, offset, length, position) {
+    const count = readSync(fd, buffer, offset, length, position);
+    if (append) { append = false; appendFileSync(file, '{}\n'); }
+    return count;
+  } });
+  assert.equal(observe(file, nonce).state, 'unreadable', 'even a delivered early row requires a stable scan');
+  assert.equal(observe(file, nonce).state, 'delivered', 'recovery must include the row from the discarded scan');
+});
