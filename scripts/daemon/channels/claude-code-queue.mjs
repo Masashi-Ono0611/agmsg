@@ -28,7 +28,7 @@ import {
   checkSocketOwnership,
   inboxNudge,
   newNonce,
-  observeTranscript,
+  createTranscriptObserver,
   resolveTranscriptPath,
   resolvePendingDelivery,
   sendClaudeCodeMessage,
@@ -134,7 +134,7 @@ export function createClaudeCodeQueueChannel({
   openStore = openMessageStore,
   readSnapshot = readUnreadSnapshot,
   send = sendClaudeCodeMessage,
-  observe = observeTranscript,
+  observe = createTranscriptObserver(),
   socketAlive = checkSocketOwnership,
   hostPlatform = process.platform,
 }) {
@@ -153,11 +153,13 @@ export function createClaudeCodeQueueChannel({
       const observation = pendingObservation(pending, observe);
       if (observation.state === "confirmed") {
         setQueueState(db, pending.id, "confirmed");
+        observe.forget?.(pending.transcript_path, pending.nonce);
         saveSeat(db, { seat, messagingSocket: pending.messaging_socket, state: "addressable" }, now);
         return;
       }
       if (!registered) {
         setQueueState(db, pending.id, "expired");
+        observe.forget?.(pending.transcript_path, pending.nonce);
         saveSeat(db, { seat, messagingSocket: pending.messaging_socket, state: "unaddressable", reason: "seat_registration_missing" }, now);
         return;
       }
@@ -182,6 +184,7 @@ export function createClaudeCodeQueueChannel({
         return;
       }
       setQueueState(db, pending.id, "expired");
+      observe.forget?.(pending.transcript_path, pending.nonce);
     }
     if (!registered) return;
     if (hostPlatform === "win32") {
@@ -268,15 +271,18 @@ export function createClaudeCodeQueueChannel({
       return;
     }
 
+    observe.begin?.(transcriptPath, nonce);
     const result = await send({ socketPath: record.messaging_socket, nonce, body: inboxNudge(nonce), timeoutMs });
     if (result.state !== "sent") {
       setQueueState(db, id, "expired");
+      observe.forget?.(transcriptPath, nonce);
       saveSeat(db, { seat, messagingSocket: record.messaging_socket, state: "blocked", reason: `send_failed:${result.reason}` }, now);
       return;
     }
     const firstCheck = pendingObservation(readPending(db, seat), observe);
     if (firstCheck.state === "confirmed") {
       setQueueState(db, id, "confirmed");
+      observe.forget?.(transcriptPath, nonce);
       saveSeat(db, { seat, messagingSocket: record.messaging_socket, state: "addressable" }, now);
       return;
     }
@@ -324,6 +330,7 @@ export function createClaudeCodeQueueChannel({
     async stop() {
       stopped = true;
       await activePoll;
+      observe.clear?.();
     },
   };
 }

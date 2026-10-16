@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
 import {
+  createTranscriptObserver,
   observeTranscript,
   resolveTranscriptPath,
   resolvePendingDelivery,
@@ -96,7 +97,7 @@ test('resolvePendingDelivery: nothing but a delivered nonce ends a pending nudge
   assert.equal(resolvePendingDelivery({ observation: { state: 'delivered' } }).state, 'confirmed');
 });
 
-function channelFixture(t) {
+function channelFixture(t, overrides = {}) {
   const root = temporaryDirectory(t);
   mkdirSync(path.join(root, 'run'));
   const db = openInstallDb(path.join(root, 'run', 'install.db'));
@@ -117,8 +118,9 @@ function channelFixture(t) {
     observe: () => ({ state: 'absent' }),
     socketAlive: () => state.alive,
     hostPlatform: 'linux',
+    ...overrides,
   });
-  return { db, channel, state };
+  return { db, channel, state, root };
 }
 
 test('an unconfirmed nudge is not sent again, however long the same session and socket stay up', async (t) => {
@@ -161,4 +163,150 @@ test('a conversation stored under another project directory is found by its sess
   mkdirSync(path.dirname(expected), { recursive: true });
   writeFileSync(expected, '');
   assert.equal(resolveTranscriptPath(config, '/proj/recorded', session), expected, 'the recorded project wins when it has the file');
+});
+
+function deliveredRow(nonce) {
+  return `${JSON.stringify({ type: 'user', origin: { kind: 'peer', body: `[agmsg:${nonce}]` } })}\n`;
+}
+
+function transcriptGrowth() {
+  return `${JSON.stringify({ type: 'assistant', message: { content: 'context '.repeat(100_000) } })}\n`;
+}
+
+test('delivery survives more than 512 KiB of subsequent transcript growth and cold recovery', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  writeFileSync(file, deliveredRow('older-delivery') + transcriptGrowth());
+  assert.equal(observeTranscript(file, 'older-delivery').state, 'delivered');
+});
+
+test('observer scans new bytes once, retains held evidence, and waits for a complete appended row', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  const nonce = 'incremental';
+  writeFileSync(file, transcriptGrowth());
+  let bytes = 0;
+  const observe = createTranscriptObserver({ read(...args) { const count = readSync(...args); bytes += count; return count; } });
+  observe.begin(file, nonce);
+  assert.equal(observe(file, nonce).state, 'absent');
+  assert.equal(bytes, 0, 'new sends begin at the EOF watermark');
+  appendFileSync(file, `${JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: `[agmsg:${nonce}]` })}\n`);
+  assert.equal(observe(file, nonce).state, 'absent', 'enqueue never confirms');
+  appendFileSync(file, `${JSON.stringify({ type: 'system', subtype: 'informational', content: `[agmsg:${nonce}] held` })}\n`);
+  assert.equal(observe(file, nonce).state, 'held');
+  const scanned = bytes;
+  assert.equal(observe(file, nonce).state, 'held');
+  assert.equal(bytes, scanned, 'unchanged polls do not rescan old bytes');
+  const row = deliveredRow(nonce);
+  appendFileSync(file, row.slice(0, -4));
+  assert.equal(observe(file, nonce).state, 'held');
+  appendFileSync(file, row.slice(-4, -1));
+  assert.equal(observe(file, nonce).state, 'held', 'JSON without its row terminator is incomplete');
+  appendFileSync(file, '\n' + transcriptGrowth());
+  assert.equal(observe(file, nonce).state, 'delivered');
+});
+
+test('cold recovery crosses giant rows and chunk boundaries, and then only scans appends', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  const nonce = 'recover';
+  writeFileSync(file, transcriptGrowth());
+  let bytes = 0;
+  const observe = createTranscriptObserver({ read(...args) { const count = readSync(...args); bytes += count; return count; } });
+  assert.equal(observe(file, nonce).state, 'absent');
+  assert.ok(bytes > 512 * 1024);
+  const scanned = bytes;
+  assert.equal(observe(file, nonce).state, 'absent');
+  assert.equal(bytes, scanned);
+  // Unicode and JSON escapes may straddle byte/chunk/append boundaries.
+  const row = JSON.stringify({ type: 'attachment', attachment: { type: 'queued_command', prompt: '日本語 ' + `[agmsg:${nonce}]` } }).replace('[agmsg:', '\\u005bagmsg:') + '\n';
+  const encoded = Buffer.from(row);
+  const split = encoded.indexOf(Buffer.from('日本語')) + 1;
+  appendFileSync(file, encoded.subarray(0, split));
+  assert.equal(observe(file, nonce).state, 'absent');
+  appendFileSync(file, encoded.subarray(split));
+  assert.equal(observe(file, nonce).state, 'delivered');
+});
+
+test('observer resets held state after rotation or truncation and recovers evicted notices', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  const nonce = 'replaced';
+  const held = `${JSON.stringify({ type: 'system', subtype: 'informational', content: `[agmsg:${nonce}] held` })}\n`;
+  const observe = createTranscriptObserver({ maxEntries: 1 });
+  writeFileSync(file, held);
+  assert.equal(observe(file, nonce).state, 'held');
+  renameSync(file, file + '.old');
+  writeFileSync(file, '{}\n');
+  assert.equal(observe(file, nonce).state, 'absent');
+  appendFileSync(file, held);
+  assert.equal(observe(file, nonce).state, 'held');
+  writeFileSync(file, '{}\n');
+  assert.equal(observe(file, nonce).state, 'absent');
+  appendFileSync(file, deliveredRow(nonce) + transcriptGrowth());
+  assert.equal(observe(file, 'another-notice').state, 'absent');
+  assert.equal(observe(file, nonce).state, 'delivered', 'eviction falls back to full recovery');
+  observe.clear();
+  assert.equal(observe(file, nonce).state, 'delivered', 'restart recovers historical delivery');
+});
+
+test('malformed JSON and lookalike fields never confirm delivery', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  for (const row of [
+    '{"type":"user","origin":{"body":"[agmsg:strict]"},}\n',
+    '{"type":"user","origin":{"body":"[agmsg:strict]"}}garbage\n',
+    '{"type":"user","origin":{"body":"[agmsg:strict]"},"origin":{}}\n',
+    JSON.stringify({ type: 'user', other: { origin: { body: '[agmsg:strict]' } } }) + '\n',
+    JSON.stringify({ type: 'user', origin: { body: '[agmsg:strict]' }, other: [1, 2, true, null, -0.25e+3] }).slice(0, -1) + ',}\n',
+  ]) {
+    writeFileSync(file, row);
+    assert.equal(observeTranscript(file, 'strict').state, 'absent', row);
+  }
+});
+
+test('channel confirms delivery buried by growth and can send its next notice', async (t) => {
+  let file;
+  const { db, channel, state, root } = channelFixture(t, {
+    observe: createTranscriptObserver(),
+    send: async ({ nonce }) => {
+      state.sent += 1;
+      appendFileSync(file, deliveredRow(nonce) + transcriptGrowth());
+      return { state: 'sent' };
+    },
+  });
+  file = `${root}/projects/${root.replace(/\//g, '-')}/sess-1.jsonl`;
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, transcriptGrowth());
+  await channel.pollOnce();
+  assert.deepEqual(db.prepare('SELECT state FROM beta_claude_queue ORDER BY id').all().map((row) => row.state), ['confirmed']);
+  await channel.pollOnce();
+  assert.equal(state.sent, 2);
+  assert.deepEqual(db.prepare('SELECT state FROM beta_claude_queue ORDER BY id').all().map((row) => row.state), ['confirmed', 'confirmed']);
+  await channel.stop();
+});
+
+test('delivery fields retain their provenance and valid JSON scalars do not interfere', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  const nonce = 'provenance';
+  const marker = `[agmsg:${nonce}]`;
+  for (const row of [
+    { type: 'user', message: { content: marker } },
+    { type: 'user', origin: { body: { text: marker } } },
+    { type: 'attachment', attachment: { type: 'other', prompt: marker } },
+    { type: 'attachment', other: { type: 'queued_command', prompt: marker } },
+    { type: 'queue-operation', operation: 'enqueue', content: marker, origin: { body: marker } },
+  ]) {
+    writeFileSync(file, JSON.stringify(row) + '\n');
+    assert.equal(observeTranscript(file, nonce).state, 'absent');
+  }
+  writeFileSync(file, JSON.stringify({ type: 'user', origin: { body: marker }, other: [0, -1, 0.25, 1e100, true, false, null, {}, []] }) + '\n');
+  assert.equal(observeTranscript(file, nonce).state, 'delivered');
+});
+
+test('nesting guard rejects the whole over-deep row and resumes at the next row', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  const nonce = 'depth-guard';
+  const row = (depth) => `{"type":"user","origin":{"body":"[agmsg:${nonce}]"},"other":${'['.repeat(depth)}0${']'.repeat(depth)}}\n`;
+  writeFileSync(file, row(127));
+  assert.equal(observeTranscript(file, nonce).state, 'delivered', '128 container levels are accepted');
+  writeFileSync(file, row(128));
+  assert.equal(observeTranscript(file, nonce).state, 'absent', 'deeper evidence rows are deliberately rejected');
+  appendFileSync(file, deliveredRow(nonce));
+  assert.equal(observeTranscript(file, nonce).state, 'delivered', 'a rejected row never poisons subsequent evidence');
 });
