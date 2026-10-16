@@ -226,6 +226,40 @@ WRAPPER
   run bash -c 'source "$SCRIPTS/lib/daemon-state.sh"; agmsg_daemon_read_state; printf "%s\n" "$AGMSGD_HEALTH"'
   [ "$status" -eq 0 ]
   [ "$output" = ready ]
+  # A caller that is denied the tool that reads the process start time (an app
+  # sandbox) cannot check: that is neither ready nor stopped, and it must not
+  # tell anyone to restart a daemon that is running.
+  mkdir -p "$BATS_TEST_TMPDIR/denied"
+  printf '#!/bin/sh\nexit 1\n' > "$BATS_TEST_TMPDIR/denied/ps"
+  printf '#!/bin/sh\nexit 1\n' > "$BATS_TEST_TMPDIR/denied/getconf"
+  chmod +x "$BATS_TEST_TMPDIR/denied/ps" "$BATS_TEST_TMPDIR/denied/getconf"
+  run env PATH="$BATS_TEST_TMPDIR/denied:$PATH" bash -c 'source "$SCRIPTS/lib/daemon-state.sh"; agmsg_daemon_read_state; printf "%s\n" "$AGMSGD_HEALTH"; agmsg_daemon_warn_if_stopped 2>&1'
+  [ "$status" -eq 0 ]
+  [ "$output" = unchecked ]
+  # A sandbox that refuses the signal for a live process ("not permitted") is
+  # still "exists"; only "no such process" is a stopped daemon.
+  run env PATH="$BATS_TEST_TMPDIR/denied:$PATH" bash -ec 'source "$SCRIPTS/lib/daemon-state.sh"; kill() { echo "kill: ($2) - Operation not permitted" >&2; return 1; }; agmsg_daemon_read_state; printf "%s\n" "$AGMSGD_HEALTH"'
+  [ "$status" -eq 0 ]
+  [ "$output" = unchecked ]
+  # A readable boot id that differs from the record is proof even when the
+  # start time cannot be read.
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_owner SET executor_boot_id='previous-boot';"
+  run env PATH="$BATS_TEST_TMPDIR/denied:$PATH" bash -ec 'source "$SCRIPTS/lib/daemon-state.sh"; agmsg_daemon_read_state; printf "%s\n" "$AGMSGD_HEALTH"'
+  [ "$output" = stopped ]
+  sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_owner SET executor_boot_id='$boot';"
+  run env PATH="$BATS_TEST_TMPDIR/denied:$PATH" bash -c 'source "$SCRIPTS/lib/daemon-state.sh"; kill() { echo "kill: ($2) - No such process" >&2; return 1; }; agmsg_daemon_read_state; printf "%s\n" "$AGMSGD_HEALTH"'
+  [ "$output" = stopped ]
+  # A readable start time later than the recorded claim is a reused pid, even
+  # when the boot id is denied.
+  if [ "$(uname -s)" = Darwin ]; then
+    mkdir -p "$BATS_TEST_TMPDIR/boot-denied"
+    printf '#!/bin/sh\nexit 1\n' > "$BATS_TEST_TMPDIR/boot-denied/sysctl"
+    chmod +x "$BATS_TEST_TMPDIR/boot-denied/sysctl"
+    sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_owner SET executor_started_at='2000-01-01T00:00:00Z';"
+    run env PATH="$BATS_TEST_TMPDIR/boot-denied:$PATH" bash -ec 'source "$SCRIPTS/lib/daemon-state.sh"; agmsg_daemon_read_state; printf "%s\n" "$AGMSGD_HEALTH"'
+    [ "$output" = stopped ]
+    sqlite3 "$TEST_SKILL_DIR/run/install.db" "UPDATE daemon_owner SET executor_started_at=strftime('%Y-%m-%dT%H:%M:%fZ','now');"
+  fi
   if [ "$(uname -s)" = Darwin ]; then
     # A record written when the boot id was kern.boottime seconds: the kernel
     # shifts that value with clock adjustments, so while its pid exists it

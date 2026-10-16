@@ -7,6 +7,19 @@ _AGMSG_DAEMON_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 # shellcheck disable=SC1091
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/instance-id.sh"
 
+# Does the recorded pid exist? Answers "gone" only on a clear "no such
+# process". A sandbox may refuse the signal even for a live process (not
+# permitted), which says the process exists; anything else is "unknown".
+_agmsg_daemon_pid_presence() {   # <pid>
+  local out
+  out="$(export LC_ALL=C; kill -0 "$1" 2>&1)" && { echo alive; return 0; }
+  case "$out" in
+    *"No such process"*) echo gone ;;
+    *"not permitted"*) echo alive ;;
+    *) echo unknown ;;
+  esac
+}
+
 agmsg_daemon_read_state() {
   AGMSGD_DESIRED=unknown; AGMSGD_HEALTH=unknown; AGMSGD_REASON="install record unavailable"
   local row state pid boot recorded_start current_boot process_start started_epoch
@@ -27,7 +40,7 @@ agmsg_daemon_read_state() {
   case "$pid" in ''|*[!0-9]*|0|1) return 0 ;; esac
   case "$(uname -s)" in
     Darwin)
-      current_boot="$(sysctl -n kern.bootsessionuuid 2>/dev/null)"
+      current_boot="$(sysctl -n kern.bootsessionuuid 2>/dev/null)" || current_boot=""
       process_start="$(LC_ALL=C ps -p "$pid" -o lstart= 2>/dev/null)" || process_start=""
       started_epoch="$(LC_ALL=C date -j -f '%a %b %e %T %Y' "$process_start" +%s 2>/dev/null)" || started_epoch=""
       ;;
@@ -56,12 +69,17 @@ agmsg_daemon_read_state() {
       fi ;;
     esac
   fi
-  if [ -z "$current_boot" ] || [ "$current_boot" != "$boot" ] || [ -z "$started_epoch" ]; then
+  # Evidence that could not be gathered is not evidence of a mismatch. A
+  # sandboxed caller (an app that runs commands in its own sandbox) may be
+  # denied the boot id, the process start time and even the liveness signal;
+  # unless the pid is clearly gone, say the check is unavailable, not stopped.
+  # A boot id that can be read and differs from the record is proof, whatever
+  # else cannot be read: that executor is from another boot.
+  if [ -n "$current_boot" ] && [ "$current_boot" != "$boot" ]; then
     AGMSGD_REASON="executor missing or boot/start evidence does not match ($AGMSGD_REASON)"
     return 0
   fi
-  # The owner records its claim time. A process born after that claim is a
-  # reused PID, never evidence that the recorded executor is still running.
+  # Likewise a readable start time later than the owner's claim: a reused pid.
   local claim_epoch
   case "$recorded_start" in
     ????-??-??T??:??:??*)
@@ -71,6 +89,23 @@ agmsg_daemon_read_state() {
       esac ;;
     *) claim_epoch="" ;;
   esac
+  if [ -n "$started_epoch" ] && [ -n "$claim_epoch" ] && [ "$started_epoch" -gt "$claim_epoch" ]; then
+    AGMSGD_REASON="executor start evidence does not match ($AGMSGD_REASON)"
+    return 0
+  fi
+  if [ -z "$current_boot" ] || [ -z "$started_epoch" ]; then
+    case "$(_agmsg_daemon_pid_presence "$pid")" in
+      gone) ;;
+      *)
+        AGMSGD_HEALTH=unchecked
+        AGMSGD_REASON="the boot id or process start time cannot be read from here"
+        return 0 ;;
+    esac
+  fi
+  if [ -z "$current_boot" ] || [ "$current_boot" != "$boot" ] || [ -z "$started_epoch" ]; then
+    AGMSGD_REASON="executor missing or boot/start evidence does not match ($AGMSGD_REASON)"
+    return 0
+  fi
   if [ -z "$claim_epoch" ] || [ "$started_epoch" -gt "$claim_epoch" ]; then
     AGMSGD_REASON="executor start evidence does not match ($AGMSGD_REASON)"
     return 0
@@ -83,6 +118,10 @@ agmsg_daemon_read_state() {
 }
 
 agmsg_daemon_recovery_text() {
+  if [ "$AGMSGD_HEALTH" = unchecked ]; then
+    printf 'agmsgd (Codex notices) could not be checked from this environment (%s). It may be running; nothing needs to be done unless notices stop arriving.\n' "$AGMSGD_REASON"
+    return 0
+  fi
   if [ "$AGMSGD_HEALTH" = unverifiable ]; then
     printf 'agmsgd (Codex notices) was recorded by an older version, so whether it is still running cannot be checked. Run agmsg daemon stop and then agmsg daemon start to update the record. Unread messages are preserved. If agmsg is not found, use "%s/scripts/agmsg" daemon stop.\n' "$_AGMSG_DAEMON_ROOT"
     return 0
@@ -108,6 +147,8 @@ agmsg_daemon_warn_if_stopped() {
   fi
   agmsg_daemon_read_state
   [ "$AGMSGD_DESIRED" = on ] && [ "$AGMSGD_HEALTH" != ready ] || return 0
+  # Not being able to look is not a stop: say nothing on ordinary commands.
+  [ "$AGMSGD_HEALTH" != unchecked ] || [ "${1:-}" = always ] || return 0
   if [ "${1:-}" = always ]; then
     agmsg_daemon_recovery_text >&2
     return 0
