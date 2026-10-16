@@ -187,14 +187,14 @@ test('observer scans new bytes once, retains held evidence, and waits for a comp
   const observe = createTranscriptObserver({ read(...args) { const count = readSync(...args); bytes += count; return count; } });
   observe.begin(file, nonce);
   assert.equal(observe(file, nonce).state, 'absent');
-  assert.equal(bytes, 0, 'new sends begin at the EOF watermark');
+  assert.equal(bytes, 2, 'begin and observe only check the byte before the EOF watermark');
   appendFileSync(file, `${JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content: `[agmsg:${nonce}]` })}\n`);
   assert.equal(observe(file, nonce).state, 'absent', 'enqueue never confirms');
   appendFileSync(file, `${JSON.stringify({ type: 'system', subtype: 'informational', content: `[agmsg:${nonce}] held` })}\n`);
   assert.equal(observe(file, nonce).state, 'held');
   const scanned = bytes;
   assert.equal(observe(file, nonce).state, 'held');
-  assert.equal(bytes, scanned, 'unchanged polls do not rescan old bytes');
+  assert.equal(bytes, scanned + 1, 'unchanged polls only validate the checkpoint boundary');
   const row = deliveredRow(nonce);
   appendFileSync(file, row.slice(0, -4));
   assert.equal(observe(file, nonce).state, 'held');
@@ -214,7 +214,7 @@ test('cold recovery crosses giant rows and chunk boundaries, and then only scans
   assert.ok(bytes > 512 * 1024);
   const scanned = bytes;
   assert.equal(observe(file, nonce).state, 'absent');
-  assert.equal(bytes, scanned);
+  assert.equal(bytes, scanned + 1, 'unchanged polls only validate the checkpoint boundary');
   // Unicode and JSON escapes may straddle byte/chunk/append boundaries.
   const row = JSON.stringify({ type: 'attachment', attachment: { type: 'queued_command', prompt: '日本語 ' + `[agmsg:${nonce}]` } }).replace('[agmsg:', '\\u005bagmsg:') + '\n';
   const encoded = Buffer.from(row);
@@ -309,4 +309,59 @@ test('nesting guard rejects the whole over-deep row and resumes at the next row'
   assert.equal(observeTranscript(file, nonce).state, 'absent', 'deeper evidence rows are deliberately rejected');
   appendFileSync(file, deliveredRow(nonce));
   assert.equal(observeTranscript(file, nonce).state, 'delivered', 'a rejected row never poisons subsequent evidence');
+});
+
+test('same-inode rewrite cannot splice cached partial JSON into delivery evidence', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  const observe = createTranscriptObserver();
+  writeFileSync(file, '{"type":"user","origin":{"body":"');
+  assert.equal(observe(file, 'synthetic').state, 'absent');
+  writeFileSync(file, '{"type":"tool","origin":{"body":"[agmsg:synthetic]"}}\n');
+  assert.equal(observeTranscript(file, 'synthetic').state, 'absent');
+  assert.equal(observe(file, 'synthetic').state, 'absent');
+});
+
+test('EOF watermark ignores a pre-existing partial row, then accepts the next complete row', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  const observe = createTranscriptObserver();
+  writeFileSync(file, 'unfinished-prefix');
+  observe.begin(file, 'mid-row');
+  appendFileSync(file, deliveredRow('mid-row'));
+  assert.equal(observe(file, 'mid-row').state, 'absent', 'a suffix is never a standalone row');
+  appendFileSync(file, deliveredRow('mid-row'));
+  assert.equal(observe(file, 'mid-row').state, 'delivered');
+});
+
+test('same-inode replacement of a completed checkpoint must preserve its newline boundary', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  const observe = createTranscriptObserver();
+  writeFileSync(file, '{}\n');
+  assert.equal(observe(file, 'boundary').state, 'absent');
+  writeFileSync(file, 'bad' + deliveredRow('boundary'));
+  assert.equal(observe(file, 'boundary').state, 'absent');
+  assert.equal(observeTranscript(file, 'boundary').state, 'absent');
+});
+
+test('short reads preserve row boundaries and a read failure discards cached progress', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  writeFileSync(file, '{}\n' + deliveredRow('short-reads'));
+  let fail = false;
+  const observe = createTranscriptObserver({ read(fd, buffer, offset, length, position) {
+    if (fail) throw Object.assign(new Error('synthetic read error'), { code: 'EIO' });
+    return readSync(fd, buffer, offset, Math.min(length, 3), position);
+  } });
+  assert.equal(observe(file, 'short-reads').state, 'delivered');
+  fail = true;
+  assert.deepEqual(observe(file, 'short-reads'), { state: 'unreadable', reason: 'transcript_read_failed' });
+  fail = false;
+  writeFileSync(file, '{"type":"tool","origin":{"body":"[agmsg:short-reads]"}}\n');
+  assert.equal(observe(file, 'short-reads').state, 'absent');
+  appendFileSync(file, deliveredRow('short-reads'));
+  assert.equal(observe(file, 'short-reads').state, 'delivered');
+});
+
+test('an incomplete UTF-8 suffix after a JSON object cannot be ignored at the newline', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  writeFileSync(file, Buffer.concat([Buffer.from(deliveredRow('utf8-tail').trimEnd()), Buffer.from([0xe3, 10])]));
+  assert.equal(observeTranscript(file, 'utf8-tail').state, 'absent');
 });

@@ -287,7 +287,7 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
     return entry;
   }
   function fresh(stat, nonce, offset = 0) {
-    return { dev: stat.dev, ino: stat.ino, offset, decoder: new StringDecoder("utf8"), row: transcriptRow(`[agmsg:${nonce}]`), state: "absent" };
+    return { dev: stat.dev, ino: stat.ino, offset, skipRemainder: false, state: "absent" };
   }
   function open(path) {
     const stat = lstatSync(path);
@@ -302,6 +302,12 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
       throw error;
     }
   }
+  function atRowBoundary(fd, offset) {
+    if (!offset) return true;
+    const byte = Buffer.alloc(1);
+    if (read(fd, byte, 0, 1, offset - 1) !== 1) throw new Error("transcript_boundary_unreadable");
+    return byte[0] === 10;
+  }
   function observe(path, nonce) {
     if (typeof nonce !== "string" || !nonce) return { state: "unreadable", reason: "nonce_missing" };
     let fd;
@@ -311,22 +317,40 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
       const stat = opened.stat;
       let entry = entries.get(key(path, nonce));
       if (!entry || entry.dev !== stat.dev || entry.ino !== stat.ino || stat.size < entry.offset) entry = fresh(stat, nonce);
+      // A checkpoint is useful only while it is still a JSONL boundary. A
+      // same-inode rewrite may keep/grow the size while moving that boundary.
+      if (entry.offset && !entry.skipRemainder && !atRowBoundary(fd, entry.offset)) entry = fresh(stat, nonce);
       put(path, nonce, entry);
       if (entry.state === "delivered") return { state: entry.state };
       const buffer = Buffer.alloc(TRANSCRIPT_CHUNK_BYTES);
-      while (entry.offset < stat.size) {
-        const count = read(fd, buffer, 0, Math.min(buffer.length, stat.size - entry.offset), entry.offset);
+      let offset = entry.offset;
+      let decoder = new StringDecoder("utf8");
+      let row = transcriptRow(`[agmsg:${nonce}]`);
+      while (offset < stat.size) {
+        const count = read(fd, buffer, 0, Math.min(buffer.length, stat.size - offset), offset);
         if (!count) break;
-        entry.offset += count;
-        const text = entry.decoder.write(buffer.subarray(0, count));
-        for (const char of text) {
-          if (char === "\n") {
-            const outcome = entry.row.finish();
-            entry.row = transcriptRow(`[agmsg:${nonce}]`);
-            if (outcome === "delivered") { entry.state = outcome; return { state: outcome }; }
-            if (outcome === "held") entry.state = outcome;
-          } else entry.row.feed(char);
+        let start = 0;
+        while (start < count) {
+          const newline = buffer.indexOf(10, start);
+          const end = newline >= 0 && newline < count ? newline : count;
+          if (!entry.skipRemainder) {
+            for (const char of decoder.write(buffer.subarray(start, end))) row.feed(char);
+          }
+          if (end === count) break;
+          // Retain only complete-row checkpoints across observations. Reparse
+          // an unfinished row next time so a rewrite cannot splice old JSON
+          // parser state together with unrelated new bytes into evidence.
+          if (!entry.skipRemainder) for (const char of decoder.end()) row.feed(char);
+          const outcome = entry.skipRemainder ? "absent" : row.finish();
+          entry.offset = offset + end + 1;
+          entry.skipRemainder = false;
+          decoder = new StringDecoder("utf8");
+          row = transcriptRow(`[agmsg:${nonce}]`);
+          if (outcome === "delivered") { entry.state = outcome; return { state: outcome }; }
+          if (outcome === "held") entry.state = outcome;
+          start = end + 1;
         }
+        offset += count;
       }
       return { state: entry.state };
     } catch (error) {
@@ -343,7 +367,11 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
     try {
       const opened = open(path);
       fd = opened.fd;
-      put(path, nonce, fresh(opened.stat, nonce, opened.stat.size));
+      const entry = fresh(opened.stat, nonce, opened.stat.size);
+      // EOF may be inside a row written before this notice. Its appended
+      // suffix must never be considered a standalone delivery record.
+      entry.skipRemainder = !atRowBoundary(fd, entry.offset);
+      put(path, nonce, entry);
     } catch { entries.delete(key(path, nonce)); }
     finally { if (fd !== undefined) closeSync(fd); }
   };
