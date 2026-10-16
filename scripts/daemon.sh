@@ -374,12 +374,31 @@ _schtasks() {
   MSYS2_ARG_CONV_EXCL='*' "$AGMSGD_SCHTASKS" "$@"
 }
 
+# Paths go into the task XML as text; a "&" in a user name would otherwise
+# make the task impossible to create.
+_xml_escape() {
+  printf '%s' "$1" | sed -e 's/&/\&amp;/g' -e 's/</\&lt;/g' -e 's/>/\&gt;/g' -e 's/"/\&quot;/g'
+}
+
 _register_windows() {
   local node_path="$1" name xml
   name="$(_schtasks_name)"
   xml="$SKILL_DIR/run/${name}.xml"
-  local native_launcher
+  # A bare `bash.exe` in the task is resolved by CreateProcess, which looks in
+  # System32 first and finds WSL's launcher there, not Git Bash. Name the Git
+  # Bash that is running this script by its full path instead.
+  local git_root git_bash native_bash native_launcher
+  git_root="$(cygpath -m / 2>/dev/null || true)"
+  git_root="${git_root%/}"
+  git_bash="$git_root/bin/bash.exe"
+  if [ -z "$git_root" ] || [ ! -f "$git_bash" ]; then
+    echo "agmsg daemon: cannot find Git Bash's bin/bash.exe (looked for '$git_bash'); not registering the scheduled task" >&2
+    return 1
+  fi
+  native_bash="$(cygpath -w "$git_bash" 2>/dev/null || printf '%s' "$git_bash")"
   native_launcher="$(cygpath -w "$LAUNCHER" 2>/dev/null || printf '%s' "$LAUNCHER")"
+  native_bash="$(_xml_escape "$native_bash")"
+  native_launcher="$(_xml_escape "$native_launcher")"
   local xml_utf8="$xml.utf8"
   cat > "$xml_utf8" <<EOF
 <?xml version="1.0" encoding="UTF-16"?>
@@ -389,7 +408,7 @@ _register_windows() {
   </Triggers>
   <Actions>
     <Exec>
-      <Command>bash.exe</Command>
+      <Command>$native_bash</Command>
       <Arguments>"$native_launcher"</Arguments>
     </Exec>
   </Actions>
