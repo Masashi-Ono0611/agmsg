@@ -10,7 +10,7 @@
 // layout; the daemon loop and its install.db schema remain owned by the caller
 // (claude-code-queue.mjs), matching codex-queue-io.mjs's split.
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { createConnection } from "node:net";
 import { closeSync, fstatSync, lstatSync, openSync, readSync, readdirSync } from "node:fs";
 import process from "node:process";
@@ -302,12 +302,34 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
       throw error;
     }
   }
-  function assertStable(fd, path, before) {
+  function changed() {
+    throw Object.assign(new Error("transcript_changed_during_read"), { code: "TRANSCRIPT_CHANGED" });
+  }
+  // Append-only growth is normal while a seat is working. It must preserve
+  // checkpoints; replacement, shrink, or a same-size rewrite invalidates them.
+  function assertAppendCompatible(fd, path, before) {
     const after = fstatSync(fd, { bigint: true });
     const current = lstatSync(path, { bigint: true });
-    if (!current.isFile() || ["dev", "ino", "size", "mtimeNs", "ctimeNs"].some((field) => before[field] !== after[field] || before[field] !== current[field])) {
-      throw Object.assign(new Error("transcript_changed_during_read"), { code: "TRANSCRIPT_CHANGED" });
+    const compatible = (older, newer) => newer.isFile() && older.dev === newer.dev && older.ino === newer.ino
+      && newer.size >= older.size && (newer.size > older.size || (older.mtimeNs === newer.mtimeNs && older.ctimeNs === newer.ctimeNs));
+    if (!compatible(before, after) || !compatible(after, current)) changed();
+    return current;
+  }
+  function verifyRow(fd, path, version, start, end, expected) {
+    const before = assertAppendCompatible(fd, path, version);
+    const hash = createHash("sha256");
+    const buffer = Buffer.alloc(TRANSCRIPT_CHUNK_BYTES);
+    let offset = start;
+    while (offset < end) {
+      const count = read(fd, buffer, 0, Math.min(buffer.length, end - offset), offset);
+      if (!count) changed();
+      hash.update(buffer.subarray(0, count));
+      offset += count;
     }
+    // Confirm exact candidate bytes, including its terminator and starting
+    // boundary. Unrelated appends may continue throughout this bounded reread.
+    if (hash.digest("hex") !== expected || !atRowBoundary(fd, start)) changed();
+    assertAppendCompatible(fd, path, before);
   }
   function atRowBoundary(fd, offset) {
     if (!offset) return true;
@@ -328,11 +350,10 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
       // same-inode rewrite may keep/grow the size while moving that boundary.
       if (entry.offset && !entry.skipRemainder && !atRowBoundary(fd, entry.offset)) entry = fresh(stat, nonce);
       put(path, nonce, entry);
-      // Evidence and progress must come from one stable file version. A
-      // short read can otherwise combine a pre-rewrite type with a post-rewrite
-      // body. On change the catch below drops all progress for recovery.
+      // Growth keeps progress; delivery additionally verifies its exact row
+      // bytes so short reads cannot splice evidence across a growing rewrite.
       const finish = () => {
-        assertStable(fd, path, opened.version);
+        assertAppendCompatible(fd, path, opened.version);
         return { state: entry.state };
       };
       if (entry.state === "delivered") return finish();
@@ -340,6 +361,8 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
       let offset = entry.offset;
       let decoder = new StringDecoder("utf8");
       let row = transcriptRow(`[agmsg:${nonce}]`);
+      let rowStart = offset;
+      let rowHash = createHash("sha256");
       while (offset < stat.size) {
         const count = read(fd, buffer, 0, Math.min(buffer.length, stat.size - offset), offset);
         if (!count) break;
@@ -347,6 +370,7 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
         while (start < count) {
           const newline = buffer.indexOf(10, start);
           const end = newline >= 0 && newline < count ? newline : count;
+          rowHash.update(buffer.subarray(start, end === count ? end : end + 1));
           if (!entry.skipRemainder) {
             for (const char of decoder.write(buffer.subarray(start, end))) row.feed(char);
           }
@@ -360,8 +384,14 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
           entry.skipRemainder = false;
           decoder = new StringDecoder("utf8");
           row = transcriptRow(`[agmsg:${nonce}]`);
-          if (outcome === "delivered") { entry.state = outcome; return finish(); }
+          if (outcome === "delivered") {
+            verifyRow(fd, path, opened.version, rowStart, entry.offset, rowHash.digest("hex"));
+            entry.state = outcome;
+            return finish();
+          }
           if (outcome === "held") entry.state = outcome;
+          rowStart = entry.offset;
+          rowHash = createHash("sha256");
           start = end + 1;
         }
         offset += count;
@@ -385,7 +415,7 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
       // EOF may be inside a row written before this notice. Its appended
       // suffix must never be considered a standalone delivery record.
       entry.skipRemainder = !atRowBoundary(fd, entry.offset);
-      assertStable(fd, path, opened.version);
+      assertAppendCompatible(fd, path, opened.version);
       put(path, nonce, entry);
     } catch { entries.delete(key(path, nonce)); }
     finally { if (fd !== undefined) closeSync(fd); }

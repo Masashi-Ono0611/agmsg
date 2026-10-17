@@ -384,7 +384,7 @@ test('a same-size rewrite during short reads cannot synthesize delivery evidence
   assert.equal(observe(file, nonce).state, 'absent', 'unstable scan progress is discarded');
 });
 
-test('append during a scan defers confirmation and the next observation recovers delivery', (t) => {
+test('unrelated append during a scan permits verified row confirmation', (t) => {
   const file = path.join(temporaryDirectory(t), 'session.jsonl');
   const nonce = 'scan-append';
   writeFileSync(file, deliveredRow(nonce));
@@ -394,6 +394,84 @@ test('append during a scan defers confirmation and the next observation recovers
     if (append) { append = false; appendFileSync(file, '{}\n'); }
     return count;
   } });
-  assert.equal(observe(file, nonce).state, 'unreadable', 'even a delivered early row requires a stable scan');
-  assert.equal(observe(file, nonce).state, 'delivered', 'recovery must include the row from the discarded scan');
+  assert.equal(observe(file, nonce).state, 'delivered', 'unchanged candidate bytes prove delivery despite unrelated growth');
+});
+
+test('repeated unrelated appends preserve the watermark and complete checkpoints', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  writeFileSync(file, transcriptGrowth());
+  let bytes = 0;
+  const observe = createTranscriptObserver({ read(...args) {
+    const count = readSync(...args);
+    bytes += count;
+    appendFileSync(file, '{}\n');
+    return count;
+  } });
+  observe.begin(file, 'active-seat');
+  for (let poll = 0; poll < 5; poll += 1) {
+    assert.equal(observe(file, 'active-seat').state, 'absent');
+    assert.ok(bytes < 1_000, 'growth must not force a cold scan of the existing 800 KB');
+  }
+  appendFileSync(file, deliveredRow('active-seat'));
+  assert.equal(observe(file, 'active-seat').state, 'delivered');
+});
+
+test('an actively appending transcript confirms a notice and permits the next notice', async (t) => {
+  let file;
+  const observe = createTranscriptObserver({ read(...args) {
+    const count = readSync(...args);
+    appendFileSync(file, '{}\n');
+    return count;
+  } });
+  const { db, channel, state, root } = channelFixture(t, {
+    observe,
+    send: async ({ nonce }) => {
+      state.sent += 1;
+      appendFileSync(file, deliveredRow(nonce));
+      return { state: 'sent' };
+    },
+  });
+  file = `${root}/projects/${root.replace(/\//g, '-')}/sess-1.jsonl`;
+  mkdirSync(path.dirname(file), { recursive: true });
+  writeFileSync(file, transcriptGrowth());
+  await channel.pollOnce();
+  await channel.pollOnce();
+  assert.equal(state.sent, 2);
+  assert.deepEqual(db.prepare('SELECT state FROM beta_claude_queue ORDER BY id').all().map((row) => row.state), ['confirmed', 'confirmed']);
+  await channel.stop();
+});
+
+test('a rewrite followed by growth cannot pass candidate-row hash verification', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  // Neither actual row contains delivery evidence for this nonce: the old
+  // user row has another nonce; the replacement has the nonce but type tool.
+  const oldRow = deliveredRow('ignored');
+  const replacement = deliveredRow('rewrite').replace('"user"', '"tool"');
+  assert.equal(Buffer.byteLength(oldRow), Buffer.byteLength(replacement));
+  writeFileSync(file, oldRow);
+  let rewrite = true;
+  const observe = createTranscriptObserver({ read(fd, buffer, offset, length, position) {
+    const count = readSync(fd, buffer, offset, Math.min(length, 14), position);
+    if (rewrite) { rewrite = false; writeFileSync(file, replacement + '{}\n'); }
+    return count;
+  } });
+  assert.equal(observe(file, 'rewrite').state, 'unreadable', 'growth cannot disguise spliced candidate bytes');
+  assert.equal(observe(file, 'rewrite').state, 'absent');
+});
+
+test('a candidate larger than one chunk is verified with bounded reread buffers', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  const row = JSON.stringify({ type: 'user', origin: { body: 'x'.repeat(800_000) + '[agmsg:large-row]' } }) + '\n';
+  writeFileSync(file, row);
+  let largest = 0;
+  let bytes = 0;
+  const observe = createTranscriptObserver({ read(fd, buffer, offset, length, position) {
+    largest = Math.max(largest, buffer.length);
+    const count = readSync(fd, buffer, offset, length, position);
+    bytes += count;
+    return count;
+  } });
+  assert.equal(observe(file, 'large-row').state, 'delivered');
+  assert.equal(largest, 64 * 1024);
+  assert.equal(bytes, 2 * Buffer.byteLength(row), 'only the candidate row is reread for verification');
 });
