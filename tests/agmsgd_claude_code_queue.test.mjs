@@ -1,10 +1,11 @@
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, mkdtempSync, readSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, fstatSync, mkdirSync, mkdtempSync, readSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
 
 import {
+  createAsyncTranscriptObserver,
   createTranscriptObserver,
   observeTranscript,
   resolveTranscriptPath,
@@ -499,4 +500,124 @@ test('a candidate larger than one chunk is verified with bounded reread buffers'
   assert.equal(observe(file, 'large-row').state, 'delivered');
   assert.equal(largest, 64 * 1024);
   assert.equal(bytes, 2 * Buffer.byteLength(row), 'only the candidate row is reread for verification');
+});
+
+test('cooperative cold recovery yields after at most 64 KiB so the event loop can run', async (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  writeFileSync(file, transcriptGrowth());
+  let bytes = 0;
+  let budget = 0;
+  let yields = 0;
+  const observe = createTranscriptObserver({ cooperative: true,
+    read(...args) { const count = readSync(...args); bytes += count; budget += count; return count; },
+    async schedule() {
+      assert.ok(budget <= 64 * 1024, 'a scheduling unit reads at most one chunk');
+      budget = 0;
+      yields += 1;
+      await new Promise((resolve) => setImmediate(resolve));
+    },
+  });
+  const pending = observe(file, 'cooperative');
+  assert.equal(typeof pending?.then, 'function');
+  assert.equal(bytes, 64 * 1024, 'only one chunk runs before the first yield');
+  assert.equal((await pending).state, 'absent');
+  assert.ok(yields > 1);
+  assert.equal(bytes, statSync(file).size);
+});
+
+test('default cooperative scheduler lets an already scheduled heartbeat run before cold recovery completes', async (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  writeFileSync(file, transcriptGrowth());
+  let settled = false;
+  const heartbeat = new Promise((resolve) => setImmediate(resolve));
+  const observe = createAsyncTranscriptObserver();
+  const pending = Promise.resolve(observe(file, 'heartbeat')).then((result) => { settled = true; return result; });
+  await heartbeat;
+  assert.equal(settled, false, 'cold recovery yields to the event loop before finishing');
+  assert.equal((await pending).state, 'absent');
+});
+
+test('cancellation during cooperative candidate verification closes its descriptor and discards progress', async (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  const nonce = 'cancel-proof';
+  const row = JSON.stringify({ type: 'user', origin: { body: 'x'.repeat(160_000) + `[agmsg:${nonce}]` } }) + '\n';
+  writeFileSync(file, row);
+  const controller = new AbortController();
+  let bytes = 0;
+  let fd;
+  let budget = 0;
+  const observe = createTranscriptObserver({ cooperative: true,
+    read(...args) { fd = args[0]; const count = readSync(...args); bytes += count; budget += count; return count; },
+    async schedule() {
+      assert.ok(budget <= 64 * 1024, 'candidate reread also yields after one chunk');
+      budget = 0;
+      if (bytes > Buffer.byteLength(row)) controller.abort();
+    },
+  });
+  assert.deepEqual(await observe(file, nonce, { signal: controller.signal }), { state: 'unreadable', reason: 'transcript_observation_cancelled' });
+  assert.ok(bytes > Buffer.byteLength(row), 'cancellation occurs during the proof reread');
+  assert.ok(bytes < 2 * Buffer.byteLength(row), 'the proof reread stops early');
+  assert.throws(() => fstatSync(fd), { code: 'EBADF' });
+  writeFileSync(file, deliveredRow(nonce).replace('"user"', '"tool"'));
+  assert.equal((await observe(file, nonce)).state, 'absent', 'cancelled candidate progress never confirms');
+});
+
+test('channel stop cancels cold observation before confirmation or another send', async (t) => {
+  let entered;
+  const suspended = new Promise((resolve) => { entered = resolve; });
+  let fd;
+  const observe = createTranscriptObserver({ cooperative: true,
+    read(...args) { fd = args[0]; return readSync(...args); },
+    schedule(signal) {
+      entered();
+      return new Promise((resolve) => {
+        if (signal.aborted) resolve();
+        else signal.addEventListener('abort', resolve, { once: true });
+      });
+    },
+  });
+  const { db, channel, state, root } = channelFixture(t, { observe });
+  const file = path.join(root, 'cold.jsonl');
+  writeFileSync(file, transcriptGrowth() + deliveredRow('stop-cold'));
+  db.prepare(`INSERT INTO beta_claude_queue (seat, messaging_socket, transcript_path, up_to, nonce, state, created_at)
+    VALUES (?, ?, ?, '{}', 'stop-cold', 'pending', '2026-10-17T00:00:00Z')`).run(JSON.stringify(['test', 'alice']), state.socket, file);
+  const polling = channel.pollOnce();
+  const phase = await Promise.race([suspended.then(() => 'yielded'), polling.then(() => 'finished')]);
+  assert.equal(phase, 'yielded', 'cold observation must suspend before finishing');
+  await channel.stop();
+  await polling;
+  assert.throws(() => fstatSync(fd), { code: 'EBADF' });
+  assert.equal(state.sent, 0);
+  assert.equal(db.prepare('SELECT state FROM beta_claude_queue').get().state, 'pending');
+  await channel.pollOnce();
+  assert.equal(state.sent, 0);
+});
+
+test('abort while awaiting the default scheduler closes the cold-scan descriptor', async (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  writeFileSync(file, transcriptGrowth());
+  const controller = new AbortController();
+  let fd;
+  const observe = createAsyncTranscriptObserver({ read(...args) { fd = args[0]; return readSync(...args); } });
+  const pending = observe(file, 'default-abort', { signal: controller.signal });
+  controller.abort();
+  assert.deepEqual(await pending, { state: 'unreadable', reason: 'transcript_observation_cancelled' });
+  assert.throws(() => fstatSync(fd), { code: 'EBADF' });
+  assert.equal((await observe(file, 'default-abort')).state, 'absent');
+});
+
+test('the daemon default observer yields while recovering an existing pending notice', async (t) => {
+  const { db, channel, state, root } = channelFixture(t, { observe: undefined });
+  const file = path.join(root, 'default-cold.jsonl');
+  writeFileSync(file, transcriptGrowth() + deliveredRow('default-cold'));
+  db.prepare(`INSERT INTO beta_claude_queue (seat, messaging_socket, transcript_path, up_to, nonce, state, created_at)
+    VALUES (?, ?, ?, '{}', 'default-cold', 'pending', '2026-10-17T00:00:00Z')`).run(JSON.stringify(['test', 'alice']), state.socket, file);
+  const heartbeat = new Promise((resolve) => setImmediate(resolve));
+  const polling = channel.pollOnce();
+  await heartbeat;
+  assert.equal(db.prepare('SELECT state FROM beta_claude_queue').get().state, 'pending');
+  await polling;
+  assert.equal(db.prepare('SELECT state FROM beta_claude_queue').get().state, 'confirmed');
+  assert.equal(state.sent, 0, 'recovery never resends an existing notice');
+  await channel.stop();
 });

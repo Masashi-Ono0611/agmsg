@@ -16,6 +16,7 @@ import { closeSync, fstatSync, lstatSync, openSync, readSync, readdirSync } from
 import process from "node:process";
 import { StringDecoder } from "node:string_decoder";
 import { isAbsolute } from "node:path";
+import { setImmediate as yieldToLoop } from "node:timers/promises";
 
 export { newNonce, inboxNudge } from "./codex-queue-io.mjs";
 
@@ -276,7 +277,12 @@ function transcriptRow(marker) {
 
 // One observer belongs to one channel lifetime. The LRU cap bounds abandoned
 // entries; an evicted pending notice recovers by scanning its file once again.
-export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read = readSync } = {}) {
+export function createTranscriptObserver({
+  maxEntries = MAX_OBSERVATIONS,
+  read = readSync,
+  cooperative = false,
+  schedule = (signal) => yieldToLoop(undefined, { signal }),
+} = {}) {
   const entries = new Map();
   function key(path, nonce) { return JSON.stringify([path, nonce]); }
   function put(path, nonce, entry) {
@@ -315,16 +321,22 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
     if (!compatible(before, after) || !compatible(after, current)) changed();
     return current;
   }
-  function verifyRow(fd, path, version, start, end, expected) {
+  function checkCancelled(signal) {
+    if (signal?.aborted) throw Object.assign(new Error("transcript_observation_cancelled"), { code: "OBSERVATION_CANCELLED" });
+  }
+  function* verifyRow(fd, path, version, start, end, expected, signal) {
     const before = assertAppendCompatible(fd, path, version);
     const hash = createHash("sha256");
     const buffer = Buffer.alloc(TRANSCRIPT_CHUNK_BYTES);
     let offset = start;
     while (offset < end) {
+      checkCancelled(signal);
       const count = read(fd, buffer, 0, Math.min(buffer.length, end - offset), offset);
       if (!count) changed();
       hash.update(buffer.subarray(0, count));
       offset += count;
+      yield;
+      checkCancelled(signal);
     }
     // Confirm exact candidate bytes, including its terminator and starting
     // boundary. Unrelated appends may continue throughout this bounded reread.
@@ -337,10 +349,12 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
     if (read(fd, byte, 0, 1, offset - 1) !== 1) throw new Error("transcript_boundary_unreadable");
     return byte[0] === 10;
   }
-  function observe(path, nonce) {
+  function* scan(path, nonce, { signal } = {}) {
     if (typeof nonce !== "string" || !nonce) return { state: "unreadable", reason: "nonce_missing" };
     let fd;
+    let finished = false;
     try {
+      checkCancelled(signal);
       const opened = open(path);
       fd = opened.fd;
       const stat = opened.stat;
@@ -353,12 +367,19 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
       if (!entry || entry.dev !== stat.dev || entry.ino !== stat.ino || stat.size < entry.offset || versionChanged) entry = fresh(stat, nonce);
       // A checkpoint is useful only while it is still a JSONL boundary. A
       // same-inode rewrite may keep/grow the size while moving that boundary.
-      if (entry.offset && !entry.skipRemainder && !atRowBoundary(fd, entry.offset)) entry = fresh(stat, nonce);
+      if (entry.offset && !entry.skipRemainder) {
+        if (!atRowBoundary(fd, entry.offset)) entry = fresh(stat, nonce);
+        // Keep this one-byte guard separate from the next full chunk's budget.
+        yield;
+        checkCancelled(signal);
+      }
       put(path, nonce, entry);
       // Growth keeps progress; delivery additionally verifies its exact row
       // bytes so short reads cannot splice evidence across a growing rewrite.
       const finish = () => {
+        checkCancelled(signal);
         entry.version = assertAppendCompatible(fd, path, opened.version);
+        finished = true;
         return { state: entry.state };
       };
       if (entry.state === "delivered") return finish();
@@ -369,6 +390,7 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
       let rowStart = offset;
       let rowHash = createHash("sha256");
       while (offset < stat.size) {
+        checkCancelled(signal);
         const count = read(fd, buffer, 0, Math.min(buffer.length, stat.size - offset), offset);
         if (!count) break;
         let start = 0;
@@ -390,7 +412,10 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
           decoder = new StringDecoder("utf8");
           row = transcriptRow(`[agmsg:${nonce}]`);
           if (outcome === "delivered") {
-            verifyRow(fd, path, opened.version, rowStart, entry.offset, rowHash.digest("hex"));
+            // The candidate may have consumed the current chunk's budget;
+            // yield before beginning its independently chunked proof reread.
+            yield;
+            yield* verifyRow(fd, path, opened.version, rowStart, entry.offset, rowHash.digest("hex"), signal);
             entry.state = outcome;
             return finish();
           }
@@ -400,15 +425,39 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
           start = end + 1;
         }
         offset += count;
+        yield;
+        checkCancelled(signal);
       }
       return finish();
     } catch (error) {
       entries.delete(key(path, nonce));
-      return { state: "unreadable", reason: error?.code === "ENOENT" ? "transcript_missing" : error?.code === "TRANSCRIPT_CHANGED" ? "transcript_changed_during_read" : "transcript_read_failed" };
+      return { state: "unreadable", reason: signal?.aborted || error?.code === "OBSERVATION_CANCELLED" ? "transcript_observation_cancelled" : error?.code === "ENOENT" ? "transcript_missing" : error?.code === "TRANSCRIPT_CHANGED" ? "transcript_changed_during_read" : "transcript_read_failed" };
     } finally {
+      if (!finished) entries.delete(key(path, nonce));
       if (fd !== undefined) closeSync(fd);
     }
   }
+  // Both APIs drive exactly the same parser/checkpoint/row-proof generator.
+  // Only the daemon's cooperative driver awaits between bounded work units.
+  const observe = cooperative ? async (path, nonce, options = {}) => {
+    const iterator = scan(path, nonce, options);
+    try {
+      for (;;) {
+        const step = iterator.next();
+        if (step.done) return step.value;
+        try { await schedule(options.signal); }
+        catch (error) { return iterator.throw(error).value; }
+      }
+    } finally { iterator.return(); }
+  } : (path, nonce, options) => {
+    const iterator = scan(path, nonce, options);
+    try {
+      for (;;) {
+        const step = iterator.next();
+        if (step.done) return step.value;
+      }
+    } finally { iterator.return(); }
+  };
   // Called once, immediately before a new send. Missing files intentionally
   // leave no watermark, so the first successful observation recovers from zero.
   observe.begin = (path, nonce) => {
@@ -428,6 +477,10 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
   observe.forget = (path, nonce) => entries.delete(key(path, nonce));
   observe.clear = () => entries.clear();
   return observe;
+}
+
+export function createAsyncTranscriptObserver(options = {}) {
+  return createTranscriptObserver({ ...options, cooperative: true });
 }
 
 // Standalone callers recover the existing file; daemon channels retain their

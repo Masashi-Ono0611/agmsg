@@ -28,7 +28,7 @@ import {
   checkSocketOwnership,
   inboxNudge,
   newNonce,
-  createTranscriptObserver,
+  createAsyncTranscriptObserver,
   resolveTranscriptPath,
   resolvePendingDelivery,
   sendClaudeCodeMessage,
@@ -116,8 +116,8 @@ function storagePaths(installRoot, env) {
   };
 }
 
-function pendingObservation(pending, observe) {
-  return resolvePendingDelivery({ observation: observe(pending.transcript_path, pending.nonce) });
+async function pendingObservation(pending, observe, signal) {
+  return resolvePendingDelivery({ observation: await observe(pending.transcript_path, pending.nonce, { signal }) });
 }
 
 export function createClaudeCodeQueueChannel({
@@ -134,12 +134,13 @@ export function createClaudeCodeQueueChannel({
   openStore = openMessageStore,
   readSnapshot = readUnreadSnapshot,
   send = sendClaudeCodeMessage,
-  observe = createTranscriptObserver(),
+  observe = createAsyncTranscriptObserver(),
   socketAlive = checkSocketOwnership,
   hostPlatform = process.platform,
 }) {
   let stopped = false;
   let activePoll = null;
+  const observationController = new AbortController();
 
   async function pollSeat(registration, paths) {
     const { team, agent, teamConfig, registered = true } = registration;
@@ -150,7 +151,8 @@ export function createClaudeCodeQueueChannel({
     // the work pauses, so a long wait is normal, not a loss. It is re-sent only
     // when the thing it was sent to is gone (see below).
     if (pending) {
-      const observation = pendingObservation(pending, observe);
+      const observation = await pendingObservation(pending, observe, observationController.signal);
+      if (stopped) return;
       if (observation.state === "confirmed") {
         setQueueState(db, pending.id, "confirmed");
         observe.forget?.(pending.transcript_path, pending.nonce);
@@ -279,7 +281,8 @@ export function createClaudeCodeQueueChannel({
       saveSeat(db, { seat, messagingSocket: record.messaging_socket, state: "blocked", reason: `send_failed:${result.reason}` }, now);
       return;
     }
-    const firstCheck = pendingObservation(readPending(db, seat), observe);
+    const firstCheck = await pendingObservation(readPending(db, seat), observe, observationController.signal);
+    if (stopped) return;
     if (firstCheck.state === "confirmed") {
       setQueueState(db, id, "confirmed");
       observe.forget?.(transcriptPath, nonce);
@@ -329,6 +332,7 @@ export function createClaudeCodeQueueChannel({
     pollOnce,
     async stop() {
       stopped = true;
+      observationController.abort();
       await activePoll;
       observe.clear?.();
     },
