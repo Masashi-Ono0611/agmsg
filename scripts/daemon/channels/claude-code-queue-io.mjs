@@ -345,7 +345,12 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
       fd = opened.fd;
       const stat = opened.stat;
       let entry = entries.get(key(path, nonce));
-      if (!entry || entry.dev !== stat.dev || entry.ino !== stat.ino || stat.size < entry.offset) entry = fresh(stat, nonce);
+      // Compare against the previous observation, not only this call's open:
+      // a rewrite completed between polls may preserve both size and newline.
+      const versionChanged = entry?.version && (opened.version.size < entry.version.size
+        || (opened.version.size === entry.version.size
+          && (opened.version.mtimeNs !== entry.version.mtimeNs || opened.version.ctimeNs !== entry.version.ctimeNs)));
+      if (!entry || entry.dev !== stat.dev || entry.ino !== stat.ino || stat.size < entry.offset || versionChanged) entry = fresh(stat, nonce);
       // A checkpoint is useful only while it is still a JSONL boundary. A
       // same-inode rewrite may keep/grow the size while moving that boundary.
       if (entry.offset && !entry.skipRemainder && !atRowBoundary(fd, entry.offset)) entry = fresh(stat, nonce);
@@ -353,7 +358,7 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
       // Growth keeps progress; delivery additionally verifies its exact row
       // bytes so short reads cannot splice evidence across a growing rewrite.
       const finish = () => {
-        assertAppendCompatible(fd, path, opened.version);
+        entry.version = assertAppendCompatible(fd, path, opened.version);
         return { state: entry.state };
       };
       if (entry.state === "delivered") return finish();
@@ -415,7 +420,7 @@ export function createTranscriptObserver({ maxEntries = MAX_OBSERVATIONS, read =
       // EOF may be inside a row written before this notice. Its appended
       // suffix must never be considered a standalone delivery record.
       entry.skipRemainder = !atRowBoundary(fd, entry.offset);
-      assertAppendCompatible(fd, path, opened.version);
+      entry.version = assertAppendCompatible(fd, path, opened.version);
       put(path, nonce, entry);
     } catch { entries.delete(key(path, nonce)); }
     finally { if (fd !== undefined) closeSync(fd); }

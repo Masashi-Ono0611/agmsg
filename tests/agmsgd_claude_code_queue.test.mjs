@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, mkdtempSync, readSync, renameSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readSync, renameSync, rmSync, statSync, utimesSync, writeFileSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import test from 'node:test';
@@ -340,6 +340,31 @@ test('same-inode replacement of a completed checkpoint must preserve its newline
   writeFileSync(file, 'bad' + deliveredRow('boundary'));
   assert.equal(observe(file, 'boundary').state, 'absent');
   assert.equal(observeTranscript(file, 'boundary').state, 'absent');
+});
+
+test('same-size rewrites between polls invalidate watermarks and absent, held or delivered checkpoints', (t) => {
+  const file = path.join(temporaryDirectory(t), 'session.jsonl');
+  const nonce = 'between-polls';
+  const rows = {
+    absent: JSON.stringify({ type: 'tool', body: 'unrelated' }),
+    held: JSON.stringify({ type: 'system', subtype: 'informational', content: `[agmsg:${nonce}]` }),
+    delivered: deliveredRow(nonce).trimEnd(),
+  };
+  const padded = (state) => rows[state].padEnd(512, ' ') + '\n';
+  for (const [before, after, begin] of [['absent', 'delivered'], ['held', 'delivered'], ['delivered', 'absent'], ['absent', 'delivered', true]]) {
+    writeFileSync(file, padded(before));
+    utimesSync(file, 10, 10);
+    const original = statSync(file);
+    const observe = createTranscriptObserver();
+    if (begin) observe.begin(file, nonce);
+    assert.equal(observe(file, nonce).state, before);
+    writeFileSync(file, padded(after));
+    utimesSync(file, 20, 20);
+    assert.equal(statSync(file).ino, original.ino);
+    assert.equal(statSync(file).size, original.size);
+    assert.equal(observe(file, nonce).state, after, `${before} checkpoint must not survive a same-size rewrite`);
+    assert.equal(observe(file, nonce).state, after, 'unchanged subsequent polls retain the new observation');
+  }
 });
 
 test('short reads preserve row boundaries and a read failure discards cached progress', (t) => {
