@@ -174,3 +174,5 @@ resolve as soon as the tap commit lands.
   federated identity trusts `main` only, so every `feat/desktop-app` run fails
   at the Azure login step. First real signal comes from a `main`-branch run.
 - Test coverage is partial: the frontend has vitest suites (`pnpm test` in `app/`) and the Rust side has unit tests in a few modules, but there are no end-to-end tests of the Tauri app itself.
+
+<!-- CI verification only (fork): triggers the app jobs after the v1.5.1 tag was added and Actions was re-enabled. Not for merging. -->
